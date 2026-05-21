@@ -15,6 +15,18 @@ from .gemv import (
     schedule_int8xint8_mat_vec,
 )
 
+from .mxfp8 import (
+    mxfp8_block_add,
+    mxfp8_decode_block,
+    mxfp8_encode_block,
+    decode_e4m3,
+    decode_e8m0,
+    encode_e4m3,
+    encode_e8m0,
+    schedule_mxfp8_block_add,
+    MXFP8_BLOCK_SIZE,
+)
+
 from .nn import (
     linear2d,
     linear3d,
@@ -63,6 +75,7 @@ KERNEL2SCHEDULE.update(
 )
 
 KERNEL2SCHEDULE[int8xint8_mat_vec] = schedule_int8xint8_mat_vec
+KERNEL2SCHEDULE[mxfp8_block_add] = schedule_mxfp8_block_add
 
 KERNEL2SCHEDULE.update(
     {
