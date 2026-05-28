@@ -82,6 +82,10 @@ public:
             allo::SubFixedOp, allo::MulFixedOp, allo::DivFixedOp,
             allo::CmpFixedOp, allo::ShLFixedOp, allo::ShRFixedOp,
             allo::MinFixedOp, allo::MaxFixedOp, allo::PrintOp,
+            allo::DecodeE4m3Op, allo::EncodeE4m3Op, allo::DecodeE8m0Op,
+            allo::EncodeE8m0Op, allo::DecodeMxfp8BlockOp,
+            allo::EncodeMxfp8BlockOp, allo::BlockAddMxfp8Op,
+            allo::BlockMatMulMxfp8Op,
             allo::StreamConstructOp, allo::StreamGetOp, allo::StreamPutOp>(
             [&](auto opNode) -> ResultType {
               return thisCast->visitOp(opNode, args...);
@@ -253,6 +257,16 @@ public:
   HANDLE(allo::ShRFixedOp);
   HANDLE(allo::MinFixedOp);
   HANDLE(allo::MaxFixedOp);
+
+  // MXFP8 operations
+  HANDLE(allo::DecodeE4m3Op);
+  HANDLE(allo::EncodeE4m3Op);
+  HANDLE(allo::DecodeE8m0Op);
+  HANDLE(allo::EncodeE8m0Op);
+  HANDLE(allo::DecodeMxfp8BlockOp);
+  HANDLE(allo::EncodeMxfp8BlockOp);
+  HANDLE(allo::BlockAddMxfp8Op);
+  HANDLE(allo::BlockMatMulMxfp8Op);
 
   /// Stream operations.
   HANDLE(allo::StreamConstructOp);

@@ -18,6 +18,11 @@ def FixedToInteger : Pass<"fixed-to-integer", "ModuleOp"> {
   let constructor = "mlir::allo::createFixedPointToIntegerPass()";
 }
 
+def Mxfp8ToPrimitive : Pass<"mxfp8-to-primitive", "ModuleOp"> {
+  let summary = "Lower MXFP8 operations to primitive arithmetic";
+  let constructor = "mlir::allo::createMxfp8ToPrimitivePass()";
+}
+
 def LowerCompositeType : Pass<"lower-composite-type", "ModuleOp"> {
   let summary = "Lower composite types";
   let constructor = "mlir::allo::createLowerCompositeTypePass()";

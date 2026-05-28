@@ -73,6 +73,7 @@ from .types import (
     Float,
     Fixed,
     UFixed,
+    Mxfp8,
     Struct,
     float32,
     Stream,
@@ -2524,6 +2525,48 @@ class ASTTransformer(ASTBuilder):
             new_name = vid
         return new_name, symbolic_slice, iterator_infos
 
+    MXFP8_SCALAR_OPS = {
+        "decode_e4m3": allo_d.DecodeE4m3Op,
+        "encode_e4m3": allo_d.EncodeE4m3Op,
+        "decode_e8m0": allo_d.DecodeE8m0Op,
+        "encode_e8m0": allo_d.EncodeE8m0Op,
+    }
+    MXFP8_BLOCK_OPS = {
+        "decode_mxfp8_block": allo_d.DecodeMxfp8BlockOp,
+        "encode_mxfp8_block": allo_d.EncodeMxfp8BlockOp,
+        "block_add_mxfp8": allo_d.BlockAddMxfp8Op,
+        "block_matmul_mxfp8": allo_d.BlockMatMulMxfp8Op,
+    }
+
+    @staticmethod
+    def build_mxfp8_native_op(ctx: ASTContext, node: ast.Call, obj_name: str):
+        stmts = build_stmts(ctx, node.args)
+        values = [ASTTransformer.get_mlir_op_result(ctx, s) for s in stmts]
+        if obj_name in ASTTransformer.MXFP8_SCALAR_OPS:
+            opcls = ASTTransformer.MXFP8_SCALAR_OPS[obj_name]
+            arg = values[0]
+            if isinstance(node.args[0].dtype, Mxfp8):
+                arg = arith_d.BitcastOp(
+                    IntegerType.get_signless(8), arg, ip=ctx.get_ip()
+                ).result
+            return opcls(node.dtype.build(), arg, ip=ctx.get_ip())
+        opcls = ASTTransformer.MXFP8_BLOCK_OPS[obj_name]
+        if obj_name == "decode_mxfp8_block":
+            return opcls(values[0], values[1], values[2], ip=ctx.get_ip())
+        if obj_name == "encode_mxfp8_block":
+            return opcls(values[0], values[1], values[2], ip=ctx.get_ip())
+        if obj_name in {"block_add_mxfp8", "block_matmul_mxfp8"}:
+            return opcls(
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                ip=ctx.get_ip(),
+            )
+        raise RuntimeError(f"Unsupported MXFP8 op `{obj_name}`")
+
     # pylint: disable=too-many-return-statements, too-many-function-args, too-many-nested-blocks
     @staticmethod
     def build_Call(ctx: ASTContext, node: ast.Call, out_buffer: OpView = None):
@@ -2560,6 +2603,12 @@ class ASTTransformer(ASTBuilder):
                 ctx.func_id = func_id
         else:
             raise RuntimeError("Unsupported function call")
+
+        if getattr(obj, "__module__", None) == "allo.mxfp8_ops" and (
+            obj_name in ASTTransformer.MXFP8_SCALAR_OPS
+            or obj_name in ASTTransformer.MXFP8_BLOCK_OPS
+        ):
+            return ASTTransformer.build_mxfp8_native_op(ctx, node, obj_name)
 
         if obj is None:
             if isinstance(node.func, ast.Attribute):

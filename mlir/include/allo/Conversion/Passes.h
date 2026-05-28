@@ -18,6 +18,7 @@ namespace allo {
 // Allo Dialect -> LLVM Dialect
 std::unique_ptr<OperationPass<ModuleOp>> createAlloToLLVMLoweringPass();
 std::unique_ptr<OperationPass<ModuleOp>> createFixedPointToIntegerPass();
+std::unique_ptr<OperationPass<ModuleOp>> createMxfp8ToPrimitivePass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerCompositeTypePass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerBitOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerTransformLayoutOpsPass();
@@ -26,6 +27,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerPrintOpsPass();
 
 bool applyAlloToLLVMLoweringPass(ModuleOp &module, MLIRContext &context);
 bool applyFixedPointToInteger(ModuleOp &module);
+bool applyMxfp8ToPrimitive(ModuleOp &module);
 bool applyLowerCompositeType(ModuleOp &module);
 bool applyLowerBitOps(ModuleOp &module);
 bool applyLowerTransformLayoutOps(ModuleOp &module);

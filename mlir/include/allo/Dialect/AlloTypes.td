@@ -57,4 +57,13 @@ def Stream : Allo_Type<"Stream", [MemRefElementTypeInterface]> {
 
 def StreamLike : TypeOrValueSemanticsContainer<Stream, "stream-like">;
 
+def Mxfp8 : Allo_Type<"Mxfp8", [MemRefElementTypeInterface]> {
+  let summary = "MXFP8 block element (E4M3 payload in a block of blockSize)";
+  let mnemonic = "Mxfp8";
+  let parameters = (ins "std::size_t":$blockSize);
+  let assemblyFormat = "`<` $blockSize `>`";
+}
+
+def Mxfp8Like : TypeOrValueSemanticsContainer<Mxfp8, "mxfp8-like">;
+
 #endif // ALLO_TYPES

@@ -807,6 +807,24 @@ Access type metadata for fixed-point types:
         return A.bits   # Returns 16 (total bitwidth)
         # A.fracs would return 8 (fractional bits)
 
+MXFP8 Block Type
+----------------
+
+MXFP8 blocks use a native payload type ``mxfp8[BS]`` (E4M3 bytes) with a separate E8M0 ``uint8`` scale:
+
+.. code-block:: python
+
+    from allo.ir.types import mxfp8, uint8, float32
+    from allo import mxfp8_ops
+
+    def kernel(data: mxfp8[32], scale: uint8, out: float32[32]):
+        mxfp8_ops.decode_mxfp8_block(scale, data, out)
+
+    # Block add uses a single intrinsic:
+    mxfp8_ops.block_add_mxfp8(scale_a, data_a, scale_b, data_b, scale_out, data_out)
+
+Library wrappers in ``allo.library.mxfp8`` call the same native ops and keep ``ref_*`` Python functions for golden verification.
+
 Bitcast
 -------
 

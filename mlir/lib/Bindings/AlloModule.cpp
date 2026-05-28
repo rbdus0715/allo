@@ -171,6 +171,11 @@ static bool lowerFixedPointToInteger(MlirModule &mlir_mod) {
   return applyFixedPointToInteger(mod);
 }
 
+static bool lowerMxfp8ToPrimitive(MlirModule &mlir_mod) {
+  auto mod = unwrap(mlir_mod);
+  return applyMxfp8ToPrimitive(mod);
+}
+
 static bool lowerAnyWidthInteger(MlirModule &mlir_mod) {
   auto mod = unwrap(mlir_mod);
   return applyAnyWidthInteger(mod);
@@ -355,6 +360,7 @@ NB_MODULE(_allo, m) {
   // LLVM backend APIs.
   allo_m.def("lower_allo_to_llvm", &lowerAlloToLLVM);
   allo_m.def("lower_fixed_to_int", &lowerFixedPointToInteger);
+  allo_m.def("lower_mxfp8_to_primitive", &lowerMxfp8ToPrimitive);
   allo_m.def("lower_anywidth_int", &lowerAnyWidthInteger);
   allo_m.def("move_return_to_input", &moveReturnToInput);
 

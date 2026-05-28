@@ -75,5 +75,5 @@ def test_mxfp8_block_add_vhls():
     s = allo.customize(mxfp8.mxfp8_block_add, instantiate=[bs])
     hls_mod = s.build(target="vhls")
     assert "void mxfp8_block_add" in hls_mod.hls_code
-    assert "uint8_t" in hls_mod.hls_code
-    assert "float" in hls_mod.hls_code
+    assert "allo_block_add_mxfp8" in hls_mod.hls_code
+    assert "allo_decode_e4m3" in hls_mod.hls_code

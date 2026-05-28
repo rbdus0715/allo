@@ -17,11 +17,13 @@ from .types import (
     UInt,
     Fixed,
     UFixed,
+    Mxfp8,
     Index,
     uint1,
     int4,
     int8,
     int32,
+    uint8,
     float16,
     float32,
     float64,
@@ -64,6 +66,12 @@ class TypeInferer(ASTVisitor):
                 ASTResolver.resolve_constant(args[0], ctx),
                 ASTResolver.resolve_constant(args[1], ctx),
             )
+        elif ty_cls is Mxfp8:
+            block_size = 32
+            if len(args) == 1:
+                assert isinstance(args[0], ast.Constant)
+                block_size = ASTResolver.resolve_constant(args[0], ctx)
+            dtype = Mxfp8(block_size)
         else:
             assert len(args) == 1
             dtype = ty_cls(ASTResolver.resolve_constant(args[0], ctx))
@@ -1156,6 +1164,20 @@ class TypeInferer(ASTVisitor):
             and not obj.__module__.startswith("allo.library")
             and not obj.__module__.startswith("allo._mlir")
         ):
+            # Native MXFP8 intrinsics
+            if obj.__module__ == "allo.mxfp8_ops":
+                visit_stmts(ctx, node.args)
+                fn_name = obj.__name__
+                if fn_name in {"decode_e4m3", "decode_e8m0"}:
+                    node.dtype = float32
+                    node.shape = tuple()
+                elif fn_name in {"encode_e4m3", "encode_e8m0"}:
+                    node.dtype = uint8
+                    node.shape = tuple()
+                else:
+                    node.dtype = None
+                    node.shape = None
+                return node
             # Allo library functions
             if isinstance(obj, IPModule):
                 # HLS IP, suppose it does not have return values

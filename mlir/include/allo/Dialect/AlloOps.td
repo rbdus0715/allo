@@ -842,6 +842,73 @@ def FixedToFixedOp : Allo_Op<"fixed_to_fixed"> {
 }
 
 //===----------------------------------------------------------------------===//
+// MXFP8 operations
+//===----------------------------------------------------------------------===//
+
+def AnyMxfp8 : Type<CPred<"::llvm::isa<::mlir::allo::Mxfp8Type>($_self)">, "mxfp8",
+                    "allo::Mxfp8Type">;
+
+def DecodeE4m3Op : Allo_Op<"decode_e4m3"> {
+  let summary = "Decode E4M3 uint8 to float32";
+  let arguments = (ins SignlessIntegerLike:$input);
+  let results = (outs FloatLike:$result);
+  let assemblyFormat = "`(` $input `)` attr-dict `:` type($input) `->` type($result)";
+}
+
+def EncodeE4m3Op : Allo_Op<"encode_e4m3"> {
+  let summary = "Encode float32 to E4M3 uint8";
+  let arguments = (ins FloatLike:$input);
+  let results = (outs SignlessIntegerLike:$result);
+  let assemblyFormat = "`(` $input `)` attr-dict `:` type($input) `->` type($result)";
+}
+
+def DecodeE8m0Op : Allo_Op<"decode_e8m0"> {
+  let summary = "Decode E8M0 uint8 scale to float32";
+  let arguments = (ins SignlessIntegerLike:$input);
+  let results = (outs FloatLike:$result);
+  let assemblyFormat = "`(` $input `)` attr-dict `:` type($input) `->` type($result)";
+}
+
+def EncodeE8m0Op : Allo_Op<"encode_e8m0"> {
+  let summary = "Encode float32 to E8M0 uint8 scale";
+  let arguments = (ins FloatLike:$input);
+  let results = (outs SignlessIntegerLike:$result);
+  let assemblyFormat = "`(` $input `)` attr-dict `:` type($input) `->` type($result)";
+}
+
+def DecodeMxfp8BlockOp : Allo_Op<"decode_mxfp8_block"> {
+  let summary = "Decode MXFP8 block (scale + payload) to float32 array";
+  let arguments = (ins SignlessIntegerLike:$scale, AnyMemRef:$data, AnyMemRef:$out);
+  let results = (outs);
+  let assemblyFormat = "`(` $scale `,` $data `,` $out `)` attr-dict `:` type($scale) `,` type($data) `,` type($out)";
+}
+
+def EncodeMxfp8BlockOp : Allo_Op<"encode_mxfp8_block"> {
+  let summary = "Encode float32 array to MXFP8 block (scale + payload)";
+  let arguments = (ins AnyMemRef:$data, AnyMemRef:$scale_out, AnyMemRef:$data_out);
+  let results = (outs);
+  let assemblyFormat = "`(` $data `,` $scale_out `,` $data_out `)` attr-dict `:` type($data) `,` type($scale_out) `,` type($data_out)";
+}
+
+def BlockAddMxfp8Op : Allo_Op<"block_add_mxfp8"> {
+  let summary = "Add two MXFP8 blocks (decode, add, re-encode)";
+  let arguments = (ins SignlessIntegerLike:$scale_a, AnyMemRef:$data_a,
+                       SignlessIntegerLike:$scale_b, AnyMemRef:$data_b,
+                       AnyMemRef:$scale_out, AnyMemRef:$data_out);
+  let results = (outs);
+  let assemblyFormat = "`(` $scale_a `,` $data_a `,` $scale_b `,` $data_b `,` $scale_out `,` $data_out `)` attr-dict `:` type($scale_a) `,` type($data_a) `,` type($scale_b) `,` type($data_b) `,` type($scale_out) `,` type($data_out)";
+}
+
+def BlockMatMulMxfp8Op : Allo_Op<"block_matmul_mxfp8"> {
+  let summary = "Block dot product of two MXFP8 blocks (decode, mul-accumulate, re-encode)";
+  let arguments = (ins SignlessIntegerLike:$scale_a, AnyMemRef:$data_a,
+                       SignlessIntegerLike:$scale_b, AnyMemRef:$data_b,
+                       AnyMemRef:$scale_out, AnyMemRef:$data_out);
+  let results = (outs);
+  let assemblyFormat = "`(` $scale_a `,` $data_a `,` $scale_b `,` $data_b `,` $scale_out `,` $data_out `)` attr-dict `:` type($scale_a) `,` type($data_a) `,` type($scale_b) `,` type($data_b) `,` type($scale_out) `,` type($data_out)";
+}
+
+//===----------------------------------------------------------------------===//
 // Bitwise operations
 //===----------------------------------------------------------------------===//
 

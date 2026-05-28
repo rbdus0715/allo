@@ -17,6 +17,7 @@ from .gemv import (
 
 from .mxfp8 import (
     mxfp8_block_add,
+    mxfp8_block_matmul,
     mxfp8_decode_block,
     mxfp8_encode_block,
     decode_e4m3,

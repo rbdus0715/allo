@@ -70,6 +70,13 @@ public:
   void emitStreamGet(allo::StreamGetOp op) override;
   void emitStreamPut(allo::StreamPutOp op) override;
 
+  /// MXFP8 operation emitters.
+  void emitMxfp8UnaryCall(Operation *op, const char *fn);
+  void emitMxfp8DecodeBlock(allo::DecodeMxfp8BlockOp op);
+  void emitMxfp8EncodeBlock(allo::EncodeMxfp8BlockOp op);
+  void emitMxfp8BlockAdd(allo::BlockAddMxfp8Op op);
+  void emitMxfp8BlockMatMul(allo::BlockMatMulMxfp8Op op);
+
   /// Top-level MLIR module emitter.
   void emitModule(ModuleOp module) override;
 

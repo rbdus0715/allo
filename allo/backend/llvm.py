@@ -72,6 +72,8 @@ class LLVMModule:
             allo_d.remove_stride_map(self.module)
             # Lower composite (struct) types
             allo_d.lower_composite_type(self.module)
+            # Lower MXFP8 ops to primitive arithmetic
+            allo_d.lower_mxfp8_to_primitive(self.module)
             # Resolve FixedType
             allo_d.lower_fixed_to_int(self.module)
             allo_d.lower_bit_ops(self.module)
@@ -207,6 +209,9 @@ class LLVMModule:
                     arg = arg * (2**frac)
                     arg = handle_overflow(arg, bitwidth, target_in_type)
                     arg = make_anywidth_numpy_array(arg, bitwidth)
+                elif target_in_type.startswith("mxfp8"):
+                    if arg.dtype != np.uint8:
+                        arg = arg.astype(np.uint8)
                 else:
                     raise RuntimeError(
                         f"Unsupported input type: {target_in_type}, "

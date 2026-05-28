@@ -29,6 +29,7 @@ from .ir.types import (
     Float,
     Fixed,
     UFixed,
+    Mxfp8,
     bfloat16,
     float16,
     float32,
@@ -191,6 +192,8 @@ def mlir_to_allo_type(mlir_type):
         return Fixed(mlir_type.width, mlir_type.frac)
     if isinstance(mlir_type, allo_d.UFixedType):
         return UFixed(mlir_type.width, mlir_type.frac)
+    if isinstance(mlir_type, allo_d.Mxfp8Type):
+        return Mxfp8(mlir_type.block_size)
 
     raise TypeError(f"Unsupported MLIR type conversion: {mlir_type}")
 
@@ -208,6 +211,9 @@ def get_mlir_dtype_from_str(dtype):
     if dtype.startswith("ufixed"):
         bitwidth, frac = get_bitwidth_and_frac_from_fixed(dtype)
         return allo_d.UFixedType.get(bitwidth, frac)
+    if dtype.startswith("mxfp8"):
+        block_size = int(dtype.split("(")[-1].rstrip(")"))
+        return allo_d.Mxfp8Type.get(block_size)
     if dtype.startswith("f"):
         bitwidth = get_bitwidth_from_type("f" + dtype[5:])
         if bitwidth == 32:
@@ -251,6 +257,9 @@ def get_dtype_and_shape_from_type(dtype):
         dtype = allo_d.UFixedType(dtype)
         width, frac = dtype.width, dtype.frac
         return f"ufixed({width}, {frac})", tuple()
+    if allo_d.Mxfp8Type.isinstance(dtype):
+        dtype = allo_d.Mxfp8Type(dtype)
+        return f"mxfp8({dtype.block_size})", tuple()
     raise RuntimeError("Unsupported type")
 
 
@@ -580,6 +589,9 @@ def allo_to_numpy_dtype(allo_type: AlloType) -> npt.DTypeLike:
             dtype = np.int32 if isinstance(allo_type, Fixed) else np.uint32
         else:
             dtype = np.int64 if isinstance(allo_type, Fixed) else np.uint64
+
+    elif isinstance(allo_type, Mxfp8):
+        dtype = np.uint8
 
     return dtype
 

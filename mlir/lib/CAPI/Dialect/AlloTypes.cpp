@@ -96,3 +96,15 @@ MlirType alloMlirStreamTypeGetBaseType(MlirType type) {
 unsigned alloMlirStreamTypeGetDepth(MlirType type) {
   return llvm::dyn_cast<allo::StreamType>(unwrap(type)).getDepth();
 }
+
+bool alloMlirTypeIsAMxfp8Type(MlirType type) {
+  return llvm::isa<allo::Mxfp8Type>(unwrap(type));
+}
+
+MlirType alloMlirMxfp8TypeGet(MlirContext ctx, size_t blockSize) {
+  return wrap(allo::Mxfp8Type::get(unwrap(ctx), blockSize));
+}
+
+unsigned alloMlirMxfp8TypeGetBlockSize(MlirType type) {
+  return llvm::dyn_cast<allo::Mxfp8Type>(unwrap(type)).getBlockSize();
+}

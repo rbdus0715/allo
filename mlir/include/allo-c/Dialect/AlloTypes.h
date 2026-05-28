@@ -45,6 +45,10 @@ MLIR_CAPI_EXPORTED MlirType alloMlirStreamTypeGet(MlirContext ctx,
 MLIR_CAPI_EXPORTED MlirType alloMlirStreamTypeGetBaseType(MlirType type);
 MLIR_CAPI_EXPORTED unsigned alloMlirStreamTypeGetDepth(MlirType type);
 
+MLIR_CAPI_EXPORTED bool alloMlirTypeIsAMxfp8Type(MlirType type);
+MLIR_CAPI_EXPORTED MlirType alloMlirMxfp8TypeGet(MlirContext ctx, size_t blockSize);
+MLIR_CAPI_EXPORTED unsigned alloMlirMxfp8TypeGetBlockSize(MlirType type);
+
 #ifdef __cplusplus
 }
 #endif

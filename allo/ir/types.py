@@ -255,6 +255,17 @@ class UFixed(AlloType):
         return allo_d.UFixedType.get(self.bits, self.fracs)
 
 
+class Mxfp8(AlloType):
+    """MXFP8 block payload element (E4M3 byte within a block)."""
+
+    def __init__(self, block_size=32):
+        super().__init__(8, 0, f"mxfp8({block_size})")
+        self.block_size = block_size
+
+    def build(self):
+        return allo_d.Mxfp8Type.get(self.block_size)
+
+
 class Struct(AlloType):
     """A C-like struct
 
@@ -358,6 +369,10 @@ def allo_type_from_mlir_type(mlir_type):
         if is_unsigned:
             return UFixed(bits, fracs)
         return Fixed(bits, fracs)
+    mx_pattern = re.compile(r"!allo\.Mxfp8<\s*(\d+)\s*>")
+    m = mx_pattern.fullmatch(str(mlir_type))
+    if m:
+        return Mxfp8(int(m.group(1)))
     raise TypeError(f"Cannot reconstruct Allo Type from MLIR type: {mlir_type}")
 
 
@@ -415,3 +430,5 @@ float32 = Float(32, 23, "f32")
 float64 = Float(64, 52, "f64")
 # brain floating point
 bfloat16 = Float(16, 7, "bf16")
+# MXFP8 block payload type (default block size 32)
+mxfp8 = Mxfp8(32)

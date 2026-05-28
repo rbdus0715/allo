@@ -8,8 +8,8 @@ import math
 
 import numpy as np
 
-from .. import dsl
-from ..ir.types import uint8, int32, float32
+from .. import mxfp8_ops
+from ..ir.types import uint8, int32, float32, mxfp8
 
 MXFP8_BLOCK_SIZE = 32
 E4M3_BIAS = 7
@@ -105,137 +105,62 @@ def ref_block_add(
 
 
 # ---------------------------------------------------------------------------
-# Allo kernels (compile to LLVM / HLS)
+# Allo kernels (native MXFP8 ops; compile to LLVM / HLS)
 # ---------------------------------------------------------------------------
 
 
 def decode_e8m0(u8: uint8) -> float32:
-    u: int32 = int(u8)
-    result: float32 = 0.0
-    if u != 0 and u != 255:
-        exp: int32 = u - E8M0_BIAS
-        result = 2.0**float(exp)
-    return result
+    return mxfp8_ops.decode_e8m0(u8)
 
 
 def encode_e8m0(scale: float32) -> uint8:
-    result: int32 = 0
-    if scale > 0.0:
-        result = 254
-        for e in range(1, 255):
-            if result == 254:
-                p: float32 = 2.0 ** float(e - E8M0_BIAS)
-                if p >= scale:
-                    result = e
-    return result
+    return mxfp8_ops.encode_e8m0(scale)
 
 
 def decode_e4m3(u8: uint8) -> float32:
-    u: int32 = int(u8)
-    sign: int32 = (u >> 7) & 1
-    exp: int32 = (u >> 3) & 15
-    mant: int32 = u & 7
-
-    val: float32 = 0.0
-    if exp == 15 and mant == 7:
-        val = 0.0
-    elif exp == 0:
-        val = float(mant) / 8.0 * (2.0 ** float(1 - E4M3_BIAS))
-    else:
-        val = (1.0 + float(mant) / 8.0) * (2.0 ** float(exp - E4M3_BIAS))
-
-    if sign == 1:
-        val = 0.0 - val
-    return val
+    return mxfp8_ops.decode_e4m3(u8)
 
 
 def encode_e4m3(f: float32) -> uint8:
-    packed: int32 = 0
-    if f != 0.0:
-        sign: int32 = 0
-        abs_f: float32 = f
-        if f < 0.0:
-            sign = 1
-            abs_f = 0.0 - f
-
-        unbiased_exp: int32 = -20
-        for e in range(-20, 16):
-            if abs_f >= 2.0 ** float(e):
-                unbiased_exp = e
-
-        exp_field: int32 = unbiased_exp + E4M3_BIAS
-        mant: int32 = 0
-
-        if exp_field <= 0:
-            exp_field = 0
-            divisor: float32 = 2.0 ** float(1 - E4M3_BIAS)
-            mant = int(abs_f / divisor * 8.0 + 0.5)
-        else:
-            divisor = 2.0 ** float(unbiased_exp)
-            mant = int((abs_f / divisor - 1.0) * 8.0 + 0.5)
-            if mant == 8:
-                mant = 0
-                exp_field += 1
-
-        if exp_field >= 15:
-            exp_field = 14
-            mant = 7
-
-        packed = (sign << 7) | (exp_field << 3) | mant
-    return packed
+    return mxfp8_ops.encode_e4m3(f)
 
 
-def mxfp8_decode_block[BS: int32](
-    scale: uint8, data: uint8[BS], out: float32[BS]
-):
-    s: float32 = decode_e8m0(scale)
-    for i in dsl.grid(BS, name="decode"):
-        out[i] = decode_e4m3(data[i]) * s
+def mxfp8_decode_block[BS: int32](scale: uint8, data: mxfp8[BS], out: float32[BS]):
+    mxfp8_ops.decode_mxfp8_block(scale, data, out)
 
 
 def mxfp8_encode_block[BS: int32](
-    data: float32[BS], scale_out: uint8[1], data_out: uint8[BS]
+    data: float32[BS], scale_out: uint8[1], data_out: mxfp8[BS]
 ):
-    max_val: float32 = 0.0
-    for i in dsl.grid(BS, name="find_max"):
-        v: float32 = data[i]
-        av: float32 = v
-        if v < 0.0:
-            av = 0.0 - v
-        if av > max_val:
-            max_val = av
-
-    scale_out[0] = encode_e8m0(max_val)
-    s: float32 = decode_e8m0(scale_out[0])
-
-    for i in dsl.grid(BS, name="encode"):
-        scaled: float32 = data[i]
-        if s != 0.0:
-            scaled = data[i] / s
-        data_out[i] = encode_e4m3(scaled)
+    mxfp8_ops.encode_mxfp8_block(data, scale_out, data_out)
 
 
 def mxfp8_block_add[BS: int32](
     scale_a: uint8,
-    data_a: uint8[BS],
+    data_a: mxfp8[BS],
     scale_b: uint8,
-    data_b: uint8[BS],
+    data_b: mxfp8[BS],
     scale_out: uint8[1],
-    data_out: uint8[BS],
+    data_out: mxfp8[BS],
 ):
-    buf: float32[BS]
-    sa: float32 = decode_e8m0(scale_a)
-    sb: float32 = decode_e8m0(scale_b)
-    for i in dsl.grid(BS, name="decode_add"):
-        buf[i] = decode_e4m3(data_a[i]) * sa + decode_e4m3(data_b[i]) * sb
-    mxfp8_encode_block[BS](buf, scale_out, data_out)
+    mxfp8_ops.block_add_mxfp8(
+        scale_a, data_a, scale_b, data_b, scale_out, data_out
+    )
+
+
+def mxfp8_block_matmul[BS: int32](
+    scale_a: uint8,
+    data_a: mxfp8[BS],
+    scale_b: uint8,
+    data_b: mxfp8[BS],
+    scale_out: uint8[1],
+    data_out: mxfp8[BS],
+):
+    mxfp8_ops.block_matmul_mxfp8(
+        scale_a, data_a, scale_b, data_b, scale_out, data_out
+    )
 
 
 def schedule_mxfp8_block_add(s):
-    assert s.top_func_name == "mxfp8_block_add"
-    loops = s.get_loops(s.top_func_name)
-    s.pipeline(loops["decode_add"]["i"])
-    encode_loops = s.get_loops("mxfp8_encode_block")
-    s.pipeline(encode_loops["find_max"]["i"])
-    s.pipeline(encode_loops["encode"]["i"])
+    # Native block_add_mxfp8 lowers to a single intrinsic without inner loops.
     return s

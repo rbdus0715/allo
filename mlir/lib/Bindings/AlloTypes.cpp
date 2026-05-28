@@ -109,4 +109,17 @@ void mlir::python::populateAlloIRTypes(nb::module_ &m) {
           "depth",
           [](MlirType type) { return alloMlirStreamTypeGetDepth(type); },
           "Returns the depth of the stream");
+
+  mlir_type_subclass(m, "Mxfp8Type", alloMlirTypeIsAMxfp8Type)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, size_t blockSize, MlirContext ctx) {
+            return cls(alloMlirMxfp8TypeGet(ctx, blockSize));
+          },
+          "Get an instance of Mxfp8Type in given context.", nb::arg("cls"),
+          nb::arg("block_size"), nb::arg("context") = nb::none())
+      .def_property_readonly(
+          "block_size",
+          [](MlirType type) { return alloMlirMxfp8TypeGetBlockSize(type); },
+          "Returns the block size of the MXFP8 type");
 }

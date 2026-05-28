@@ -86,6 +86,8 @@ static SmallString<16> getTypeName(Type valType) {
     return SmallString<16>(
         "ap_ufixed<" + std::to_string(ufixedType.getWidth()) + ", " +
         std::to_string(ufixedType.getWidth() - ufixedType.getFrac()) + ">");
+  else if (llvm::isa<allo::Mxfp8Type>(valType))
+    return SmallString<16>("uint8_t");
   else if (auto streamType = llvm::dyn_cast<StreamType>(valType))
     return SmallString<16>(
         "tapa::stream< " +
@@ -260,6 +262,19 @@ public:
   bool visitOp(memref::DimOp op) { return emitter.emitDim(op), true; }
   bool visitOp(memref::RankOp op) { return emitter.emitRank(op), true; }
 
+  bool visitOp(allo::DecodeMxfp8BlockOp op) {
+    return emitter.emitMxfp8DecodeBlock(op), true;
+  }
+  bool visitOp(allo::EncodeMxfp8BlockOp op) {
+    return emitter.emitMxfp8EncodeBlock(op), true;
+  }
+  bool visitOp(allo::BlockAddMxfp8Op op) {
+    return emitter.emitMxfp8BlockAdd(op), true;
+  }
+  bool visitOp(allo::BlockMatMulMxfp8Op op) {
+    return emitter.emitMxfp8BlockMatMul(op), true;
+  }
+
 private:
   TapaModuleEmitter &emitter;
 };
@@ -419,6 +434,19 @@ public:
   }
   bool visitOp(allo::MaxFixedOp op) {
     return emitter.emitMaxMin(op, "max"), true;
+  }
+
+  bool visitOp(allo::DecodeE4m3Op op) {
+    return emitter.emitUnary(op, "allo_decode_e4m3"), true;
+  }
+  bool visitOp(allo::EncodeE4m3Op op) {
+    return emitter.emitUnary(op, "allo_encode_e4m3"), true;
+  }
+  bool visitOp(allo::DecodeE8m0Op op) {
+    return emitter.emitUnary(op, "allo_decode_e8m0"), true;
+  }
+  bool visitOp(allo::EncodeE8m0Op op) {
+    return emitter.emitUnary(op, "allo_encode_e8m0"), true;
   }
 
   /// Stream operations.
@@ -2532,6 +2560,69 @@ void allo::hls::TapaModuleEmitter::emitHostFunction(func::FuncOp func) {
   os << "\n";
 }
 
+void allo::hls::TapaModuleEmitter::emitMxfp8DecodeBlock(
+    allo::DecodeMxfp8BlockOp op) {
+  auto bs = cast<MemRefType>(op.getData().getType()).getShape()[0];
+  indent();
+  os << "allo_decode_mxfp8_block(" << bs << ", ";
+  emitValue(op.getScale());
+  os << ", ";
+  emitValue(op.getData());
+  os << ", ";
+  emitValue(op.getOut());
+  os << ");\n";
+}
+
+void allo::hls::TapaModuleEmitter::emitMxfp8EncodeBlock(
+    allo::EncodeMxfp8BlockOp op) {
+  auto bs = cast<MemRefType>(op.getDataOut().getType()).getShape()[0];
+  indent();
+  os << "allo_encode_mxfp8_block(" << bs << ", ";
+  emitValue(op.getData());
+  os << ", ";
+  emitValue(op.getScaleOut());
+  os << ", ";
+  emitValue(op.getDataOut());
+  os << ");\n";
+}
+
+void allo::hls::TapaModuleEmitter::emitMxfp8BlockAdd(allo::BlockAddMxfp8Op op) {
+  auto bs = cast<MemRefType>(op.getDataA().getType()).getShape()[0];
+  indent();
+  os << "allo_block_add_mxfp8(" << bs << ", ";
+  emitValue(op.getScaleA());
+  os << ", ";
+  emitValue(op.getDataA());
+  os << ", ";
+  emitValue(op.getScaleB());
+  os << ", ";
+  emitValue(op.getDataB());
+  os << ", ";
+  emitValue(op.getScaleOut());
+  os << ", ";
+  emitValue(op.getDataOut());
+  os << ");\n";
+}
+
+void allo::hls::TapaModuleEmitter::emitMxfp8BlockMatMul(
+    allo::BlockMatMulMxfp8Op op) {
+  auto bs = cast<MemRefType>(op.getDataA().getType()).getShape()[0];
+  indent();
+  os << "allo_block_matmul_mxfp8(" << bs << ", ";
+  emitValue(op.getScaleA());
+  os << ", ";
+  emitValue(op.getDataA());
+  os << ", ";
+  emitValue(op.getScaleB());
+  os << ", ";
+  emitValue(op.getDataB());
+  os << ", ";
+  emitValue(op.getScaleOut());
+  os << ", ";
+  emitValue(op.getDataOut());
+  os << ");\n";
+}
+
 /// Top-level MLIR module emitter.
 // TODO: overload
 void allo::hls::TapaModuleEmitter::emitModule(ModuleOp module) {
@@ -2550,6 +2641,79 @@ void allo::hls::TapaModuleEmitter::emitModule(ModuleOp module) {
 #include <math.h>
 #include <stdint.h>
 using namespace std;
+
+static const int ALLO_E4M3_BIAS = 7;
+static const int ALLO_E8M0_BIAS = 127;
+static inline float allo_pow2_int(int exp) { return ldexp(1.0f, exp); }
+static inline float allo_decode_e4m3(uint8_t u8) {
+  int sign = (u8 >> 7) & 1;
+  int exp = (u8 >> 3) & 15;
+  int mant = u8 & 7;
+  float val = 0.0f;
+  if (exp == 15 && mant == 7) val = 0.0f;
+  else if (exp == 0) val = float(mant) / 8.0f * allo_pow2_int(1 - ALLO_E4M3_BIAS);
+  else val = (1.0f + float(mant) / 8.0f) * allo_pow2_int(exp - ALLO_E4M3_BIAS);
+  return sign ? -val : val;
+}
+static inline uint8_t allo_encode_e4m3(float f) {
+  if (f == 0.0f) return 0;
+  int sign = (f < 0.0f) ? 1 : 0;
+  float abs_f = sign ? -f : f;
+  int unbiased_exp = -20;
+  for (int e = -20; e < 16; ++e)
+    if (abs_f >= allo_pow2_int(e)) unbiased_exp = e;
+  int exp_field = unbiased_exp + ALLO_E4M3_BIAS;
+  int mant = 0;
+  if (exp_field <= 0) {
+    exp_field = 0;
+    mant = int(abs_f / allo_pow2_int(1 - ALLO_E4M3_BIAS) * 8.0f + 0.5f);
+  } else {
+    mant = int((abs_f / allo_pow2_int(unbiased_exp) - 1.0f) * 8.0f + 0.5f);
+    if (mant == 8) { mant = 0; exp_field += 1; }
+  }
+  if (exp_field >= 15) { exp_field = 14; mant = 7; }
+  return uint8_t((sign << 7) | (exp_field << 3) | mant);
+}
+static inline float allo_decode_e8m0(uint8_t u8) {
+  if (u8 == 0 || u8 == 255) return 0.0f;
+  return allo_pow2_int(int(u8) - ALLO_E8M0_BIAS);
+}
+static inline uint8_t allo_encode_e8m0(float scale) {
+  if (scale <= 0.0f) return 0;
+  int result = 254;
+  for (int e = 1; e < 255; ++e)
+    if (result == 254 && allo_pow2_int(e - ALLO_E8M0_BIAS) >= scale) result = e;
+  return uint8_t(result);
+}
+static inline void allo_decode_mxfp8_block(int bs, uint8_t scale, uint8_t *data, float *out) {
+  float s = allo_decode_e8m0(scale);
+  for (int i = 0; i < bs; ++i) out[i] = allo_decode_e4m3(data[i]) * s;
+}
+static inline void allo_encode_mxfp8_block(int bs, float *data, uint8_t *scale_out, uint8_t *data_out) {
+  float max_val = 0.0f;
+  for (int i = 0; i < bs; ++i) {
+    float av = data[i] < 0.0f ? -data[i] : data[i];
+    if (av > max_val) max_val = av;
+  }
+  scale_out[0] = allo_encode_e8m0(max_val);
+  float s = allo_decode_e8m0(scale_out[0]);
+  for (int i = 0; i < bs; ++i) {
+    float scaled = (s != 0.0f) ? data[i] / s : data[i];
+    data_out[i] = allo_encode_e4m3(scaled);
+  }
+}
+static inline void allo_block_add_mxfp8(int bs, uint8_t scale_a, uint8_t *data_a, uint8_t scale_b, uint8_t *data_b, uint8_t *scale_out, uint8_t *data_out) {
+  float sa = allo_decode_e8m0(scale_a), sb = allo_decode_e8m0(scale_b);
+  float buf[32];
+  for (int i = 0; i < bs; ++i) buf[i] = allo_decode_e4m3(data_a[i]) * sa + allo_decode_e4m3(data_b[i]) * sb;
+  allo_encode_mxfp8_block(bs, buf, scale_out, data_out);
+}
+static inline void allo_block_matmul_mxfp8(int bs, uint8_t scale_a, uint8_t *data_a, uint8_t scale_b, uint8_t *data_b, uint8_t *scale_out, uint8_t *data_out) {
+  float sa = allo_decode_e8m0(scale_a), sb = allo_decode_e8m0(scale_b), acc = 0.0f;
+  for (int i = 0; i < bs; ++i) acc += allo_decode_e4m3(data_a[i]) * sa * allo_decode_e4m3(data_b[i]) * sb;
+  float out[1] = {acc};
+  allo_encode_mxfp8_block(1, out, scale_out, data_out);
+}
 )XXX";
 
   std::string host_header = R"XXX(
