@@ -14,6 +14,7 @@ from ..ir.types import uint8, int32, float32, mxfp8
 MXFP8_BLOCK_SIZE = 32
 E4M3_BIAS = 7
 E8M0_BIAS = 127
+MX_INT_W = 24
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +96,105 @@ def ref_encode_block(data: np.ndarray) -> tuple[int, np.ndarray]:
     return scale_u8, encoded
 
 
+def _sign_extend(val: int, bits: int) -> int:
+    val = int(val) & ((1 << bits) - 1)
+    if val & (1 << (bits - 1)):
+        val -= 1 << bits
+    return val
+
+
+def ref_unpack_mx_elem(e4m3_byte: int, block_scale_u8: int) -> tuple[int, int]:
+    """Unpack one MXFP8 element to (signed mantissa, combined scale byte)."""
+    u8 = int(e4m3_byte) & 0xFF
+    block_scale = int(block_scale_u8) & 0xFF
+    if u8 == 0 or block_scale == 0:
+        return 0, 0
+
+    sign = (u8 >> 7) & 1
+    exp = (u8 >> 3) & 0xF
+    mant = u8 & 0x7
+    if exp == 15 and mant == 7:
+        return 0, 0
+
+    if exp == 0:
+        op = -mant if sign else mant
+        scale = block_scale - 9
+    else:
+        op = -(8 + mant) if sign else (8 + mant)
+        scale = block_scale + exp - E4M3_BIAS
+    return _sign_extend(op, MX_INT_W), scale & 0xFF
+
+
+def ref_nrm_to_float(op: int, scale: int) -> float:
+    if op == 0:
+        return 0.0
+    return _sign_extend(op, MX_INT_W) * (2.0 ** (scale - E8M0_BIAS - 3))
+
+
+def ref_add_nrm(
+    op0: int, op1: int, scale0: int, scale1: int, int_w: int = MX_INT_W
+) -> tuple[int, int]:
+    """Hardware-style MX mantissa addition with scale alignment (add_nrm)."""
+    op0 = _sign_extend(op0, int_w)
+    op1 = _sign_extend(op1, int_w)
+    scale0 = int(scale0) & 0xFF
+    scale1 = int(scale1) & 0xFF
+
+    if scale0 < scale1:
+        op_lrg, op_sml = op1, op0
+        scale_lrg, _scale_sml = scale1, scale0
+    else:
+        op_lrg, op_sml = op0, op1
+        scale_lrg, _scale_sml = scale0, scale1
+
+    scale_diff = (scale_lrg - _scale_sml) & 0xFF
+    if scale_diff > 3:
+        shift_amt = scale_diff - 3
+        all_ones = (1 << int_w) - 1
+        sticky_mask = (~(all_ones << shift_amt)) & all_ones
+        sticky = 1 if (op_sml & sticky_mask) else 0
+    else:
+        sticky = 0
+
+    aug_sml = _sign_extend(op_sml << 3, int_w + 4)
+    if scale_diff < int_w + 4:
+        aug_sml = _sign_extend(aug_sml >> scale_diff, int_w + 4)
+    else:
+        aug_sml = 0
+    aug_sml = (aug_sml & ~1) | sticky
+
+    aug_lrg = _sign_extend(op_lrg << 3, int_w + 4)
+    total = _sign_extend(aug_lrg + aug_sml, int_w + 4)
+    if total == 0:
+        return 0, scale_lrg
+
+    rnd_bit = (total >> 3) & 1
+    sticky_bits = total & 0x7
+    lsb = (total >> 4) & 1
+    inc = rnd_bit and (sticky_bits != 0 or lsb)
+    out = _sign_extend((total >> 3) + (1 if inc else 0), int_w)
+
+    limit = 1 << (int_w - 1)
+    scale_adj = scale_lrg
+    while out >= limit or out < -limit:
+        dropped = out & 1
+        out = _sign_extend(out >> 1, int_w)
+        if dropped and out != 0:
+            out = _sign_extend(out + (1 if out > 0 else -1), int_w)
+        scale_adj = (scale_adj + 1) & 0xFF
+    return out, scale_adj
+
+
 def ref_block_add(
     scale1: int, data1: np.ndarray, scale2: int, data2: np.ndarray
 ) -> tuple[int, np.ndarray]:
-    arr1 = ref_decode_block(scale1, data1)
-    arr2 = ref_decode_block(scale2, data2)
-    arr_sum = arr1 + arr2
-    return ref_encode_block(arr_sum)
+    buf = np.zeros(len(data1), dtype=np.float32)
+    for i, (d1, d2) in enumerate(zip(data1, data2)):
+        o0, sc0 = ref_unpack_mx_elem(d1, scale1)
+        o1, sc1 = ref_unpack_mx_elem(d2, scale2)
+        out, osc = ref_add_nrm(o0, o1, sc0, sc1)
+        buf[i] = ref_nrm_to_float(out, osc)
+    return ref_encode_block(buf)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include <utility>
+
 using namespace mlir;
 using namespace allo;
 
@@ -323,6 +325,155 @@ static int64_t getBlockSizeFromMemRef(Value memref) {
   return 32;
 }
 
+static constexpr int64_t kMxIntW = 24;
+
+static Value signExtendI32(OpBuilder &builder, Location loc, Value v,
+                           int64_t width) {
+  Value i32 = castToI32(builder, loc, v);
+  Value shift = createConstI32(builder, loc, 32 - width);
+  Value shl = builder.create<arith::ShLIOp>(loc, i32, shift);
+  return builder.create<arith::ShRSIOp>(loc, shl, shift);
+}
+
+static std::pair<Value, Value> lowerUnpackMxElem(OpBuilder &builder, Location loc,
+                                                  Value e4m3Byte,
+                                                  Value blockScaleByte) {
+  Value u8 = castToI32(builder, loc, castToI8(builder, loc, e4m3Byte));
+  Value bs = castToI32(builder, loc, castToI8(builder, loc, blockScaleByte));
+  Value c0 = createConstI32(builder, loc, 0);
+  Value c7 = createConstI32(builder, loc, 7);
+  Value c8 = createConstI32(builder, loc, 8);
+  Value c9 = createConstI32(builder, loc, 9);
+  Value c15 = createConstI32(builder, loc, 15);
+
+  Value isZero = builder.create<arith::OrIOp>(
+      loc,
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, u8, c0),
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, bs, c0));
+  Value sign = builder.create<arith::ShRUIOp>(loc, u8, createConstI32(builder, loc, 7));
+  Value exp = builder.create<arith::AndIOp>(
+      loc, builder.create<arith::ShRUIOp>(loc, u8, createConstI32(builder, loc, 3)), c15);
+  Value mant = builder.create<arith::AndIOp>(loc, u8, c7);
+  Value isNan = builder.create<arith::AndIOp>(
+      loc,
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exp, c15),
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, mant, c7));
+  Value isSubnorm = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, exp, c0);
+
+  Value subOp = builder.create<arith::SelectOp>(
+      loc, builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, sign, c0),
+      builder.create<arith::SubIOp>(loc, c0, mant), mant);
+  Value subScale = builder.create<arith::SubIOp>(loc, bs, c9);
+
+  Value normMag = builder.create<arith::AddIOp>(loc, c8, mant);
+  Value normOp = builder.create<arith::SelectOp>(
+      loc, builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, sign, c0),
+      builder.create<arith::SubIOp>(loc, c0, normMag), normMag);
+  Value normScale = builder.create<arith::AddIOp>(
+      loc, bs, builder.create<arith::SubIOp>(loc, exp, createConstI32(builder, loc, kE4M3Bias)));
+
+  Value op = builder.create<arith::SelectOp>(loc, isSubnorm, subOp, normOp);
+  Value scale = builder.create<arith::SelectOp>(loc, isSubnorm, subScale, normScale);
+  op = signExtendI32(builder, loc, op, kMxIntW);
+  scale = builder.create<arith::TruncIOp>(loc, builder.getIntegerType(8), scale);
+  op = builder.create<arith::SelectOp>(loc,
+                                       builder.create<arith::OrIOp>(loc, isZero, isNan), c0, op);
+  scale = builder.create<arith::SelectOp>(
+      loc, builder.create<arith::OrIOp>(loc, isZero, isNan),
+      builder.create<arith::ConstantOp>(loc, builder.getIntegerType(8),
+                                        builder.getIntegerAttr(builder.getIntegerType(8), 0)),
+      scale);
+  return {op, scale};
+}
+
+static Value lowerNrmToFloat(OpBuilder &builder, Location loc, Value op,
+                              Value scaleByte) {
+  Value c0 = createConstI32(builder, loc, 0);
+  Value isZero = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                             castToI32(builder, loc, op), c0);
+  Value scaleI32 = castToI32(builder, loc, scaleByte);
+  Value exp = builder.create<arith::SubIOp>(
+      loc, scaleI32, createConstI32(builder, loc, kE8M0Bias + 3));
+  Value opF = castToF32(builder, loc, signExtendI32(builder, loc, op, kMxIntW));
+  Value scaleF = castToF32(builder, loc, exp);
+  Value pow = builder.create<math::PowFOp>(
+      loc, createConstF32(builder, loc, 2.0f), scaleF);
+  Value val = builder.create<arith::MulFOp>(loc, opF, pow);
+  return builder.create<arith::SelectOp>(loc, isZero, createConstF32(builder, loc, 0.0f),
+                                         val);
+}
+
+static std::pair<Value, Value> lowerAddNrm(OpBuilder &builder, Location loc,
+                                            Value op0, Value op1, Value scale0,
+                                            Value scale1) {
+  Value c0 = createConstI32(builder, loc, 0);
+  Value c1 = createConstI32(builder, loc, 1);
+  Value c3 = createConstI32(builder, loc, 3);
+  Value c7 = createConstI32(builder, loc, 7);
+  Value op0s = signExtendI32(builder, loc, op0, kMxIntW);
+  Value op1s = signExtendI32(builder, loc, op1, kMxIntW);
+  Value sc0 = castToI32(builder, loc, scale0);
+  Value sc1 = castToI32(builder, loc, scale1);
+
+  Value useFirst = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, sc0, sc1);
+  Value opLrg = builder.create<arith::SelectOp>(loc, useFirst, op0s, op1s);
+  Value opSml = builder.create<arith::SelectOp>(loc, useFirst, op1s, op0s);
+  Value scaleLrg = builder.create<arith::SelectOp>(loc, useFirst, sc0, sc1);
+  Value scaleSml = builder.create<arith::SelectOp>(loc, useFirst, sc1, sc0);
+
+  Value scaleDiff = builder.create<arith::SubIOp>(loc, scaleLrg, scaleSml);
+  Value gt3 = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, scaleDiff, c3);
+  Value shiftAmt = builder.create<arith::SubIOp>(loc, scaleDiff, c3);
+  Value allOnes = createConstI32(builder, loc, (1 << kMxIntW) - 1);
+  Value stickyMask = builder.create<arith::AndIOp>(
+      loc, builder.create<arith::XOrIOp>(loc, allOnes,
+                                       builder.create<arith::ShLIOp>(loc, allOnes, shiftAmt)),
+      allOnes);
+  Value stickyNonZero = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::ne,
+      builder.create<arith::AndIOp>(loc, opSml, stickyMask), createConstI32(builder, loc, 0));
+  Value sticky = builder.create<arith::SelectOp>(
+      loc, gt3,
+      builder.create<arith::SelectOp>(loc, stickyNonZero, c1, c0), c0);
+
+  Value augSml = signExtendI32(builder, loc,
+                               builder.create<arith::ShLIOp>(loc, opSml, c3), kMxIntW + 4);
+  Value maxShift = createConstI32(builder, loc, kMxIntW + 4);
+  Value inRange = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, scaleDiff, maxShift);
+  augSml = builder.create<arith::SelectOp>(
+      loc, inRange,
+      signExtendI32(builder, loc,
+                    builder.create<arith::ShRSIOp>(loc, augSml, scaleDiff), kMxIntW + 4),
+      createConstI32(builder, loc, 0));
+  augSml = builder.create<arith::OrIOp>(
+      loc, builder.create<arith::AndIOp>(loc, augSml, builder.create<arith::XOrIOp>(loc, augSml, c1)),
+      sticky);
+  Value augLrg = signExtendI32(builder, loc,
+                               builder.create<arith::ShLIOp>(loc, opLrg, c3), kMxIntW + 4);
+  Value total = signExtendI32(builder, loc,
+                              builder.create<arith::AddIOp>(loc, augLrg, augSml), kMxIntW + 4);
+
+  Value isZero = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, total, c0);
+  Value rndBit = builder.create<arith::AndIOp>(
+      loc, builder.create<arith::ShRUIOp>(loc, total, c3), c1);
+  Value stickyBits = builder.create<arith::AndIOp>(loc, total, c7);
+  Value lsb = builder.create<arith::AndIOp>(
+      loc, builder.create<arith::ShRUIOp>(loc, total, createConstI32(builder, loc, 4)), c1);
+  Value hasSticky = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, stickyBits, c0);
+  Value hasStickyI32 = builder.create<arith::ExtUIOp>(loc, builder.getI32Type(), hasSticky);
+  Value incCond = builder.create<arith::AndIOp>(
+      loc, rndBit,
+      builder.create<arith::OrIOp>(loc, hasStickyI32, lsb));
+  Value inc = builder.create<arith::SelectOp>(loc,
+      builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, incCond, c0), c1, c0);
+  Value shifted = builder.create<arith::ShRSIOp>(loc, total, c3);
+  Value out = signExtendI32(builder, loc,
+                            builder.create<arith::AddIOp>(loc, shifted, inc), kMxIntW);
+  Value outScale = builder.create<arith::TruncIOp>(loc, builder.getIntegerType(8), scaleLrg);
+  out = builder.create<arith::SelectOp>(loc, isZero, c0, out);
+  return {out, outScale};
+}
+
 static void lowerDecodeMxfp8Block(DecodeMxfp8BlockOp op) {
   OpBuilder builder(op);
   Location loc = op.getLoc();
@@ -399,8 +550,6 @@ static void lowerBlockAddMxfp8(BlockAddMxfp8Op op) {
   auto f32Ty = builder.getF32Type();
   auto bufTy = MemRefType::get({bs}, f32Ty);
   Value buf = builder.create<memref::AllocaOp>(loc, bufTy);
-  Value sa = lowerDecodeE8m0(builder, loc, op.getScaleA());
-  Value sb = lowerDecodeE8m0(builder, loc, op.getScaleB());
   Value c0 = createConstI32(builder, loc, 0);
   Value c1 = createConstI32(builder, loc, 1);
   Value cbs = createConstI32(builder, loc, bs);
@@ -409,13 +558,12 @@ static void lowerBlockAddMxfp8(BlockAddMxfp8Op op) {
       loc, c0, cbs, c1, ValueRange(),
       [&](OpBuilder &b, Location l, Value i, ValueRange) {
         Value idx = castToIndex(b, l, i);
-        Value a = lowerDecodeE4m3(
-            b, l, b.create<memref::LoadOp>(l, op.getDataA(), ValueRange({idx})));
-        Value bb = lowerDecodeE4m3(
-            b, l, b.create<memref::LoadOp>(l, op.getDataB(), ValueRange({idx})));
-        Value sum = b.create<arith::AddFOp>(
-            l, b.create<arith::MulFOp>(l, a, sa),
-            b.create<arith::MulFOp>(l, bb, sb));
+        Value aByte = b.create<memref::LoadOp>(l, op.getDataA(), ValueRange({idx}));
+        Value bByte = b.create<memref::LoadOp>(l, op.getDataB(), ValueRange({idx}));
+        auto ua = lowerUnpackMxElem(b, l, aByte, op.getScaleA());
+        auto ub = lowerUnpackMxElem(b, l, bByte, op.getScaleB());
+        auto added = lowerAddNrm(b, l, ua.first, ub.first, ua.second, ub.second);
+        Value sum = lowerNrmToFloat(b, l, added.first, added.second);
         b.create<memref::StoreOp>(l, sum, buf, ValueRange({idx}));
         b.create<scf::YieldOp>(l);
       });

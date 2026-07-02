@@ -97,7 +97,7 @@ def test_block_add_native_vhls():
     s = allo.customize(kernel, instantiate=[bs])
     hls_mod = s.build(target="vhls")
     assert "allo_block_add_mxfp8" in hls_mod.hls_code
-    assert "allo_decode_e4m3" in hls_mod.hls_code
+    assert "allo_add_nrm" in hls_mod.hls_code
 
 
 def test_block_matmul_native():

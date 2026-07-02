@@ -3275,14 +3275,122 @@ static inline void allo_encode_mxfp8_block(int bs, float *data, uint8_t *scale_o
   }
 }
 
+static const int ALLO_MX_INT_W = 24;
+
+static inline int32_t allo_sign_extend_i32(int32_t v, int w) {
+  int32_t mask = (1 << w) - 1;
+  v &= mask;
+  if (v & (1 << (w - 1)))
+    v |= ~mask;
+  return v;
+}
+
+static inline void allo_unpack_mx_elem(uint8_t e4m3, uint8_t block_scale,
+                                       int32_t *op, uint8_t *scale_out) {
+  if (e4m3 == 0 || block_scale == 0) {
+    *op = 0;
+    *scale_out = 0;
+    return;
+  }
+  int sign = (e4m3 >> 7) & 1;
+  int exp = (e4m3 >> 3) & 0xF;
+  int mant = e4m3 & 7;
+  if (exp == 15 && mant == 7) {
+    *op = 0;
+    *scale_out = 0;
+    return;
+  }
+  int32_t op_val;
+  uint8_t sc;
+  if (exp == 0) {
+    op_val = sign ? -mant : mant;
+    sc = (uint8_t)(block_scale - 9);
+  } else {
+    op_val = sign ? -(8 + mant) : (8 + mant);
+    sc = (uint8_t)(block_scale + exp - ALLO_E4M3_BIAS);
+  }
+  *op = allo_sign_extend_i32(op_val, ALLO_MX_INT_W);
+  *scale_out = sc;
+}
+
+static inline float allo_nrm_to_float(int32_t op, uint8_t scale) {
+  if (op == 0)
+    return 0.0f;
+  op = allo_sign_extend_i32(op, ALLO_MX_INT_W);
+  return float(op) * allo_pow2_int(int(scale) - ALLO_E8M0_BIAS - 3);
+}
+
+static inline void allo_add_nrm(int32_t op0, int32_t op1, uint8_t scale0, uint8_t scale1,
+                                int32_t *out, uint8_t *o_scale) {
+  const int int_w = ALLO_MX_INT_W;
+  op0 = allo_sign_extend_i32(op0, int_w);
+  op1 = allo_sign_extend_i32(op1, int_w);
+  int32_t op_lrg, op_sml;
+  uint8_t scale_lrg, scale_sml;
+  if (scale0 < scale1) {
+    op_lrg = op1;
+    op_sml = op0;
+    scale_lrg = scale1;
+    scale_sml = scale0;
+  } else {
+    op_lrg = op0;
+    op_sml = op1;
+    scale_lrg = scale0;
+    scale_sml = scale1;
+  }
+  int scale_diff = (int)scale_lrg - (int)scale_sml;
+  int sticky = 0;
+  if (scale_diff > 3) {
+    int shift_amt = scale_diff - 3;
+    int32_t all_ones = (1 << int_w) - 1;
+    int32_t sticky_mask = ~(all_ones << shift_amt) & all_ones;
+    sticky = (op_sml & sticky_mask) != 0 ? 1 : 0;
+  }
+  int32_t aug_sml = allo_sign_extend_i32(op_sml << 3, int_w + 4);
+  if (scale_diff < int_w + 4)
+    aug_sml = allo_sign_extend_i32(aug_sml >> scale_diff, int_w + 4);
+  else
+    aug_sml = 0;
+  aug_sml = (aug_sml & ~1) | sticky;
+  int32_t aug_lrg = allo_sign_extend_i32(op_lrg << 3, int_w + 4);
+  int32_t total = allo_sign_extend_i32(aug_lrg + aug_sml, int_w + 4);
+  if (total == 0) {
+    *out = 0;
+    *o_scale = scale_lrg;
+    return;
+  }
+  int rnd_bit = (total >> 3) & 1;
+  int sticky2 = total & 7;
+  int lsb = (total >> 4) & 1;
+  int inc = rnd_bit && (sticky2 != 0 || lsb);
+  int32_t result = allo_sign_extend_i32((total >> 3) + inc, int_w);
+  int limit = 1 << (int_w - 1);
+  uint8_t scale_adj = scale_lrg;
+  while (result >= limit || result < -limit) {
+    int dropped = result & 1;
+    result = allo_sign_extend_i32(result >> 1, int_w);
+    if (dropped && result != 0)
+      result = allo_sign_extend_i32(result + (result > 0 ? 1 : -1), int_w);
+    scale_adj = (uint8_t)(scale_adj + 1);
+  }
+  *out = result;
+  *o_scale = scale_adj;
+}
+
 static inline void allo_block_add_mxfp8(int bs, uint8_t scale_a, uint8_t *data_a,
                                         uint8_t scale_b, uint8_t *data_b,
                                         uint8_t *scale_out, uint8_t *data_out) {
-  float sa = allo_decode_e8m0(scale_a);
-  float sb = allo_decode_e8m0(scale_b);
   float buf[32];
-  for (int i = 0; i < bs; ++i)
-    buf[i] = allo_decode_e4m3(data_a[i]) * sa + allo_decode_e4m3(data_b[i]) * sb;
+  for (int i = 0; i < bs; ++i) {
+    int32_t o0, o1;
+    uint8_t s0, s1;
+    allo_unpack_mx_elem(data_a[i], scale_a, &o0, &s0);
+    allo_unpack_mx_elem(data_b[i], scale_b, &o1, &s1);
+    int32_t out;
+    uint8_t osc;
+    allo_add_nrm(o0, o1, s0, s1, &out, &osc);
+    buf[i] = allo_nrm_to_float(out, osc);
+  }
   allo_encode_mxfp8_block(bs, buf, scale_out, data_out);
 }
 

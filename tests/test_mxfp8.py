@@ -70,10 +70,21 @@ def test_mxfp8_block_add_kernel():
     assert np.allclose(out, a + b, atol=0.5)
 
 
+def test_add_nrm_scalar():
+    from allo.library.mxfp8 import ref_add_nrm, ref_unpack_mx_elem, ref_nrm_to_float
+
+    s1, d1 = ref_encode_block(np.array([1.0], dtype=np.float32))
+    s2, d2 = ref_encode_block(np.array([1.0], dtype=np.float32))
+    o0, sc0 = ref_unpack_mx_elem(d1[0], s1)
+    o1, sc1 = ref_unpack_mx_elem(d2[0], s2)
+    out, osc = ref_add_nrm(o0, o1, sc0, sc1)
+    assert abs(ref_nrm_to_float(out, osc) - 2.0) < 0.25
+
+
 def test_mxfp8_block_add_vhls():
     bs = MXFP8_BLOCK_SIZE
     s = allo.customize(mxfp8.mxfp8_block_add, instantiate=[bs])
     hls_mod = s.build(target="vhls")
     assert "void mxfp8_block_add" in hls_mod.hls_code
     assert "allo_block_add_mxfp8" in hls_mod.hls_code
-    assert "allo_decode_e4m3" in hls_mod.hls_code
+    assert "allo_add_nrm" in hls_mod.hls_code
