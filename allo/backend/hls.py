@@ -5,6 +5,7 @@
 import os
 import re
 import io
+import signal
 import subprocess
 import time
 import numpy as np
@@ -72,6 +73,22 @@ def run_process(cmd, pattern=None):
     if pattern:
         return re.findall(pattern, out.decode("utf-8"))
     return out.decode("utf-8")
+
+
+def _run_shell_cmd(cmd):
+    """Run shell command without LLVM subprocess signal-handler conflicts."""
+    for sig in (signal.SIGCHLD, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+    ret = os.system(cmd)
+    if os.WIFEXITED(ret):
+        status = os.WEXITSTATUS(ret)
+    else:
+        status = ret
+    if status != 0:
+        raise RuntimeError(f"Command failed with exit code {status}: {cmd}")
 
 
 def codegen_tcl(top, configs):
@@ -610,13 +627,7 @@ class HLSModule:
                     f"cd {self.project}; make run TARGET={self.mode} PLATFORM=$XDEVICE"
                 )
                 print(cmd)
-                if shell:
-                    process = subprocess.Popen(cmd, shell=True)
-                else:
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-                process.wait()
-                if process.returncode != 0:
-                    raise RuntimeError("Failed to build the project")
+                _run_shell_cmd(cmd)
             else:
                 print("Build folder exists, skip building")
                 # run the executable
@@ -626,12 +637,13 @@ class HLSModule:
                 prefix += (
                     f" XCL_EMULATION_MODE={self.mode}" if self.mode != "hw" else ""
                 )
-                cmd = f"{prefix} ./{self.top_func_name} ../{bitstream_folder}/{self.top_func_name}.xclbin"
+                xclbin = os.path.join(
+                    os.path.basename(bitstream_folder),
+                    f"{self.top_func_name}.xclbin",
+                )
+                cmd = f"{prefix} ./{self.top_func_name} ./{xclbin}"
                 print(cmd)
-                process = subprocess.Popen(cmd, shell=True)
-                process.wait()
-                if process.returncode != 0:
-                    raise RuntimeError("Failed to run the executable")
+                _run_shell_cmd(cmd)
             # Read output tensors from files
             # Determine how many output files to read
             func = find_func_in_module(self.module, self.top_func_name)

@@ -344,6 +344,28 @@ def generate_input_output_buffers(module, top_func_name, flatten=False, mappings
 
 
 # pylint: disable=dangerous-default-value
+def _mxfp8_memref_io_type(owner, operand_number):
+    """Return in/out/both for memref operands of native MXFP8 ops."""
+    if isinstance(owner, allo_d.DecodeMxfp8BlockOp):
+        if operand_number == 1:
+            return "in"
+        if operand_number == 2:
+            return "out"
+    elif isinstance(owner, allo_d.EncodeMxfp8BlockOp):
+        if operand_number == 0:
+            return "in"
+        if operand_number in {1, 2}:
+            return "out"
+    elif isinstance(
+        owner, (allo_d.BlockAddMxfp8Op, allo_d.BlockMatMulMxfp8Op)
+    ):
+        if operand_number in {1, 3}:
+            return "in"
+        if operand_number in {4, 5}:
+            return "out"
+    return None
+
+
 def analyze_arg_load_store_in_func(func, mapping={}):
     res = []
     if func.is_external:
@@ -376,6 +398,14 @@ def analyze_arg_load_store_in_func(func, mapping={}):
                         io_type |= 3
                     else:
                         io_type |= 0
+            else:
+                mxfp8_io = _mxfp8_memref_io_type(use.owner, use.operand_number)
+                if mxfp8_io == "out":
+                    io_type |= 1
+                elif mxfp8_io == "in":
+                    io_type |= 2
+                elif mxfp8_io == "both":
+                    io_type |= 3
         match io_type:
             case 1:
                 res.append("out")

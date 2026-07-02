@@ -150,6 +150,8 @@ def get_bitwidth_from_type(dtype):
         return int(dtype.split(",")[0].split("(")[-1])
     if dtype.startswith("f"):
         return int(dtype[1:])
+    if dtype.startswith("mxfp8"):
+        return 8
     raise RuntimeError("Unsupported type")
 
 
