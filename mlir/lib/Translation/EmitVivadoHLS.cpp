@@ -90,7 +90,7 @@ static SmallString<16> getTypeName(Type valType) {
         std::to_string(ufixedType.getWidth() - ufixedType.getFrac()) + ">");
 
   else if (llvm::isa<allo::Mxfp8Type>(valType))
-    return SmallString<16>("uint8_t");
+    return SmallString<16>("ap_uint<8>");
 
   else if (auto streamType = llvm::dyn_cast<StreamType>(valType)) {
     // Check if the base type is a shaped type (tensor/array) - stream of blocks
@@ -3191,7 +3191,7 @@ static const int ALLO_E8M0_BIAS = 127;
 
 static inline float allo_pow2_int(int exp) { return ldexp(1.0f, exp); }
 
-static inline float allo_decode_e4m3(uint8_t u8) {
+static inline float allo_decode_e4m3(ap_uint<8> u8) {
   int sign = (u8 >> 7) & 1;
   int exp = (u8 >> 3) & 15;
   int mant = u8 & 7;
@@ -3206,7 +3206,7 @@ static inline float allo_decode_e4m3(uint8_t u8) {
   return sign ? -val : val;
 }
 
-static inline uint8_t allo_encode_e4m3(float f) {
+static inline ap_uint<8> allo_encode_e4m3(float f) {
   if (f == 0.0f)
     return 0;
   int sign = (f < 0.0f) ? 1 : 0;
@@ -3232,16 +3232,16 @@ static inline uint8_t allo_encode_e4m3(float f) {
     exp_field = 14;
     mant = 7;
   }
-  return uint8_t((sign << 7) | (exp_field << 3) | mant);
+  return ap_uint<8>((sign << 7) | (exp_field << 3) | mant);
 }
 
-static inline float allo_decode_e8m0(uint8_t u8) {
+static inline float allo_decode_e8m0(ap_uint<8> u8) {
   if (u8 == 0 || u8 == 255)
     return 0.0f;
   return allo_pow2_int(int(u8) - ALLO_E8M0_BIAS);
 }
 
-static inline uint8_t allo_encode_e8m0(float scale) {
+static inline ap_uint<8> allo_encode_e8m0(float scale) {
   if (scale <= 0.0f)
     return 0;
   int result = 254;
@@ -3249,18 +3249,18 @@ static inline uint8_t allo_encode_e8m0(float scale) {
     if (result == 254 && allo_pow2_int(e - ALLO_E8M0_BIAS) >= scale)
       result = e;
   }
-  return uint8_t(result);
+  return ap_uint<8>(result);
 }
 
-static inline void allo_decode_mxfp8_block(int bs, uint8_t scale, uint8_t *data,
+static inline void allo_decode_mxfp8_block(int bs, ap_uint<8> scale, ap_uint<8> *data,
                                            float *out) {
   float s = allo_decode_e8m0(scale);
   for (int i = 0; i < bs; ++i)
     out[i] = allo_decode_e4m3(data[i]) * s;
 }
 
-static inline void allo_encode_mxfp8_block(int bs, float *data, uint8_t *scale_out,
-                                           uint8_t *data_out) {
+static inline void allo_encode_mxfp8_block(int bs, float *data, ap_uint<8> *scale_out,
+                                           ap_uint<8> *data_out) {
   float max_val = 0.0f;
   for (int i = 0; i < bs; ++i) {
     float av = data[i] < 0.0f ? -data[i] : data[i];
@@ -3285,8 +3285,8 @@ static inline int32_t allo_sign_extend_i32(int32_t v, int w) {
   return v;
 }
 
-static inline void allo_unpack_mx_elem(uint8_t e4m3, uint8_t block_scale,
-                                       int32_t *op, uint8_t *scale_out) {
+static inline void allo_unpack_mx_elem(ap_uint<8> e4m3, ap_uint<8> block_scale,
+                                       int32_t *op, ap_uint<8> *scale_out) {
   if (e4m3 == 0 || block_scale == 0) {
     *op = 0;
     *scale_out = 0;
@@ -3301,32 +3301,32 @@ static inline void allo_unpack_mx_elem(uint8_t e4m3, uint8_t block_scale,
     return;
   }
   int32_t op_val;
-  uint8_t sc;
+  ap_uint<8> sc;
   if (exp == 0) {
     op_val = sign ? -mant : mant;
-    sc = (uint8_t)(block_scale - 9);
+    sc = ap_uint<8>(block_scale - 9);
   } else {
     op_val = sign ? -(8 + mant) : (8 + mant);
-    sc = (uint8_t)(block_scale + exp - ALLO_E4M3_BIAS);
+    sc = ap_uint<8>(block_scale + exp - ALLO_E4M3_BIAS);
   }
   *op = allo_sign_extend_i32(op_val, ALLO_MX_INT_W);
   *scale_out = sc;
 }
 
-static inline float allo_nrm_to_float(int32_t op, uint8_t scale) {
+static inline float allo_nrm_to_float(int32_t op, ap_uint<8> scale) {
   if (op == 0)
     return 0.0f;
   op = allo_sign_extend_i32(op, ALLO_MX_INT_W);
   return float(op) * allo_pow2_int(int(scale) - ALLO_E8M0_BIAS - 3);
 }
 
-static inline void allo_add_nrm(int32_t op0, int32_t op1, uint8_t scale0, uint8_t scale1,
-                                int32_t *out, uint8_t *o_scale) {
+static inline void allo_add_nrm(int32_t op0, int32_t op1, ap_uint<8> scale0, ap_uint<8> scale1,
+                                int32_t *out, ap_uint<8> *o_scale) {
   const int int_w = ALLO_MX_INT_W;
   op0 = allo_sign_extend_i32(op0, int_w);
   op1 = allo_sign_extend_i32(op1, int_w);
   int32_t op_lrg, op_sml;
-  uint8_t scale_lrg, scale_sml;
+  ap_uint<8> scale_lrg, scale_sml;
   if (scale0 < scale1) {
     op_lrg = op1;
     op_sml = op0;
@@ -3365,38 +3365,38 @@ static inline void allo_add_nrm(int32_t op0, int32_t op1, uint8_t scale0, uint8_
   int inc = rnd_bit && (sticky2 != 0 || lsb);
   int32_t result = allo_sign_extend_i32((total >> 3) + inc, int_w);
   int limit = 1 << (int_w - 1);
-  uint8_t scale_adj = scale_lrg;
+  ap_uint<8> scale_adj = scale_lrg;
   while (result >= limit || result < -limit) {
     int dropped = result & 1;
     result = allo_sign_extend_i32(result >> 1, int_w);
     if (dropped && result != 0)
       result = allo_sign_extend_i32(result + (result > 0 ? 1 : -1), int_w);
-    scale_adj = (uint8_t)(scale_adj + 1);
+    scale_adj = ap_uint<8>(scale_adj + 1);
   }
   *out = result;
   *o_scale = scale_adj;
 }
 
-static inline void allo_block_add_mxfp8(int bs, uint8_t scale_a, uint8_t *data_a,
-                                        uint8_t scale_b, uint8_t *data_b,
-                                        uint8_t *scale_out, uint8_t *data_out) {
+static inline void allo_block_add_mxfp8(int bs, ap_uint<8> scale_a, ap_uint<8> *data_a,
+                                        ap_uint<8> scale_b, ap_uint<8> *data_b,
+                                        ap_uint<8> *scale_out, ap_uint<8> *data_out) {
   float buf[32];
   for (int i = 0; i < bs; ++i) {
     int32_t o0, o1;
-    uint8_t s0, s1;
+    ap_uint<8> s0, s1;
     allo_unpack_mx_elem(data_a[i], scale_a, &o0, &s0);
     allo_unpack_mx_elem(data_b[i], scale_b, &o1, &s1);
     int32_t out;
-    uint8_t osc;
+    ap_uint<8> osc;
     allo_add_nrm(o0, o1, s0, s1, &out, &osc);
     buf[i] = allo_nrm_to_float(out, osc);
   }
   allo_encode_mxfp8_block(bs, buf, scale_out, data_out);
 }
 
-static inline void allo_block_matmul_mxfp8(int bs, uint8_t scale_a, uint8_t *data_a,
-                                           uint8_t scale_b, uint8_t *data_b,
-                                           uint8_t *scale_out, uint8_t *data_out) {
+static inline void allo_block_matmul_mxfp8(int bs, ap_uint<8> scale_a, ap_uint<8> *data_a,
+                                           ap_uint<8> scale_b, ap_uint<8> *data_b,
+                                           ap_uint<8> *scale_out, ap_uint<8> *data_out) {
   float sa = allo_decode_e8m0(scale_a);
   float sb = allo_decode_e8m0(scale_b);
   float acc = 0.0f;
