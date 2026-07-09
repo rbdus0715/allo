@@ -3,9 +3,10 @@
 
 import numpy as np
 import ml_dtypes
+import pytest
 import allo
-from allo.library.mxfp import mx_quantize_block, mx_quantize
-from allo.ir.types import float32, uint8
+from allo.library.mxfp import mx_quantize_block, mx_quantize, mx_block_dot
+from allo.ir.types import float32, uint8, int32
 import allo.ir.types as T
 
 # (format name, Allo type, ml_dtypes element dtype or None for MXINT8)
@@ -177,3 +178,142 @@ def test_mx_quantize_full_tensor():
         assert int(scales[b]) == ref_scale
         for i in range(K):
             assert int(data_bits[b, i]) == int(ref_bits[i])
+
+
+######################################################################
+# mx_block_dot (Fig 1: block dot product, Kulisch accumulation)
+######################################################################
+
+DOT_K = 16
+
+
+def make_block_dot_kernel(Ty, K):
+    def kernel(
+        a: float32[K], b: float32[K]
+    ) -> ("uint8[1]", "uint8[1]", "uint8[K]", "uint8[K]", "float32[1]", "uint8[1]", "uint8[1]"):
+        sa: uint8[1]
+        sb: uint8[1]
+        a_bytes: uint8[K]
+        b_bytes: uint8[K]
+        scale_a, data_a = mx_quantize_block[Ty, K](a)
+        scale_b, data_b = mx_quantize_block[Ty, K](b)
+        sa[0] = scale_a
+        sb[0] = scale_b
+        for i in range(K):
+            a_bytes[i] = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+            b_bytes[i] = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+
+        out_scale, acc, has_nan, has_inf = mx_block_dot[Ty, K](
+            scale_a, data_a, scale_b, data_b
+        )
+        shift: int32 = int(out_scale) - 127
+        acc_f: float32 = float(acc)
+        if shift >= 0:
+            s: int32 = 0
+            while s < shift:
+                acc_f = acc_f * 2.0
+                s = s + 1
+        else:
+            s: int32 = 0
+            while s < -shift:
+                acc_f = acc_f / 2.0
+                s = s + 1
+        result: float32[1]
+        result[0] = acc_f
+        nan_out: uint8[1]
+        inf_out: uint8[1]
+        nan_out[0] = has_nan
+        inf_out[0] = has_inf
+        return sa, sb, a_bytes, b_bytes, result, nan_out, inf_out
+
+    kernel.__name__ = f"block_dot_{Ty.name}"
+    return kernel
+
+
+def _decode_mxfp_elem(byte_val, elem_dtype):
+    return float(np.array([byte_val], dtype=np.uint8).view(elem_dtype)[0])
+
+
+def test_mx_block_dot_all_formats():
+    # Verify against the SAME quantized values our own kernel produced
+    # (decoded and dot-producted in fp64), not the original unquantized
+    # inputs: this isolates mx_block_dot's own accumulation error from
+    # mx_quantize_block's (already separately verified) quantization
+    # error. Kulisch accumulation should be exact, so error should be 0.
+    rng = np.random.default_rng(3)
+    for name, Ty, elem_dtype in MXFP_FORMATS:
+        mod = allo.customize(make_block_dot_kernel(Ty, DOT_K)).build()
+        for trial in range(10):
+            a = (rng.standard_normal(DOT_K) * 2.0 ** rng.integers(-6, 6)).astype(
+                np.float32
+            )
+            b = (rng.standard_normal(DOT_K) * 2.0 ** rng.integers(-6, 6)).astype(
+                np.float32
+            )
+            sa, sb, a_bytes, b_bytes, result, _, _ = mod(a, b)
+            sa = int(np.asarray(sa).flatten()[0])
+            sb = int(np.asarray(sb).flatten()[0])
+            a_bytes = np.asarray(a_bytes).flatten()
+            b_bytes = np.asarray(b_bytes).flatten()
+            our_dot = float(np.asarray(result).flatten()[0])
+
+            scale_a_val = 2.0 ** (sa - 127)
+            scale_b_val = 2.0 ** (sb - 127)
+            ref_dot = 0.0
+            for i in range(DOT_K):
+                av = _decode_mxfp_elem(int(a_bytes[i]), elem_dtype) * scale_a_val
+                bv = _decode_mxfp_elem(int(b_bytes[i]), elem_dtype) * scale_b_val
+                ref_dot += av * bv
+
+            assert our_dot == pytest.approx(ref_dot, rel=1e-5, abs=1e-30), (
+                f"[{name}] trial {trial}: our={our_dot} ref={ref_dot}"
+            )
+
+
+def test_mx_block_dot_mxint8():
+    Ty = T.mxint8
+    mod = allo.customize(make_block_dot_kernel(Ty, DOT_K)).build()
+    rng = np.random.default_rng(4)
+    for trial in range(10):
+        a = rng.integers(-100, 100, DOT_K).astype(np.float32)
+        b = rng.integers(-100, 100, DOT_K).astype(np.float32)
+        _, _, _, _, result, _, _ = mod(a, b)
+        our_dot = float(np.asarray(result).flatten()[0])
+        ref_dot = float(np.dot(a.astype(np.float64), b.astype(np.float64)))
+        assert our_dot == pytest.approx(ref_dot, rel=1e-3), (
+            f"trial {trial}: our={our_dot} ref={ref_dot}"
+        )
+
+
+def test_mx_block_dot_nan_propagation():
+    Ty = T.mxfp8_e4m3
+    mod = allo.customize(make_block_dot_kernel(Ty, DOT_K)).build()
+    a_nan = np.array([float("nan")] + [1.0] * (DOT_K - 1), dtype=np.float32)
+    b_normal = np.ones(DOT_K, dtype=np.float32)
+    _, _, _, _, _, nan_out, inf_out = mod(a_nan, b_normal)
+    assert int(np.asarray(nan_out).flatten()[0]) == 1
+    assert int(np.asarray(inf_out).flatten()[0]) == 0
+
+    a_normal = np.ones(DOT_K, dtype=np.float32)
+    _, _, _, _, _, nan_out2, inf_out2 = mod(a_normal, b_normal)
+    assert int(np.asarray(nan_out2).flatten()[0]) == 0
+    assert int(np.asarray(inf_out2).flatten()[0]) == 0
+
+
+def test_mx_block_dot_no_overflow_worst_case():
+    # block_size=32, all elements at the format's max magnitude, same
+    # sign: the accumulator must be wide enough (final_accum_bits, not
+    # the narrower block_accum_bits -- see mx_block_dot's own comment)
+    # to hold this exactly without overflow.
+    K32 = 32
+    for name, Ty, elem_dtype in MXFP_FORMATS:
+        max_val = float(ml_dtypes.finfo(elem_dtype).max)
+        mod = allo.customize(make_block_dot_kernel(Ty, K32)).build()
+        a = np.full(K32, max_val, dtype=np.float32)
+        b = np.full(K32, max_val, dtype=np.float32)
+        _, _, _, _, result, _, _ = mod(a, b)
+        our_dot = float(np.asarray(result).flatten()[0])
+        ref_dot = float(K32 * max_val * max_val)
+        assert our_dot == pytest.approx(ref_dot, rel=1e-6), (
+            f"[{name}] worst-case: our={our_dot} ref={ref_dot}"
+        )

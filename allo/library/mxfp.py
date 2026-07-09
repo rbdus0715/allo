@@ -3,7 +3,7 @@
 # pylint: disable=used-before-assignment, unsubscriptable-object
 
 import allo
-from ..ir.types import UInt, int32, uint8, float32
+from ..ir.types import Int, UInt, int32, uint8, uint1, float32
 
 
 def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
@@ -217,3 +217,135 @@ def mx_quantize[Ty, K, N](
         s, w = mx_quantize_block[Ty, K](blk)
         scales[b] = s
         data[b] = w
+
+
+def mx_block_dot[Ty, K](
+    scale_a: uint8, data_a: "Ty", scale_b: uint8, data_b: "Ty"
+) -> ("uint8", "Int(Ty.final_accum_bits)", "uint1", "uint1"):
+    # Fig 1's block dot product: integer multiply (k x multipliers) +
+    # Kulisch (exact, no per-term rounding) accumulation, no
+    # dequantization to float anywhere. Uses final_accum_bits (not the
+    # narrower block_accum_bits) as the accumulator width: block_accum_bits
+    # only bounds a single product term, but summing up to block_size of
+    # them (all same sign, all near the format's max magnitude is a valid,
+    # if adversarial, input) needs ceil(log2(block_size)) extra guard bits
+    # to stay overflow-free -- confirmed empirically, since block_accum_bits
+    # alone overflows on a same-sign, max-magnitude stress input.
+    # Scales are E8M0 (biased by 127, representing a power of two), so
+    # combining them means adding the *unbiased* exponents, not the raw
+    # fields: (scale_a-127) + (scale_b-127) + 127 = scale_a + scale_b - 127.
+    combined_scale: int32 = int(scale_a) + int(scale_b) - 127
+
+    # eexp_min_single is the reference point the per-element significand
+    # products below are shifted against so every product lands at a
+    # non-negative bit offset within the fixed-width accumulator (see
+    # shift_amount below). Folding 2*eexp_min_single into the returned
+    # scale here undoes that shift, so (scale_out, acc) together still
+    # satisfy true_dot_value == acc * 2**(scale_out - 127), exactly like
+    # a single quantized MXFP value -- callers don't need to know this
+    # implementation detail of how the accumulator was aligned.
+    eexp_min_single: int32 = 0
+    with allo.meta_if(Ty.is_float):
+        eexp_min_single = 1 - Ty.bias - Ty.mantissa_bits
+        combined_scale = combined_scale + 2 * eexp_min_single
+
+    combined_scale = min(combined_scale, 254)
+    combined_scale = max(combined_scale, 0)
+    scale_out: uint8 = combined_scale
+
+    acc: Int(Ty.final_accum_bits) = 0
+    has_nan: uint1 = 0
+    has_inf: uint1 = 0
+
+    for i in range(K):
+        with allo.meta_if(Ty.is_float):
+            a_i: UInt(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+            b_i: UInt(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+            sign_a: int32 = a_i[Ty.elem_bits - 1 : Ty.elem_bits]
+            ec_a: int32 = a_i[Ty.mantissa_bits : Ty.elem_bits - 1]
+            m_a: int32 = a_i[0 : Ty.mantissa_bits]
+            sign_b: int32 = b_i[Ty.elem_bits - 1 : Ty.elem_bits]
+            ec_b: int32 = b_i[Ty.mantissa_bits : Ty.elem_bits - 1]
+            m_b: int32 = b_i[0 : Ty.mantissa_bits]
+
+            # Sticky NaN/Inf detection: threaded as separate flags rather
+            # than encoded in the integer accumulator, since ordinary
+            # two's-complement add/shift cannot propagate IEEE-style
+            # special values (see mxfp_dev_plan design notes).
+            is_special_pair: int32 = 0
+            with allo.meta_if(Ty.has_nan or Ty.has_inf):
+                all_ones: int32 = (1 << Ty.exp_bits) - 1
+                a_special: int32 = 0
+                b_special: int32 = 0
+                with allo.meta_if(Ty.has_nan and Ty.has_inf):
+                    # E5M2-style: the whole top exponent code is reserved
+                    # (either Inf or NaN), regardless of mantissa.
+                    if ec_a == all_ones:
+                        a_special = 1
+                    if ec_b == all_ones:
+                        b_special = 1
+                with allo.meta_else():
+                    # E4M3-style: only the single all-ones-mantissa pattern
+                    # at the top exponent code is NaN; every other mantissa
+                    # there (e.g. 448's encoding) is an ordinary normal
+                    # value and must not be treated as special.
+                    nan_mant: int32 = (1 << Ty.mantissa_bits) - 1
+                    if ec_a == all_ones and m_a == nan_mant:
+                        a_special = 1
+                    if ec_b == all_ones and m_b == nan_mant:
+                        b_special = 1
+
+                if a_special == 1 or b_special == 1:
+                    is_special_pair = 1
+                    with allo.meta_if(Ty.has_nan and Ty.has_inf):
+                        # E5M2-style: mantissa nonzero at the reserved
+                        # exponent code means NaN, else Inf.
+                        a_nan: int32 = 0
+                        if a_special == 1 and m_a != 0:
+                            a_nan = 1
+                        b_nan: int32 = 0
+                        if b_special == 1 and m_b != 0:
+                            b_nan = 1
+                        if a_nan == 1 or b_nan == 1:
+                            has_nan = 1
+                        else:
+                            has_inf = 1
+                    with allo.meta_else():
+                        # E4M3-style: the reserved code only ever means
+                        # NaN (no Inf encoding exists in this format).
+                        has_nan = 1
+
+            if is_special_pair == 0:
+                ec_a_eff: int32 = ec_a
+                if ec_a_eff == 0:
+                    ec_a_eff = 1
+                ec_b_eff: int32 = ec_b
+                if ec_b_eff == 0:
+                    ec_b_eff = 1
+
+                sig_a: int32 = m_a
+                if ec_a != 0:
+                    sig_a = (1 << Ty.mantissa_bits) | m_a
+                sig_b: int32 = m_b
+                if ec_b != 0:
+                    sig_b = (1 << Ty.mantissa_bits) | m_b
+
+                # unified effective exponent (true magnitude = sig * 2**eexp)
+                # for both normal (ec>0) and subnormal (ec==0) elements
+                eexp_a: int32 = ec_a_eff - Ty.bias - Ty.mantissa_bits
+                eexp_b: int32 = ec_b_eff - Ty.bias - Ty.mantissa_bits
+
+                shift_amount: int32 = (eexp_a + eexp_b) - 2 * eexp_min_single
+                product_mag: Int(Ty.final_accum_bits) = sig_a * sig_b
+                product_mag = product_mag << shift_amount
+
+                if (sign_a ^ sign_b) == 1:
+                    acc = acc - product_mag
+                else:
+                    acc = acc + product_mag
+        with allo.meta_else():
+            a_i: Int(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+            b_i: Int(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+            acc = acc + int(a_i) * int(b_i)
+
+    return scale_out, acc, has_nan, has_inf
