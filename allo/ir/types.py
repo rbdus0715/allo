@@ -294,13 +294,42 @@ class MXFP(MXScaledType):
         final_accum_bits  = block_accum_bits + ceil(log2(block_size))
     """
 
-    def __init__(self, exp_bits, mantissa_bits, block_size=32, name=None):
+    # compile-time marker so generic Allo kernels can `meta_if(Ty.is_float)`
+    # to branch between the MXFP and MXInt quantize/dot code paths
+    is_float = True
+
+    def __init__(
+        self,
+        exp_bits,
+        mantissa_bits,
+        block_size=32,
+        name=None,
+        has_nan=False,
+        has_inf=False,
+    ):
         self.exp_bits = exp_bits
         self.mantissa_bits = mantissa_bits
+        self.bias = 2 ** (exp_bits - 1) - 1
+        # OCP MX element formats reserve special encodings per-format, not
+        # inferable from (exp_bits, mantissa_bits) alone: MXFP8 E4M3 reserves
+        # one mantissa pattern for NaN only (no Inf), MXFP8 E5M2 reserves the
+        # top exponent code for Inf/NaN like IEEE, and MXFP6/MXFP4 reserve
+        # nothing (fully saturating).
+        self.has_nan = has_nan
+        self.has_inf = has_inf
         elem_bits = 1 + exp_bits + mantissa_bits
         if name is None:
             name = f"mxfp_e{exp_bits}m{mantissa_bits}_k{block_size}"
         super().__init__(elem_bits, block_size, name)
+
+    @property
+    def max_unbiased_exp(self):
+        # the top exponent code is unusable for normal values only when the
+        # format reserves it for Inf (E5M2); E4M3's NaN reservation instead
+        # takes a single mantissa pattern within the top exponent code, so
+        # the code itself still hosts normal values.
+        reserved = 1 if self.has_inf else 0
+        return 2 ** (self.exp_bits - 1) - reserved
 
     @property
     def block_accum_bits(self):
@@ -327,10 +356,20 @@ class MXInt(MXScaledType):
     block_size of them needs ceil(log2(block_size)) additional guard bits.
     """
 
+    is_float = False
+
     def __init__(self, elem_bits, block_size=32, name=None):
         if name is None:
             name = f"mxint{elem_bits}_k{block_size}"
         super().__init__(elem_bits, block_size, name)
+
+    @property
+    def max_unbiased_exp(self):
+        # Algorithm 1 (arXiv:2310.10537) needs emax_elem = floor(log2(largest
+        # normal number in the element format)); for an N-bit two's
+        # complement integer the largest magnitude is 2**(N-1) - 1, whose
+        # floor(log2(.)) is N-2.
+        return self.elem_bits - 2
 
     @property
     def block_accum_bits(self):
@@ -506,8 +545,8 @@ float64 = Float(64, 52, "f64")
 # brain floating point
 bfloat16 = Float(16, 7, "bf16")
 # OCP Microscaling (MX) formats, block_size=32 per spec default
-mxfp8_e4m3 = MXFP(4, 3, 32, "mxfp8_e4m3")
-mxfp8_e5m2 = MXFP(5, 2, 32, "mxfp8_e5m2")
+mxfp8_e4m3 = MXFP(4, 3, 32, "mxfp8_e4m3", has_nan=True, has_inf=False)
+mxfp8_e5m2 = MXFP(5, 2, 32, "mxfp8_e5m2", has_nan=True, has_inf=True)
 mxfp6_e2m3 = MXFP(2, 3, 32, "mxfp6_e2m3")
 mxfp6_e3m2 = MXFP(3, 2, 32, "mxfp6_e3m2")
 mxfp4_e2m1 = MXFP(2, 1, 32, "mxfp4_e2m1")

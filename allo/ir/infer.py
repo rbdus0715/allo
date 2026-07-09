@@ -231,7 +231,22 @@ class TypeInferer(ASTVisitor):
             node.dtype = res.dtype
             node.shape = res.shape
             return node
-        if node.attr in {"bits", "fracs"} and isinstance(res, ast.Name):
+        if node.attr in {
+            "bits",
+            "fracs",
+            "exp_bits",
+            "mantissa_bits",
+            "elem_bits",
+            "block_size",
+            "scale_bits",
+            "bias",
+            "has_nan",
+            "has_inf",
+            "is_float",
+            "max_unbiased_exp",
+            "block_accum_bits",
+            "final_accum_bits",
+        } and isinstance(res, ast.Name):
             node.dtype = res.dtype
             node.shape = res.shape
             return node
@@ -484,10 +499,23 @@ class TypeInferer(ASTVisitor):
         if isinstance(node, ast.Attribute):
             assert isinstance(node.value, ast.Name)
             var = ctx.global_vars[node.value.id]
-            if node.attr == "bits":
-                return sympy.Integer(var.bits)
-            if node.attr == "fracs":
-                return sympy.Integer(var.fracs)
+            if node.attr in {
+                "bits",
+                "fracs",
+                "exp_bits",
+                "mantissa_bits",
+                "elem_bits",
+                "block_size",
+                "scale_bits",
+                "bias",
+                "has_nan",
+                "has_inf",
+                "is_float",
+                "max_unbiased_exp",
+                "block_accum_bits",
+                "final_accum_bits",
+            }:
+                return sympy.Integer(getattr(var, node.attr))
         if isinstance(node, ast.BinOp):
             lhs = TypeInferer.visit_symbol(ctx, node.left)
             rhs = TypeInferer.visit_symbol(ctx, node.right)
