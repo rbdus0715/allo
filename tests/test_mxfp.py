@@ -5,7 +5,13 @@ import numpy as np
 import ml_dtypes
 import pytest
 import allo
-from allo.library.mxfp import mx_quantize_block, mx_quantize, mx_block_dot
+from allo.library.mxfp import (
+    mx_quantize_block,
+    mx_quantize,
+    mx_block_dot,
+    mx_normalize_add,
+    mx_dot_general,
+)
 from allo.ir.types import float32, uint8, int32
 import allo.ir.types as T
 
@@ -317,3 +323,193 @@ def test_mx_block_dot_no_overflow_worst_case():
         assert our_dot == pytest.approx(ref_dot, rel=1e-6), (
             f"[{name}] worst-case: our={our_dot} ref={ref_dot}"
         )
+
+
+######################################################################
+# mx_normalize_add (Fig 2) and mx_dot_general (cross-block reduction)
+######################################################################
+
+
+def test_mx_normalize_add():
+    # mx_normalize_add is parametrized by Ty (not a bare bit-width): Allo's
+    # generic-subscript resolver only accepts a bare name there, not an
+    # attribute expression like Ty.final_accum_bits, so BW is derived
+    # internally from Ty instead (see mx_normalize_add's own comment).
+    #
+    # op0/op1 cross the kernel boundary as plain int32 (not the wide,
+    # non-power-of-2 Int(Ty.final_accum_bits)=43 bits): scalar arguments
+    # at odd wide bit-widths hit the same LLVM-boundary marshalling
+    # fragility already worked around for wide *array* arguments in
+    # mx_quantize/mx_dot_general (see those tests' notes) -- the value is
+    # widened internally instead, via the already-proven assignment cast.
+    Ty = T.mxfp8_e4m3
+    BW = Ty.final_accum_bits
+
+    def kernel(s0: uint8, o0: int32, s1: uint8, o1: int32) -> (
+        "uint8[1]",
+        "float32[1]",
+    ):
+        wide0: Int(Ty.final_accum_bits) = o0
+        wide1: Int(Ty.final_accum_bits) = o1
+        so, out = mx_normalize_add[Ty](s0, wide0, s1, wide1)
+        so_out: uint8[1]
+        val_out: float32[1]
+        so_out[0] = so
+        val_out[0] = float(out)
+        return so_out, val_out
+
+    mod = allo.customize(kernel).build()
+
+    def ref(scale0, op0, scale1, op1):
+        return op0 * 2.0 ** (scale0 - 127) + op1 * 2.0 ** (scale1 - 127)
+
+    cases = [
+        (127, 100, 127, 50),
+        (127, 100, 120, 50),
+        (120, 50, 127, 100),
+        (127, -100, 127, 50),
+        (127, -100, 120, -50),
+        (127, 1000, 127, -999),
+    ]
+    for scale0, op0, scale1, op1 in cases:
+        so, val = mod(scale0, op0, scale1, op1)
+        so = int(np.asarray(so).flatten()[0])
+        val = float(np.asarray(val).flatten()[0])
+        our_val = val * 2.0 ** (so - 127)
+        ref_val = ref(scale0, op0, scale1, op1)
+        assert our_val == pytest.approx(ref_val, rel=1e-2), (
+            f"s0={scale0},o0={op0},s1={scale1},o1={op1}: our={our_val} ref={ref_val}"
+        )
+
+
+def test_mx_normalize_add_overflow_renormalize():
+    # trigger the addition-overflow/renormalize path with an operand near
+    # Int(BW)'s limit; constructed via an internal shift (compile-time
+    # constant amount) since a value that large can't cross the LLVM
+    # boundary as a plain int32 argument.
+    Ty = T.mxfp8_e4m3
+    BW = Ty.final_accum_bits
+
+    def kernel() -> ("uint8[1]", "float32[1]"):
+        s: uint8 = 127
+        big: Int(Ty.final_accum_bits) = 1
+        big = big << (Ty.final_accum_bits - 2)
+        so, out = mx_normalize_add[Ty](s, big, s, big)
+        so_out: uint8[1]
+        val_out: float32[1]
+        so_out[0] = so
+        val_out[0] = float(out)
+        return so_out, val_out
+
+    mod = allo.customize(kernel).build()
+    so, val = mod()
+    so = int(np.asarray(so).flatten()[0])
+    val = float(np.asarray(val).flatten()[0])
+    our_val = val * 2.0 ** (so - 127)
+    ref_val = float(2 * (1 << (BW - 2)))
+    assert our_val == pytest.approx(ref_val, rel=1e-9), f"our={our_val} ref={ref_val}"
+
+
+def make_dot_general_kernel(Ty, K, NB):
+    N = K * NB
+
+    # out-params (not 2D-array returns): returning a 2D array triggered a
+    # fatal crash in the numpy/ctypes memref-marshalling path (segfault in
+    # numpy.ctypeslib.as_array during output extraction) -- a framework
+    # limitation distinct from (but in the same spirit as) the wide-memref
+    # return limitations already worked around elsewhere in this file.
+    def kernel(
+        a: float32[N],
+        b: float32[N],
+        scales_a: uint8[NB],
+        scales_b: uint8[NB],
+        a_bytes: uint8[NB, K],
+        b_bytes: uint8[NB, K],
+        result: float32[1],
+    ):
+        data_a: Ty[NB]
+        data_b: Ty[NB]
+        for blk in range(NB):
+            blk_a: float32[K]
+            blk_b: float32[K]
+            for i in range(K):
+                blk_a[i] = a[blk * K + i]
+                blk_b[i] = b[blk * K + i]
+            sa, wa = mx_quantize_block[Ty, K](blk_a)
+            sb, wb = mx_quantize_block[Ty, K](blk_b)
+            scales_a[blk] = sa
+            scales_b[blk] = sb
+            data_a[blk] = wa
+            data_b[blk] = wb
+            for i in range(K):
+                a_bytes[blk, i] = wa[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+                b_bytes[blk, i] = wb[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+
+        out_scale, acc, has_nan, has_inf = mx_dot_general[Ty, K, N](
+            scales_a, data_a, scales_b, data_b
+        )
+        shift: int32 = int(out_scale) - 127
+        acc_f: float32 = float(acc)
+        if shift >= 0:
+            s: int32 = 0
+            while s < shift:
+                acc_f = acc_f * 2.0
+                s = s + 1
+        else:
+            s: int32 = 0
+            while s < -shift:
+                acc_f = acc_f / 2.0
+                s = s + 1
+        result[0] = acc_f
+
+    kernel.__name__ = f"dot_general_{Ty.name}"
+    return kernel
+
+
+def test_mx_dot_general_all_formats():
+    # cross-block reduction, verified the same way as mx_block_dot: decode
+    # the SAME quantized values our kernel produced and dot them in fp64,
+    # so any deviation is attributable only to mx_dot_general's own
+    # cross-block combine (mx_normalize_add), not to quantization error.
+    K, NB = 8, 4
+    N = K * NB
+    rng = np.random.default_rng(5)
+    for name, Ty, elem_dtype in MXFP_FORMATS:
+        mod = allo.customize(make_dot_general_kernel(Ty, K, NB)).build()
+        for trial in range(5):
+            a = np.concatenate(
+                [
+                    (rng.standard_normal(K) * 2.0 ** rng.integers(-10, 10)).astype(
+                        np.float32
+                    )
+                    for _ in range(NB)
+                ]
+            )
+            b = np.concatenate(
+                [
+                    (rng.standard_normal(K) * 2.0 ** rng.integers(-10, 10)).astype(
+                        np.float32
+                    )
+                    for _ in range(NB)
+                ]
+            )
+            scales_a = np.zeros(NB, dtype=np.uint8)
+            scales_b = np.zeros(NB, dtype=np.uint8)
+            a_bytes = np.zeros((NB, K), dtype=np.uint8)
+            b_bytes = np.zeros((NB, K), dtype=np.uint8)
+            result = np.zeros(1, dtype=np.float32)
+            mod(a, b, scales_a, scales_b, a_bytes, b_bytes, result)
+            our_dot = float(result[0])
+
+            ref_dot = 0.0
+            for blk in range(NB):
+                scale_a_val = 2.0 ** (int(scales_a[blk]) - 127)
+                scale_b_val = 2.0 ** (int(scales_b[blk]) - 127)
+                for i in range(K):
+                    av = _decode_mxfp_elem(int(a_bytes[blk, i]), elem_dtype) * scale_a_val
+                    bv = _decode_mxfp_elem(int(b_bytes[blk, i]), elem_dtype) * scale_b_val
+                    ref_dot += av * bv
+
+            assert our_dot == pytest.approx(ref_dot, rel=1e-3, abs=1e-30), (
+                f"[{name}] trial {trial}: our={our_dot} ref={ref_dot}"
+            )

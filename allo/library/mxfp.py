@@ -5,6 +5,14 @@
 import allo
 from ..ir.types import Int, UInt, int32, uint8, uint1, float32
 
+# extra guard bits mx_normalize_add widens its intermediate sum by, so a
+# single addition's worst-case 1-bit magnitude growth never truncates the
+# alignment-shift's own rounded result before the final renormalize step.
+# Must be a plain Python int (not an Allo-typed kernel variable): it is
+# used inside Int(...) bit-width expressions, which only accept
+# compile-time constants.
+_NORM_ADD_GUARD = 3
+
 
 def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
     # Requantize one float32 element into Ty's (1 + exp_bits + mantissa_bits)
@@ -349,3 +357,123 @@ def mx_block_dot[Ty, K](
             acc = acc + int(a_i) * int(b_i)
 
     return scale_out, acc, has_nan, has_inf
+
+
+def mx_normalize_add[Ty](
+    scale0: uint8, op0: "Int(Ty.final_accum_bits)", scale1: uint8, op1: "Int(Ty.final_accum_bits)"
+) -> ("uint8", "Int(Ty.final_accum_bits)"):
+    # Fig 2: a floating-point-adder-like normalising adder, but combining
+    # whole Kulisch block-dot results rather than per-element mantissas.
+    # Sort by scale, align (barrel-shift + round-to-nearest-even) the
+    # smaller-scale operand into the larger-scale operand's frame, add
+    # losslessly in a widened (BW+GUARD) frame, then round+renormalize
+    # the (at most 1-bit-wider) sum back down to BW bits -- exactly like
+    # a mantissa-carry pushing a floating-point adder's exponent up by 1.
+    #
+    # Parametrized by Ty (not a bare bit-width) only because Allo's
+    # generic-subscript resolver doesn't accept an attribute expression
+    # like mx_normalize_add[Ty.final_accum_bits] at the call site -- Ty
+    # itself, a bare name, works fine, so BW is derived internally instead.
+    # NOTE: bare literal `1` defaults to int32, so `1 << shift_amount` would
+    # silently overflow/wrap for shift_amount >= 32 (very real here: BW can
+    # be into the 40s). Every wide shift below starts from this
+    # already-widened constant instead of a bare `1`.
+    wide_one: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = 1
+    BW: int32 = Ty.final_accum_bits
+
+    hi_scale: int32 = int(scale0)
+    hi_op: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = op0
+    lo_scale: int32 = int(scale1)
+    lo_op: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = op1
+    if int(scale1) > int(scale0):
+        hi_scale = int(scale1)
+        hi_op = op1
+        lo_scale = int(scale0)
+        lo_op = op0
+
+    diff: int32 = hi_scale - lo_scale
+
+    aligned_lo: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = 0
+    if diff > 0:
+        if diff >= BW + _NORM_ADD_GUARD:
+            aligned_lo = 0
+        else:
+            kept: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = lo_op >> diff
+            remainder: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = lo_op & (
+                (wide_one << diff) - 1
+            )
+            halfpoint: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = wide_one << (
+                diff - 1
+            )
+            round_up: int32 = 0
+            if remainder > halfpoint:
+                round_up = 1
+            elif remainder == halfpoint:
+                if (kept & 1) == 1:
+                    round_up = 1
+            if round_up == 1:
+                kept = kept + 1
+            aligned_lo = kept
+    else:
+        aligned_lo = lo_op
+
+    total: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = hi_op + aligned_lo
+
+    max_val: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = (
+        wide_one << (BW - 1)
+    ) - 1
+    min_val: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = -(wide_one << (BW - 1))
+
+    out_scale: int32 = hi_scale
+    result: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = total
+    if total > max_val or total < min_val:
+        # a single addition can grow the magnitude by at most one bit;
+        # shift right by 1 (round-to-nearest-even) and bump the scale,
+        # mirroring a floating-point adder's post-normalize step.
+        bit0: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = total & 1
+        result = total >> 1
+        if bit0 == 1:
+            if (result & 1) == 1:
+                result = result + 1
+        out_scale = hi_scale + 1
+
+    out_scale = min(out_scale, 254)
+    out_scale = max(out_scale, 0)
+    scale_out: uint8 = out_scale
+    out: Int(Ty.final_accum_bits) = result
+    return scale_out, out
+
+
+def mx_dot_general[Ty, K, N](
+    scales_a: "uint8[N // K]",
+    data_a: "Ty[N // K]",
+    scales_b: "uint8[N // K]",
+    data_b: "Ty[N // K]",
+) -> ("uint8", "Int(Ty.final_accum_bits)", "uint1", "uint1"):
+    # Cross-block reduction (Fig 1 + Fig 2 combined): each block pair's
+    # mx_block_dot result is folded into a running (scale, acc) total via
+    # mx_normalize_add, with has_nan/has_inf sticky-OR'd in alongside
+    # (kept a separate, much simpler concern from the magnitude path, see
+    # mx_block_dot). No dequantization to float anywhere in this reduction.
+    acc_scale: uint8 = 0
+    acc_val: Int(Ty.final_accum_bits) = 0
+    has_nan: uint1 = 0
+    has_inf: uint1 = 0
+
+    for b in range(N // K):
+        blk_scale, blk_acc, blk_nan, blk_inf = mx_block_dot[Ty, K](
+            scales_a[b], data_a[b], scales_b[b], data_b[b]
+        )
+        if b == 0:
+            acc_scale = blk_scale
+            acc_val = blk_acc
+        else:
+            acc_scale, acc_val = mx_normalize_add[Ty](
+                acc_scale, acc_val, blk_scale, blk_acc
+            )
+        if blk_nan == 1:
+            has_nan = 1
+        if blk_inf == 1:
+            has_inf = 1
+
+    return acc_scale, acc_val, has_nan, has_inf
