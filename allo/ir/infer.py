@@ -18,6 +18,7 @@ from .types import (
     Fixed,
     UFixed,
     Index,
+    MXScaledType,
     uint1,
     int4,
     int8,
@@ -561,7 +562,7 @@ class TypeInferer(ASTVisitor):
             node.shape = tuple(shape)
             node.dtype = ctx.get_symbol(node.value.id).dtype
         elif len(value.shape) == 0 and isinstance(
-            value.dtype, (Int, UInt)
+            value.dtype, (Int, UInt, MXScaledType)
         ):  # bit operation
             if isinstance(node.slice, (ast.Index, ast.Constant, ast.Name, ast.BinOp)):
                 visit_stmt(ctx, node.slice)

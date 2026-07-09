@@ -76,6 +76,7 @@ from .types import (
     Struct,
     float32,
     Stream,
+    MXScaledType,
     allo_type_from_mlir_type,
 )
 from ..memory import Memory
@@ -602,7 +603,9 @@ class ASTTransformer(ASTBuilder):
             )
             op_result = op.result
             opcls = arith_d.IndexCastOp
-        elif isinstance(src_type, (Int, UInt)) and isinstance(res_type, (Int, UInt)):
+        elif isinstance(src_type, (Int, UInt, MXScaledType)) and isinstance(
+            res_type, (Int, UInt, MXScaledType)
+        ):
             if src_type.bits > res_type.bits:
                 opcls = arith_d.TruncIOp
             elif src_type.bits == res_type.bits:
@@ -616,7 +619,7 @@ class ASTTransformer(ASTBuilder):
                     or src_type.bits == 1
                 ):
                     opcls = arith_d.ExtUIOp
-                elif isinstance(src_type, UInt):
+                elif isinstance(src_type, (UInt, MXScaledType)):
                     opcls = arith_d.ExtUIOp
                 else:
                     opcls = arith_d.ExtSIOp
@@ -1710,7 +1713,8 @@ class ASTTransformer(ASTBuilder):
     ):
         # TODO: Fix tuple idx
         if not (
-            len(node.value.shape) == 0 and isinstance(node.value.dtype, (Int, UInt))
+            len(node.value.shape) == 0
+            and isinstance(node.value.dtype, (Int, UInt, MXScaledType))
         ):
             raise RuntimeError("Can only access bit (slice) for integers")
         # Bit operations should follow the convention in

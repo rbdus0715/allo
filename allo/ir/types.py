@@ -255,6 +255,96 @@ class UFixed(AlloType):
         return allo_d.UFixedType.get(self.bits, self.fracs)
 
 
+class MXScaledType(AlloType):
+    """
+    Base class for OCP Microscaling (MX) formats: a block of `block_size`
+    narrow elements sharing one 8-bit power-of-two scale (E8M0).
+
+    A block is represented as a single packed signless integer word (the
+    same "no new MLIR type" trick used by UInt), laid out MSB to LSB as:
+
+        scale (8 bits) | elem_{block_size-1} | ... | elem_1 | elem_0
+    """
+
+    SCALE_BITS = 8
+
+    def __init__(self, elem_bits, block_size, name):
+        self.elem_bits = elem_bits
+        self.block_size = block_size
+        self.scale_bits = self.SCALE_BITS
+        total_bits = self.scale_bits + block_size * elem_bits
+        super().__init__(total_bits, 0, name)
+
+    def build(self):
+        # Same trick as UInt: no dedicated MLIR type, just a wide signless
+        # integer. Element/scale extraction is done with bit-slice ops.
+        return IntegerType.get_signless(self.bits)
+
+
+class MXFP(MXScaledType):
+    """
+    An OCP Microscaling floating-point format (MXFP): a block of
+    `block_size` narrow (1 + exp_bits + mantissa_bits)-bit floating-point
+    elements sharing one 8-bit power-of-two (E8M0) scale.
+
+    Bit-width sizing (paper Table III) for a no-dequantize Kulisch
+    accumulator dot product:
+        elem_bits         = 1 + exp_bits + mantissa_bits
+        block_accum_bits  = 2 * (1 + 2**exp_bits + (mantissa_bits - 1))
+        final_accum_bits  = block_accum_bits + ceil(log2(block_size))
+    """
+
+    def __init__(self, exp_bits, mantissa_bits, block_size=32, name=None):
+        self.exp_bits = exp_bits
+        self.mantissa_bits = mantissa_bits
+        elem_bits = 1 + exp_bits + mantissa_bits
+        if name is None:
+            name = f"mxfp_e{exp_bits}m{mantissa_bits}_k{block_size}"
+        super().__init__(elem_bits, block_size, name)
+
+    @property
+    def block_accum_bits(self):
+        return 2 * (1 + 2**self.exp_bits + (self.mantissa_bits - 1))
+
+    @property
+    def final_accum_bits(self):
+        return self.block_accum_bits + (self.block_size - 1).bit_length()
+
+    @staticmethod
+    def isinstance(other):
+        return isinstance(other, MXFP)
+
+
+class MXInt(MXScaledType):
+    """
+    An OCP Microscaling integer format (MXINT): a block of `block_size`
+    two's-complement integer elements sharing one 8-bit power-of-two
+    (E8M0) scale. Unlike MXFP, elements have no reserved NaN/Inf encodings.
+
+    Bit-width sizing (standard integer dot-product accumulator, not given
+    by the paper's table since it only covers MXFP): a product of two
+    elem_bits-wide signed elements needs 2*elem_bits bits, and summing
+    block_size of them needs ceil(log2(block_size)) additional guard bits.
+    """
+
+    def __init__(self, elem_bits, block_size=32, name=None):
+        if name is None:
+            name = f"mxint{elem_bits}_k{block_size}"
+        super().__init__(elem_bits, block_size, name)
+
+    @property
+    def block_accum_bits(self):
+        return 2 * self.elem_bits + (self.block_size - 1).bit_length()
+
+    @property
+    def final_accum_bits(self):
+        return self.block_accum_bits
+
+    @staticmethod
+    def isinstance(other):
+        return isinstance(other, MXInt)
+
+
 class Struct(AlloType):
     """A C-like struct
 
@@ -415,3 +505,10 @@ float32 = Float(32, 23, "f32")
 float64 = Float(64, 52, "f64")
 # brain floating point
 bfloat16 = Float(16, 7, "bf16")
+# OCP Microscaling (MX) formats, block_size=32 per spec default
+mxfp8_e4m3 = MXFP(4, 3, 32, "mxfp8_e4m3")
+mxfp8_e5m2 = MXFP(5, 2, 32, "mxfp8_e5m2")
+mxfp6_e2m3 = MXFP(2, 3, 32, "mxfp6_e2m3")
+mxfp6_e3m2 = MXFP(3, 2, 32, "mxfp6_e3m2")
+mxfp4_e2m1 = MXFP(2, 1, 32, "mxfp4_e2m1")
+mxint8 = MXInt(8, 32, "mxint8")

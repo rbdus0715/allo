@@ -720,5 +720,78 @@ def test_type_comparison():
                 assert list_of_types[i] != list_of_types[j]
 
 
+######################################################################
+# MXFP / MXINT (OCP Microscaling) tests
+######################################################################
+
+
+def test_mxfp_bitwidth_formulas():
+    # elem_bits = 1 + exp_bits + mantissa_bits; bits = 8 (scale) + k * elem_bits
+    # block_accum_bits/final_accum_bits follow the paper's Table III formulas
+    assert T.mxfp8_e4m3.elem_bits == 8
+    assert T.mxfp8_e4m3.bits == 264
+    assert T.mxfp8_e4m3.block_accum_bits == 38
+    assert T.mxfp8_e4m3.final_accum_bits == 43
+
+    assert T.mxfp8_e5m2.elem_bits == 8
+    assert T.mxfp8_e5m2.bits == 264
+    assert T.mxfp8_e5m2.block_accum_bits == 68
+    assert T.mxfp8_e5m2.final_accum_bits == 73
+
+    assert T.mxfp6_e2m3.elem_bits == 6
+    assert T.mxfp6_e2m3.bits == 200
+    assert T.mxfp6_e2m3.block_accum_bits == 14
+    assert T.mxfp6_e2m3.final_accum_bits == 19
+
+    assert T.mxfp6_e3m2.elem_bits == 6
+    assert T.mxfp6_e3m2.bits == 200
+    assert T.mxfp6_e3m2.block_accum_bits == 20
+    assert T.mxfp6_e3m2.final_accum_bits == 25
+
+    assert T.mxfp4_e2m1.elem_bits == 4
+    assert T.mxfp4_e2m1.bits == 136
+    assert T.mxfp4_e2m1.block_accum_bits == 10
+    assert T.mxfp4_e2m1.final_accum_bits == 15
+
+    assert T.mxint8.elem_bits == 8
+    assert T.mxint8.bits == 264
+    assert T.mxint8.block_accum_bits == 21
+    assert T.mxint8.final_accum_bits == 21
+
+
+def test_mxfp_type_equality():
+    # same construction params + explicit name -> equal
+    assert T.MXFP(4, 3, 32, "mxfp8_e4m3") == T.mxfp8_e4m3
+    assert T.MXInt(8, 32, "mxint8") == T.mxint8
+    # different params -> not equal
+    assert T.mxfp8_e4m3 != T.mxfp8_e5m2
+    assert T.mxfp6_e2m3 != T.mxfp6_e3m2
+    assert T.mxfp8_e4m3 != T.mxint8
+    # default (auto-generated) name differs from the predefined explicit name
+    assert T.MXFP(4, 3, 32) != T.mxfp8_e4m3
+    # isinstance helpers
+    assert T.MXFP.isinstance(T.mxfp8_e4m3)
+    assert not T.MXFP.isinstance(T.mxint8)
+    assert T.MXInt.isinstance(T.mxint8)
+    assert not T.MXInt.isinstance(T.mxfp8_e4m3)
+
+
+def test_mxfp_bit_slice_smoke():
+    # End-to-end smoke test: a scalar MXFP-typed word can be built, and its
+    # packed scale field can be written/read via ordinary bit-slice syntax.
+    mxfp8_e4m3 = T.mxfp8_e4m3
+    uint8 = T.uint8
+
+    def kernel(scale_byte: uint8) -> uint8:
+        w: mxfp8_e4m3 = 0
+        w[256:264] = scale_byte
+        return w[256:264]
+
+    s = allo.customize(kernel)
+    print(s.module)
+    mod = s.build()
+    assert mod(200) == 200
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
