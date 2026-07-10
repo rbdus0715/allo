@@ -1748,12 +1748,21 @@ class ASTTransformer(ASTBuilder):
                 index = ASTTransformer.build_cast_op(
                     ctx, index, node.slice.dtype, Index()
                 )
-                return allo_d.GetIntBitOp(
+                get_bit_op = allo_d.GetIntBitOp(
                     node.dtype.build(),
                     value_result,
                     index.result,
                     ip=ctx.get_ip(),
                 )
+                # A single extracted bit is always an unsigned 0/1 magnitude
+                # regardless of the source's signedness -- without this,
+                # HLS C++ emission (EmitVivadoHLS.cpp's fixUnsignedType,
+                # driven by this attribute) defaults the result's C type to
+                # signed, which is still usually fine for a 1-bit value but
+                # is inconsistent with GetIntSliceOp below and with how
+                # bit-extraction is used elsewhere in this codebase.
+                get_bit_op.attributes["unsigned"] = UnitAttr.get()
+                return get_bit_op
             else:
                 value_dtype = (
                     node.slice.value.dtype
@@ -1801,13 +1810,25 @@ class ASTTransformer(ASTBuilder):
             )
             # pylint: disable=no-else-return
             if isinstance(node.ctx, ast.Load):
-                return allo_d.GetIntSliceOp(
+                get_slice_op = allo_d.GetIntSliceOp(
                     node.dtype.build(),
                     value_result,
                     upper.result,
                     lower.result,
                     ip=ctx.get_ip(),
                 )
+                # A bit-slice is always an unsigned magnitude regardless of
+                # the source's signedness (e.g. exp_field = bits[23:31] on
+                # a signed int32 `bits` must not be sign-extended). Without
+                # this, EmitVivadoHLS.cpp's C++ emission defaults the
+                # extracted temporary to a signed type, silently wrapping
+                # any extracted value >= half the slice width's range
+                # negative (e.g. an 8-bit slice holding 128-255 becomes a
+                # negative int8_t) -- caught via mx_quantize_block giving a
+                # different shared exponent under real Vitis HLS csim than
+                # under the LLVM JIT for the exact same input.
+                get_slice_op.attributes["unsigned"] = UnitAttr.get()
+                return get_slice_op
             else:  # ast.Store
                 set_slice_op = allo_d.SetIntSliceOp(
                     node.value.dtype.build(),

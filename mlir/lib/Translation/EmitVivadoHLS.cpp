@@ -2077,9 +2077,15 @@ void allo::hls::VhlsModuleEmitter::emitSetBit(allo::SetIntBitOp op) {
 void allo::hls::VhlsModuleEmitter::emitGetSlice(allo::GetIntSliceOp op) {
   indent();
   Value result = op.getResult();
+  // Must run before emitValue below: emitValue prints the declaration's
+  // type name immediately (via getTypeName), so fixing up the result's
+  // signedness *after* that call is too late to affect what's printed --
+  // the declared temporary silently stays signed (e.g. `int8_t` for an
+  // extracted 8-bit exponent field, wrapping values >=128 negative)
+  // regardless of the "unsigned" attribute actually being set.
+  fixUnsignedType(result, op->hasAttr("unsigned"));
   emitValue(result);
   os << ";\n";
-  fixUnsignedType(result, op->hasAttr("unsigned"));
   // generate ap_int types
   indent();
   os << "ap_int<" << op.getNum().getType().getIntOrFloatBitWidth() << "> ";
@@ -2302,7 +2308,29 @@ void allo::hls::VhlsModuleEmitter::emitCall(func::CallOp op) {
   // Handle returned value by the callee.
   // For HLS C++, any function with return values needs those values
   // declared as variables and passed as pointer arguments.
-  for (auto result : op.getResults()) {
+  //
+  // The callee's *own* signature (emitFunctionSignature) already restores
+  // unsigned-ness of its return values from its "otypes" attribute before
+  // printing them -- but that mutates the ReturnOp's operand Values inside
+  // the callee, not the caller's CallOp result Values. Those are a
+  // different set of SSA values (produced by the CallOp itself), and
+  // without this same fix-up they fall back to getTypeName's default
+  // (signless-as-signed), producing a caller-side temporary typed
+  // `int8_t` even when the callee's own parameter is `uint8_t*` --
+  // observed as a "invalid conversion from int8_t* to uint8_t*" HLS C++
+  // compile error for any UInt-returning function call.
+  std::string otypes = "";
+  if (auto calleeFunc = op->getParentOfType<ModuleOp>()
+                            .lookupSymbol<func::FuncOp>(op.getCallee())) {
+    if (calleeFunc->hasAttr("otypes"))
+      otypes = llvm::dyn_cast<StringAttr>(calleeFunc->getAttr("otypes"))
+                   .getValue()
+                   .str();
+  }
+  for (const auto &it : llvm::enumerate(op.getResults())) {
+    Value result = it.value();
+    if (it.index() < otypes.size())
+      fixUnsignedType(result, otypes[it.index()] == 'u');
     if (!isDeclared(result)) {
       indent();
       if (llvm::isa<ShapedType>(result.getType()))
