@@ -213,18 +213,27 @@ def mx_quantize_block[Ty, K](x: "float32[K]") -> ("uint8", "Ty"):
 
 
 def mx_quantize[Ty, K, N](
-    X: "float32[N]", scales: "uint8[N // K]", data: "Ty[N // K]"
+    X: "float32[N]", scales: "uint8[N // K]", data: "uint8[N // K, K]"
 ):
     # out-params (not a tuple return): Allo does not support a plain
     # function returning multiple array-typed (memref) results and
     # destructuring them at the call site, only scalar tuple-returns.
+    #
+    # `data` holds per-element raw bytes, not an array of the packed Ty
+    # word (`Ty[N // K]`): a local/live memref whose element type is wider
+    # than 64 bits and has 3+ elements crashes the MLIR JIT's
+    # ExecutionEngine at MLIRContext teardown (StorageUniquer heap
+    # corruption -- reproduced with plain UInt(72)[N] independent of any
+    # mxfp-specific logic). The packed Ty word is only ever materialized
+    # as a scalar local (`w` below), never stored into an array.
     for b in range(N // K):
         blk: float32[K]
         for i in range(K):
             blk[i] = X[b * K + i]
         s, w = mx_quantize_block[Ty, K](blk)
         scales[b] = s
-        data[b] = w
+        for i in range(K):
+            data[b, i] = w[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
 
 
 def mx_block_dot[Ty, K](
@@ -393,10 +402,20 @@ def mx_normalize_add[Ty](
 
     diff: int32 = hi_scale - lo_scale
 
-    aligned_lo: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = 0
+    # NOTE: round-then-add (rounding the shifted-down lo_op on its own,
+    # before adding it to hi_op) is a classic double-rounding bug -- e.g.
+    # hi_op=-215 (scale134), lo_op=-1438 (scale132, diff=2): the exact
+    # combined value is -574.5 (scale134 units), a tie whose correct
+    # round-to-even result is -574 (even). Rounding lo_op/4=-359.5 to -360
+    # (even) *first*, then adding -215, gives -575 (odd) instead -- wrong
+    # by a full unit at this scale. Fix: add hi_op + floor(lo_op >> diff)
+    # *unrounded* first, keep a guard/sticky pair from the discarded bits,
+    # and make the single round-to-nearest-even decision against the
+    # SUM's own parity, not the shifted operand's parity in isolation.
+    total: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = 0
     if diff > 0:
         if diff >= BW + _NORM_ADD_GUARD:
-            aligned_lo = 0
+            total = hi_op
         else:
             kept: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = lo_op >> diff
             remainder: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = lo_op & (
@@ -405,19 +424,17 @@ def mx_normalize_add[Ty](
             halfpoint: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = wide_one << (
                 diff - 1
             )
+            total = hi_op + kept
             round_up: int32 = 0
             if remainder > halfpoint:
                 round_up = 1
             elif remainder == halfpoint:
-                if (kept & 1) == 1:
+                if (total & 1) == 1:
                     round_up = 1
             if round_up == 1:
-                kept = kept + 1
-            aligned_lo = kept
+                total = total + 1
     else:
-        aligned_lo = lo_op
-
-    total: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = hi_op + aligned_lo
+        total = hi_op + lo_op
 
     max_val: Int(Ty.final_accum_bits + _NORM_ADD_GUARD) = (
         wide_one << (BW - 1)
@@ -446,23 +463,33 @@ def mx_normalize_add[Ty](
 
 def mx_dot_general[Ty, K, N](
     scales_a: "uint8[N // K]",
-    data_a: "Ty[N // K]",
+    data_a: "uint8[N // K, K]",
     scales_b: "uint8[N // K]",
-    data_b: "Ty[N // K]",
+    data_b: "uint8[N // K, K]",
 ) -> ("uint8", "Int(Ty.final_accum_bits)", "uint1", "uint1"):
     # Cross-block reduction (Fig 1 + Fig 2 combined): each block pair's
     # mx_block_dot result is folded into a running (scale, acc) total via
     # mx_normalize_add, with has_nan/has_inf sticky-OR'd in alongside
     # (kept a separate, much simpler concern from the magnitude path, see
     # mx_block_dot). No dequantization to float anywhere in this reduction.
+    #
+    # data_a/data_b hold per-element raw bytes, not `Ty[N // K]` arrays --
+    # see mx_quantize's comment for why a live array of the wide packed Ty
+    # word crashes the MLIR JIT ExecutionEngine. Each block's packed word
+    # is rebuilt as a scalar local (word_a/word_b) immediately before use.
     acc_scale: uint8 = 0
     acc_val: Int(Ty.final_accum_bits) = 0
     has_nan: uint1 = 0
     has_inf: uint1 = 0
 
     for b in range(N // K):
+        word_a: Ty = 0
+        word_b: Ty = 0
+        for i in range(K):
+            word_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = data_a[b, i]
+            word_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = data_b[b, i]
         blk_scale, blk_acc, blk_nan, blk_inf = mx_block_dot[Ty, K](
-            scales_a[b], data_a[b], scales_b[b], data_b[b]
+            scales_a[b], word_a, scales_b[b], word_b
         )
         if b == 0:
             acc_scale = blk_scale

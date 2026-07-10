@@ -161,16 +161,10 @@ def test_mx_quantize_full_tensor():
     Ty = T.mxfp8_e4m3
     N = 16
 
-    # data as raw per-element bytes (uint8[N//K, K]) so the wide Ty[N//K]
-    # word never has to cross the numpy boundary directly.
+    # mx_quantize writes data_bits directly as per-element bytes (see its
+    # docstring comment): no local Ty[N//K] array or manual unpack needed.
     def kernel2(x: float32[N], scales: uint8[N // K], data_bits: uint8[N // K, K]):
-        mx_scales: uint8[N // K]
-        mx_data: Ty[N // K]
-        mx_quantize[Ty, K, N](x, mx_scales, mx_data)
-        for b in range(N // K):
-            scales[b] = mx_scales[b]
-            for i in range(K):
-                data_bits[b, i] = mx_data[b][i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+        mx_quantize[Ty, K, N](x, scales, data_bits)
 
     mod = allo.customize(kernel2).build()
     rng = np.random.default_rng(2)
@@ -411,13 +405,14 @@ def test_mx_normalize_add_overflow_renormalize():
 
 
 def make_dot_general_kernel(Ty, K, NB):
+    # a single fused kernel (quantize both operands, then cross-block
+    # reduce) is safe now that mx_quantize/mx_dot_general never materialize
+    # a local array of the wide packed Ty word (see their docstrings in
+    # allo/library/mxfp.py) -- only uint8 byte buffers cross their
+    # boundaries, so no array-of->64-bit-type memref ever exists to trip
+    # the MLIR JIT ExecutionEngine's MLIRContext-teardown heap corruption.
     N = K * NB
 
-    # out-params (not 2D-array returns): returning a 2D array triggered a
-    # fatal crash in the numpy/ctypes memref-marshalling path (segfault in
-    # numpy.ctypeslib.as_array during output extraction) -- a framework
-    # limitation distinct from (but in the same spirit as) the wide-memref
-    # return limitations already worked around elsewhere in this file.
     def kernel(
         a: float32[N],
         b: float32[N],
@@ -426,28 +421,15 @@ def make_dot_general_kernel(Ty, K, NB):
         a_bytes: uint8[NB, K],
         b_bytes: uint8[NB, K],
         result: float32[1],
+        result_scale: uint8[1],
     ):
-        data_a: Ty[NB]
-        data_b: Ty[NB]
-        for blk in range(NB):
-            blk_a: float32[K]
-            blk_b: float32[K]
-            for i in range(K):
-                blk_a[i] = a[blk * K + i]
-                blk_b[i] = b[blk * K + i]
-            sa, wa = mx_quantize_block[Ty, K](blk_a)
-            sb, wb = mx_quantize_block[Ty, K](blk_b)
-            scales_a[blk] = sa
-            scales_b[blk] = sb
-            data_a[blk] = wa
-            data_b[blk] = wb
-            for i in range(K):
-                a_bytes[blk, i] = wa[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-                b_bytes[blk, i] = wb[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+        mx_quantize[Ty, K, N](a, scales_a, a_bytes)
+        mx_quantize[Ty, K, N](b, scales_b, b_bytes)
 
         out_scale, acc, has_nan, has_inf = mx_dot_general[Ty, K, N](
-            scales_a, data_a, scales_b, data_b
+            scales_a, a_bytes, scales_b, b_bytes
         )
+        result_scale[0] = out_scale
         shift: int32 = int(out_scale) - 127
         acc_f: float32 = float(acc)
         if shift >= 0:
@@ -498,7 +480,8 @@ def test_mx_dot_general_all_formats():
             a_bytes = np.zeros((NB, K), dtype=np.uint8)
             b_bytes = np.zeros((NB, K), dtype=np.uint8)
             result = np.zeros(1, dtype=np.float32)
-            mod(a, b, scales_a, scales_b, a_bytes, b_bytes, result)
+            result_scale = np.zeros(1, dtype=np.uint8)
+            mod(a, b, scales_a, scales_b, a_bytes, b_bytes, result, result_scale)
             our_dot = float(result[0])
 
             ref_dot = 0.0
@@ -510,6 +493,16 @@ def test_mx_dot_general_all_formats():
                     bv = _decode_mxfp_elem(int(b_bytes[blk, i]), elem_dtype) * scale_b_val
                     ref_dot += av * bv
 
-            assert our_dot == pytest.approx(ref_dot, rel=1e-3, abs=1e-30), (
-                f"[{name}] trial {trial}: our={our_dot} ref={ref_dot}"
+            # rel=1e-3 alone is unsound here: mx_dot_general is a *lossy*
+            # sequential shared-exponent (block-floating-point) combiner,
+            # so a block whose magnitude is far below the running total's
+            # current ULP legitimately rounds away to nothing -- that's
+            # correct behavior, not error, and can exceed 0.1% relative to
+            # an unrounded fp64 reference for adversarial magnitude
+            # spreads. Bound the allowed deviation in absolute ULPs of the
+            # result's own scale instead (NB - 1 combine steps, each
+            # contributing at most ~0.5 ULP of its own rounding).
+            ulp = 2.0 ** (int(result_scale[0]) - 127)
+            assert our_dot == pytest.approx(ref_dot, rel=1e-3, abs=NB * ulp), (
+                f"[{name}] trial {trial}: our={our_dot} ref={ref_dot} ulp={ulp}"
             )
