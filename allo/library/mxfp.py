@@ -504,3 +504,55 @@ def mx_dot_general[Ty, K, N](
             has_inf = 1
 
     return acc_scale, acc_val, has_nan, has_inf
+
+
+def mx_to_float32[Ty](
+    scale: uint8, val: "Int(Ty.final_accum_bits)", has_nan: uint1, has_inf: uint1
+) -> float32:
+    # Boundary-only float32 conversion (Fig 1/2's four-port (scale, acc,
+    # has_nan, has_inf) design): the only place an MXFP dot-product result
+    # ever leaves the integer domain. has_inf always maps to +Inf here --
+    # mx_block_dot skips a special element's product term entirely rather
+    # than folding a signed Inf into acc (see its is_special_pair branch),
+    # so no sign is ever tracked for Inf through the accumulator. This is
+    # a documented simplification, not full IEEE-754 Inf-sign propagation.
+    NAN_BITS: int32 = 0x7FC00000
+    INF_BITS: int32 = 0x7F800000
+    out: float32 = 0.0
+    if has_nan == 1:
+        out = NAN_BITS.bitcast()
+    elif has_inf == 1:
+        out = INF_BITS.bitcast()
+    else:
+        shift: int32 = int(scale) - 127
+        acc_f: float32 = float(val)
+        if shift >= 0:
+            s: int32 = 0
+            while s < shift:
+                acc_f = acc_f * 2.0
+                s = s + 1
+        else:
+            s: int32 = 0
+            while s < -shift:
+                acc_f = acc_f / 2.0
+                s = s + 1
+        out = acc_f
+    return out
+
+
+def dot_product[Ty, K, N](A: "float32[N]", B: "float32[N]") -> float32:
+    # Top-level user-facing kernel: plain float32[N] operands in, a single
+    # float32 scalar out. Quantize -> block_dot (folded into dot_general's
+    # cross-block reduction) -> to_float32, with no dequantization to
+    # float anywhere in between -- everything from mx_quantize through
+    # mx_dot_general stays in packed-integer/E8M0-scale form.
+    scales_a: uint8[N // K]
+    scales_b: uint8[N // K]
+    data_a: uint8[N // K, K]
+    data_b: uint8[N // K, K]
+    mx_quantize[Ty, K, N](A, scales_a, data_a)
+    mx_quantize[Ty, K, N](B, scales_b, data_b)
+    out_scale, acc, has_nan, has_inf = mx_dot_general[Ty, K, N](
+        scales_a, data_a, scales_b, data_b
+    )
+    return mx_to_float32[Ty](out_scale, acc, has_nan, has_inf)

@@ -11,6 +11,7 @@ from allo.library.mxfp import (
     mx_block_dot,
     mx_normalize_add,
     mx_dot_general,
+    dot_product,
 )
 from allo.ir.types import float32, uint8, int32
 import allo.ir.types as T
@@ -506,3 +507,118 @@ def test_mx_dot_general_all_formats():
             assert our_dot == pytest.approx(ref_dot, rel=1e-3, abs=NB * ulp), (
                 f"[{name}] trial {trial}: our={our_dot} ref={ref_dot} ulp={ulp}"
             )
+
+
+######################################################################
+# dot_product (top-level kernel: float32[N], float32[N] -> float32)
+######################################################################
+
+DOT_PRODUCT_K = 32  # OCP MX spec default block_size
+DOT_PRODUCT_NB = 8  # well past the NB>=3 crash threshold this session found
+
+
+def _ref_dot_product_float(a, b, K, elem_dtype):
+    # Reuses ref_mxfp_quantize (already verified bit-exact against
+    # ml_dtypes for every float MX format) per block, so any mismatch is
+    # attributable to dot_product's own pipeline, not to an approximate
+    # reimplementation of the quantizer here.
+    NB = len(a) // K
+    total = 0.0
+    for blk in range(NB):
+        a_scale, a_bits = ref_mxfp_quantize(a[blk * K : (blk + 1) * K], elem_dtype)
+        b_scale, b_bits = ref_mxfp_quantize(b[blk * K : (blk + 1) * K], elem_dtype)
+        a_scale_val = 2.0 ** (a_scale - 127)
+        b_scale_val = 2.0 ** (b_scale - 127)
+        for i in range(K):
+            av = _decode_mxfp_elem(int(a_bits[i]), elem_dtype) * a_scale_val
+            bv = _decode_mxfp_elem(int(b_bits[i]), elem_dtype) * b_scale_val
+            total += av * bv
+    return total
+
+
+def _ref_dot_product_mxint8(a, b, K, Ty):
+    # Mirrors test_mx_quantize_block_mxint8's reference quantizer.
+    NB = len(a) // K
+    elem_max_unbiased = Ty.max_unbiased_exp
+
+    def quantize(x):
+        amax = np.max(np.abs(x))
+        shared_exp = -127.0 if amax == 0 else np.floor(np.log2(amax)) - elem_max_unbiased
+        scale_val = 2.0**shared_exp
+        out = np.zeros(len(x))
+        for i in range(len(x)):
+            scaled = x[i] / scale_val
+            signed = int(scaled + 0.5) if scaled >= 0 else -int(-scaled + 0.5)
+            signed = max(-128, min(127, signed))
+            out[i] = signed * scale_val
+        return out
+
+    total = 0.0
+    for blk in range(NB):
+        aq = quantize(a[blk * K : (blk + 1) * K])
+        bq = quantize(b[blk * K : (blk + 1) * K])
+        total += float(np.sum(aq * bq))
+    return total
+
+
+def test_dot_product_all_formats():
+    K, NB = DOT_PRODUCT_K, DOT_PRODUCT_NB
+    N = K * NB
+    rng = np.random.default_rng(11)
+    all_formats = MXFP_FORMATS + [("mxint8", T.mxint8, None)]
+    for name, Ty, elem_dtype in all_formats:
+
+        def kernel(a: float32[N], b: float32[N]) -> float32:
+            return dot_product[Ty, K, N](a, b)
+
+        mod = allo.customize(kernel).build()
+        for trial in range(5):
+            a = (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
+            b = (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
+            our_dot = float(mod(a, b))
+
+            if name == "mxint8":
+                ref_dot = _ref_dot_product_mxint8(a, b, K, Ty)
+            else:
+                ref_dot = _ref_dot_product_float(a, b, K, elem_dtype)
+
+            # same ULP-in-the-result's-own-scale rationale as
+            # test_mx_dot_general_all_formats: dot_product is built
+            # directly on mx_dot_general's lossy sequential combiner.
+            mag = max(abs(our_dot), abs(ref_dot), 1.0)
+            ulp_guess = mag * 2.0**-8  # generous: within final format's rounding budget
+            assert our_dot == pytest.approx(ref_dot, rel=1e-3, abs=NB * ulp_guess), (
+                f"[{name}] trial {trial}: our={our_dot} ref={ref_dot}"
+            )
+
+
+def test_dot_product_nan_inf():
+    # E4M3 (has_nan, no has_inf) and E5M2 (has both) exercise mx_to_float32's
+    # special-value boundary conversion end to end.
+    K, NB = DOT_PRODUCT_K, DOT_PRODUCT_NB
+    N = K * NB
+
+    for Ty, expect_inf_representable in ((T.mxfp8_e4m3, False), (T.mxfp8_e5m2, True)):
+
+        def kernel(a: float32[N], b: float32[N]) -> float32:
+            return dot_product[Ty, K, N](a, b)
+
+        mod = allo.customize(kernel).build()
+
+        a_nan = np.ones(N, dtype=np.float32)
+        a_nan[0] = float("nan")
+        b_normal = np.ones(N, dtype=np.float32)
+        out = float(mod(a_nan, b_normal))
+        assert np.isnan(out), f"[{Ty.name}] expected NaN, got {out}"
+
+        a_normal = np.ones(N, dtype=np.float32)
+        out2 = float(mod(a_normal, b_normal))
+        assert not np.isnan(out2) and not np.isinf(out2), (
+            f"[{Ty.name}] expected a normal finite result, got {out2}"
+        )
+
+        if expect_inf_representable:
+            a_inf = np.ones(N, dtype=np.float32)
+            a_inf[0] = float("inf")
+            out3 = float(mod(a_inf, b_normal))
+            assert np.isinf(out3), f"[{Ty.name}] expected Inf, got {out3}"
