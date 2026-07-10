@@ -86,6 +86,14 @@ public:
   /// Top-level MLIR module emitter.
   virtual void emitModule(ModuleOp module) {}
 
+  /// Returns true iff `val` should never be declared as its own named
+  /// statement -- instead its defining computation is printed inline (as a
+  /// parenthesized sub-expression) at its single use site. Default `false`
+  /// preserves today's "one statement per SSA op" behavior everywhere;
+  /// only VhlsModuleEmitter overrides this with real logic, so every other
+  /// backend (Tapa/Intel HLS/Catapult/XLS) is unaffected by construction.
+  virtual bool isInlinable(Value val) { return false; }
+
 protected:
   /// C++ component emitters.
   virtual void emitValue(Value val, unsigned rank = 0, bool isPtr = false,

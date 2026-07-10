@@ -10,6 +10,12 @@ using namespace allo;
 using namespace hls;
 
 void ModuleEmitterBase::emitBinary(Operation *op, const char *syntax) {
+  // Values printed inline at their (single) use site never get their own
+  // declared statement -- see VhlsModuleEmitter::isInlinable/emitValue.
+  // Default isInlinable() is always false, so this is a no-op for every
+  // backend except Vitis/Vivado HLS.
+  if (isInlinable(op->getResult(0)))
+    return;
   auto rank = emitNestedLoopHead(op->getResult(0));
   indent();
   Value result = op->getResult(0);

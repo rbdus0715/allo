@@ -575,7 +575,7 @@ public:
 
   /// Special operations.
   bool visitOp(func::CallOp op) { return emitter.emitCall(op), true; }
-  bool visitOp(func::ReturnOp op) { return true; }
+  bool visitOp(func::ReturnOp op) { return emitter.emitReturn(op), true; }
   bool visitOp(arith::SelectOp op) { return emitter.emitSelect(op), true; }
   bool visitOp(arith::ConstantOp op) { return emitter.emitConstant(op), true; }
   bool visitOp(arith::IndexCastOp op) {
@@ -2075,6 +2075,13 @@ void allo::hls::VhlsModuleEmitter::emitSetBit(allo::SetIntBitOp op) {
 }
 
 void allo::hls::VhlsModuleEmitter::emitGetSlice(allo::GetIntSliceOp op) {
+  // Printed inline at its one use site instead -- see
+  // isInlinable/emitInlineExpr. Must check before doing anything else:
+  // emitValue(result) below would otherwise itself dispatch back into
+  // emitInlineExpr (since emitValue is the shared choke point for every
+  // Value print), producing a nonsensical partial statement.
+  if (isInlinable(op.getResult()))
+    return;
   indent();
   Value result = op.getResult();
   // Must run before emitValue below: emitValue prints the declaration's
@@ -2284,6 +2291,10 @@ void allo::hls::VhlsModuleEmitter::emitBitcast(arith::BitcastOp op) {
 
 template <typename CastOpType>
 void allo::hls::VhlsModuleEmitter::emitCast(CastOpType op) {
+  // Printed inline at its one use site instead -- see
+  // isInlinable/emitInlineExpr.
+  if (isInlinable(op.getResult()))
+    return;
   indent();
   Value result = op.getResult();
   fixUnsignedType(result, op->hasAttr("unsigned"));
@@ -2305,6 +2316,58 @@ void allo::hls::VhlsModuleEmitter::emitGeneralCast(
 }
 
 void allo::hls::VhlsModuleEmitter::emitCall(func::CallOp op) {
+  auto calleeFunc =
+      op->getParentOfType<ModuleOp>().lookupSymbol<func::FuncOp>(
+          op.getCallee());
+  Value calleeReturnResult =
+      calleeFunc ? getValueReturnResult(calleeFunc) : nullptr;
+
+  if (calleeReturnResult) {
+    // Real-return callee (see getValueReturnResult): `T tmp = foo(args);`
+    // instead of `T tmp; foo(args, &tmp);` -- or, if this call's own
+    // result is itself single-use, nothing at all here (isInlinable +
+    // emitInlineExpr print `foo(args)` directly at its one use site).
+    //
+    // op.getResults() always has the same length and ordering as the
+    // callee's func::ReturnOp operands (MLIR requires a function's result
+    // arity to match its return op exactly), so the index of
+    // calleeReturnResult within the callee's return operands is also its
+    // index within op.getResults() -- find it to fix its signedness from
+    // the matching otypes character.
+    std::string otypes = "";
+    if (calleeFunc->hasAttr("otypes"))
+      otypes = llvm::dyn_cast<StringAttr>(calleeFunc->getAttr("otypes"))
+                   .getValue()
+                   .str();
+    auto calleeReturn =
+        cast<func::ReturnOp>(calleeFunc.front().getTerminator());
+    unsigned resultIdx = 0;
+    for (const auto &it : llvm::enumerate(calleeReturn.getOperands())) {
+      if (it.value() == calleeReturnResult) {
+        resultIdx = it.index();
+        break;
+      }
+    }
+    Value result = op.getResult(resultIdx);
+    if (resultIdx < otypes.size())
+      fixUnsignedType(result, otypes[resultIdx] == 'u');
+
+    if (isInlinable(result))
+      return; // printed inline at its use site instead
+
+    indent();
+    emitValue(result);
+    os << " = " << op.getCallee() << "(";
+    for (const auto &it : llvm::enumerate(op.getOperands())) {
+      emitValue(it.value());
+      if (it.index() != op.getNumOperands() - 1)
+        os << ", ";
+    }
+    os << ");";
+    emitInfoAndNewLine(op);
+    return;
+  }
+
   // Handle returned value by the callee.
   // For HLS C++, any function with return values needs those values
   // declared as variables and passed as pointer arguments.
@@ -2370,10 +2433,240 @@ void allo::hls::VhlsModuleEmitter::emitCall(func::CallOp op) {
   emitInfoAndNewLine(op);
 }
 
+void allo::hls::VhlsModuleEmitter::emitReturn(func::ReturnOp op) {
+  auto func = op->getParentOfType<func::FuncOp>();
+  Value valueReturnResult = getValueReturnResult(func);
+  if (!valueReturnResult)
+    return; // out-param convention: the return value's own assignment
+            // already wrote into the pointer-named out-param earlier in
+            // the body (see emitFunctionSignature) -- nothing to do here.
+  indent();
+  os << "return ";
+  emitValue(valueReturnResult);
+  os << ";";
+  emitInfoAndNewLine(op);
+}
+
+namespace {
+// Mirrors ExprVisitor's binary-op -> operator-string dispatch table (see
+// the visitOp(arith::AddIOp)-style entries above), minus CmpIOp/CmpFOp,
+// whose operator string depends on a runtime predicate attribute and is
+// handled separately below.
+const char *getFixedBinarySyntax(Operation *op) {
+  if (llvm::isa<arith::AddIOp, arith::AddFOp>(op))
+    return "+";
+  if (llvm::isa<arith::SubIOp, arith::SubFOp>(op))
+    return "-";
+  if (llvm::isa<arith::MulIOp, arith::MulFOp>(op))
+    return "*";
+  if (llvm::isa<arith::DivSIOp, arith::DivUIOp, arith::DivFOp,
+                arith::FloorDivSIOp>(op))
+    return "/";
+  if (llvm::isa<arith::RemSIOp, arith::RemUIOp, arith::RemFOp>(op))
+    return "%";
+  if (llvm::isa<arith::XOrIOp>(op))
+    return "^";
+  if (llvm::isa<arith::AndIOp>(op))
+    return "&";
+  if (llvm::isa<arith::OrIOp>(op))
+    return "|";
+  if (llvm::isa<arith::ShLIOp>(op))
+    return "<<";
+  if (llvm::isa<arith::ShRSIOp, arith::ShRUIOp>(op))
+    return ">>";
+  return nullptr;
+}
+
+// Mirrors ExprVisitor::visitOp(arith::CmpIOp)'s predicate switch.
+const char *getCmpIPredicateSyntax(arith::CmpIPredicate pred) {
+  switch (pred) {
+  case arith::CmpIPredicate::eq:
+    return "==";
+  case arith::CmpIPredicate::ne:
+    return "!=";
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+    return "<";
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+    return "<=";
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+    return ">";
+  case arith::CmpIPredicate::sge:
+  case arith::CmpIPredicate::uge:
+    return ">=";
+  }
+  llvm_unreachable("unsupported CmpIPredicate");
+}
+
+// Mirrors ExprVisitor::visitOp(arith::CmpFOp)'s predicate switch.
+const char *getCmpFPredicateSyntax(arith::CmpFPredicate pred) {
+  switch (pred) {
+  case arith::CmpFPredicate::OEQ:
+  case arith::CmpFPredicate::UEQ:
+    return "==";
+  case arith::CmpFPredicate::ONE:
+  case arith::CmpFPredicate::UNE:
+    return "!=";
+  case arith::CmpFPredicate::OLT:
+  case arith::CmpFPredicate::ULT:
+    return "<";
+  case arith::CmpFPredicate::OLE:
+  case arith::CmpFPredicate::ULE:
+    return "<=";
+  case arith::CmpFPredicate::OGT:
+  case arith::CmpFPredicate::UGT:
+    return ">";
+  case arith::CmpFPredicate::OGE:
+  case arith::CmpFPredicate::UGE:
+    return ">=";
+  default:
+    llvm_unreachable("unsupported CmpFPredicate");
+  }
+}
+
+// The exact set of single-operand cast op types instantiating
+// VhlsModuleEmitter::emitCast<CastOpType> (see the visitOp(...) ->
+// emitCast<...> dispatch table above). Kept as its own check so
+// isInlinable/emitInlineExpr don't have to enumerate them twice.
+bool isSupportedCastOp(Operation *op) {
+  return llvm::isa<arith::IndexCastOp, arith::UIToFPOp, arith::SIToFPOp,
+                   arith::FPToUIOp, arith::FPToSIOp, arith::TruncIOp,
+                   arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp,
+                   arith::ExtFOp>(op);
+}
+} // namespace
+
+bool allo::hls::VhlsModuleEmitter::isInlinable(Value val) {
+  // A value can already be "declared" under a fixed name before its
+  // defining op is ever visited -- e.g. emitFunctionSignature pre-
+  // registers a top-level function's return value as a pointer out-param
+  // name (`*v391`) purely from walking the signature, before the body is
+  // emitted at all. Such a value must never be inlined: there's no single
+  // "use site" to fold it into anymore (its name is already fixed, and
+  // whatever produces it is expected to assign into that exact name).
+  if (isDeclared(val))
+    return false;
+  // Only plain scalars: array/rank-context ops carry their own enclosing
+  // loop (emitNestedLoopHead/Tail) and aren't a single expression.
+  if (llvm::isa<ShapedType>(val.getType()))
+    return false;
+  if (!val.hasOneUse())
+    return false;
+  Operation *defOp = val.getDefiningOp();
+  if (!defOp)
+    return false; // block arguments (e.g. function parameters) never inline
+  Operation *useOp = val.getUses().begin()->getOwner();
+  if (defOp->getBlock() != useOp->getBlock())
+    return false; // keep this a straight-line, same-scope substitution
+
+  if (getFixedBinarySyntax(defOp) != nullptr)
+    return true;
+  if (llvm::isa<arith::CmpIOp, arith::CmpFOp>(defOp))
+    return true;
+  if (isSupportedCastOp(defOp))
+    return true;
+  if (llvm::isa<allo::GetIntSliceOp>(defOp))
+    return true;
+  if (auto callOp = dyn_cast<func::CallOp>(defOp)) {
+    // Only calls to functions already using the real-return convention
+    // (see getValueReturnResult) produce a genuine C++ value expression;
+    // out-param-convention calls have no return value to inline.
+    if (auto calleeFunc =
+            callOp->getParentOfType<ModuleOp>().lookupSymbol<func::FuncOp>(
+                callOp.getCallee()))
+      if (getValueReturnResult(calleeFunc))
+        return true;
+  }
+  return false;
+}
+
+void allo::hls::VhlsModuleEmitter::emitInlineExpr(Value val) {
+  Operation *op = val.getDefiningOp();
+
+  if (const char *syntax = getFixedBinarySyntax(op)) {
+    os << "(";
+    emitValue(op->getOperand(0));
+    os << " " << syntax << " ";
+    emitValue(op->getOperand(1));
+    os << ")";
+    return;
+  }
+
+  if (auto cmpi = dyn_cast<arith::CmpIOp>(op)) {
+    os << "(";
+    emitValue(cmpi.getLhs());
+    os << " " << getCmpIPredicateSyntax(cmpi.getPredicate()) << " ";
+    emitValue(cmpi.getRhs());
+    os << ")";
+    return;
+  }
+  if (auto cmpf = dyn_cast<arith::CmpFOp>(op)) {
+    os << "(";
+    emitValue(cmpf.getLhs());
+    os << " " << getCmpFPredicateSyntax(cmpf.getPredicate()) << " ";
+    emitValue(cmpf.getRhs());
+    os << ")";
+    return;
+  }
+
+  if (isSupportedCastOp(op)) {
+    // Must fix signedness before getTypeName, exactly like emitCast does
+    // for its declaration -- otherwise this reintroduces the same
+    // signed-vs-unsigned ordering bug fixed elsewhere this session.
+    fixUnsignedType(val, op->hasAttr("unsigned"));
+    os << "((" << getTypeName(val) << ")(";
+    emitValue(op->getOperand(0));
+    os << "))";
+    return;
+  }
+
+  if (auto sliceOp = dyn_cast<allo::GetIntSliceOp>(op)) {
+    // Mirrors emitGetSlice's own "widen to ap_int<N>, then slice" logic,
+    // as one nested expression instead of two statements.
+    os << "((ap_int<" << sliceOp.getNum().getType().getIntOrFloatBitWidth()
+       << ">)(";
+    emitValue(sliceOp.getNum());
+    os << "))(";
+    emitValue(sliceOp.getHi());
+    os << ", ";
+    emitValue(sliceOp.getLo());
+    os << ")";
+    return;
+  }
+
+  if (auto callOp = dyn_cast<func::CallOp>(op)) {
+    // No outer parens needed -- a function call already binds tighter
+    // than any operator it might be nested inside.
+    os << callOp.getCallee() << "(";
+    for (const auto &it : llvm::enumerate(callOp.getOperands())) {
+      emitValue(it.value());
+      if (it.index() != callOp.getNumOperands() - 1)
+        os << ", ";
+    }
+    os << ")";
+    return;
+  }
+
+  llvm_unreachable("emitInlineExpr called on a non-inlinable op -- "
+                   "isInlinable's whitelist and this dispatch must stay "
+                   "in sync");
+}
+
 /// C++ component emitters.
 void allo::hls::VhlsModuleEmitter::emitValue(Value val, unsigned rank,
                                              bool isPtr, std::string name) {
   assert(!(rank && isPtr) && "should be either an array or a pointer.");
+
+  // Print the value's defining computation inline, parenthesized, right
+  // here at its one use site, instead of falling through to the
+  // "declare it as its own named temporary" path below.
+  if (rank == 0 && !isPtr && name == "" && !isDeclared(val) &&
+      isInlinable(val)) {
+    emitInlineExpr(val);
+    return;
+  }
 
   // Value has been declared before or is a constant number.
   if (isDeclared(val)) {
@@ -2772,12 +3065,67 @@ void allo::hls::VhlsModuleEmitter::emitFunctionDirectives(
   // }
 }
 
+Value allo::hls::VhlsModuleEmitter::getValueReturnResult(func::FuncOp func) {
+  if (func->hasAttr("top"))
+    return nullptr;
+  auto funcReturn = dyn_cast<func::ReturnOp>(func.front().getTerminator());
+  if (!funcReturn)
+    return nullptr;
+  auto args = func.getArguments();
+  Value onlyResult = nullptr;
+  for (auto result : funcReturn.getOperands()) {
+    if (std::find(args.begin(), args.end(), result) == args.end()) {
+      if (onlyResult)
+        return nullptr; // more than one real (non-passthrough) result
+      onlyResult = result;
+    }
+  }
+  if (!onlyResult || llvm::isa<ShapedType>(onlyResult.getType()))
+    return nullptr;
+  return onlyResult;
+}
+
 /// Emit only the function signature: "void funcName(args...)"
 /// Returns the port list for use in directive emission.
 /// After this call, indentation is back to the original level.
 SmallVector<Value, 8>
 allo::hls::VhlsModuleEmitter::emitFunctionSignature(func::FuncOp func) {
-  os << "void " << func.getName() << "(\n";
+  // Nested (non-top-level) functions with exactly one scalar result use a
+  // real C++ return type/`return <expr>;` instead of the default
+  // `void f(..., T *out)` + `*out = <expr>;` out-param convention -- see
+  // useValueReturn's doc comment. Top-level (wrap_io-boundary) functions
+  // always keep the out-param convention: it's tied to AXI/host-buffer
+  // generation, a separate concern from internal-helper readability.
+  //
+  // otypes must be read before printing anything, since the return type
+  // (if any) needs its signedness fixed up before getTypeName prints it.
+  std::string otypesForReturn = "";
+  if (func->hasAttr("otypes"))
+    otypesForReturn =
+        llvm::dyn_cast<StringAttr>(func->getAttr("otypes")).getValue().str();
+  else
+    for (unsigned i = 0; i < func.getNumArguments(); ++i)
+      otypesForReturn += "x";
+
+  Value valueReturnResult = getValueReturnResult(func);
+  if (valueReturnResult) {
+    unsigned idx = 0;
+    auto funcArgs = func.getArguments();
+    for (auto result :
+         cast<func::ReturnOp>(func.front().getTerminator()).getOperands()) {
+      if (result == valueReturnResult &&
+          std::find(funcArgs.begin(), funcArgs.end(), result) ==
+              funcArgs.end()) {
+        if (idx < otypesForReturn.size())
+          fixUnsignedType(valueReturnResult, otypesForReturn[idx] == 'u');
+        break;
+      }
+      ++idx;
+    }
+    os << getTypeName(valueReturnResult) << " " << func.getName() << "(\n";
+  } else {
+    os << "void " << func.getName() << "(\n";
+  }
   addIndent();
 
   // This vector is to record all ports of the function.
@@ -2851,32 +3199,36 @@ allo::hls::VhlsModuleEmitter::emitFunctionSignature(func::FuncOp func) {
   }
   if (auto funcReturn =
           llvm::dyn_cast<func::ReturnOp>(func.front().getTerminator())) {
-    unsigned idx = 0;
-    for (auto result : funcReturn.getOperands()) {
-      if (std::find(args.begin(), args.end(), result) == args.end()) {
-        if (func.getArguments().size() > 0)
-          os << ",\n";
-        indent();
+    // valueReturnResult (if set) is already handled as a real return type
+    // above, not as a trailing out-param -- skip it here entirely.
+    if (!valueReturnResult) {
+      unsigned idx = 0;
+      for (auto result : funcReturn.getOperands()) {
+        if (std::find(args.begin(), args.end(), result) == args.end()) {
+          if (func.getArguments().size() > 0)
+            os << ",\n";
+          indent();
 
-        // TODO: a known bug, cannot return a value twice, e.g. return %0, %0
-        // : index, index. However, typically this should not happen.
-        fixUnsignedType(result, otypes[idx] == 'u');
-        if (llvm::isa<ShapedType>(result.getType())) {
-          if (output_names != "")
-            emitArrayDecl(result, true);
-          else
-            emitArrayDecl(result, true, output_names);
-        } else {
-          // In Vivado HLS, pointer indicates the value is an output.
-          if (output_names != "")
-            emitValue(result, /*rank=*/0, /*isPtr=*/true);
-          else
-            emitValue(result, /*rank=*/0, /*isPtr=*/true, output_names);
+          // TODO: a known bug, cannot return a value twice, e.g. return %0, %0
+          // : index, index. However, typically this should not happen.
+          fixUnsignedType(result, otypes[idx] == 'u');
+          if (llvm::isa<ShapedType>(result.getType())) {
+            if (output_names != "")
+              emitArrayDecl(result, true);
+            else
+              emitArrayDecl(result, true, output_names);
+          } else {
+            // In Vivado HLS, pointer indicates the value is an output.
+            if (output_names != "")
+              emitValue(result, /*rank=*/0, /*isPtr=*/true);
+            else
+              emitValue(result, /*rank=*/0, /*isPtr=*/true, output_names);
+          }
+
+          portList.push_back(result);
         }
-
-        portList.push_back(result);
+        idx += 1;
       }
-      idx += 1;
     }
   } else
     emitError(func, "doesn't have a return operation as terminator.");
