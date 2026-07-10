@@ -182,8 +182,8 @@ def mx_quantize_block[Ty, K](x: "float32[K]") -> ("uint8", "Ty"):
     # exponent is found from the max IEEE exponent field among the block's
     # elements (a bit-extraction, not a real log2), per Algorithm 1.
     max_exp_field: int32 = 0
-    for i in range(K):
-        bits_i: int32 = x[i].bitcast()
+    for i0 in range(K):
+        bits_i: int32 = x[i0].bitcast()
         exp_field_i: int32 = bits_i[23:31]
         # ignore subnormal/zero (0) and Inf/NaN (255) float32 inputs when
         # searching for the block's shared exponent: neither contributes a
@@ -201,15 +201,24 @@ def mx_quantize_block[Ty, K](x: "float32[K]") -> ("uint8", "Ty"):
     word: Ty = 0
     word[Ty.bits - 8 : Ty.bits] = scale_field
 
-    for i in range(K):
+    for i1 in range(K):
         elem: UInt(Ty.elem_bits) = 0
         with allo.meta_if(Ty.is_float):
-            elem = _mx_quantize_elem_fp[Ty](x[i], shared_exp)
+            elem = _mx_quantize_elem_fp[Ty](x[i1], shared_exp)
         with allo.meta_else():
-            elem = _mx_quantize_elem_int[Ty](x[i], shared_exp)
-        word[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = elem
+            elem = _mx_quantize_elem_int[Ty](x[i1], shared_exp)
+        word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return scale_field, word
+
+
+def schedule_mx_quantize_block(s):
+    # dev-plan Fig 1 "parallel structure": pipelining a reduction/elementwise
+    # loop lets Vitis HLS's own scheduler overlap iterations (parallel-like
+    # multiplier throughput) and, for the max_exp_field reduction, rebalance
+    # the dependency chain into a tree internally to still hit II=1.
+    s.pipeline("mx_quantize_block:i0")
+    s.pipeline("mx_quantize_block:i1")
 
 
 def mx_quantize[Ty, K, N](
@@ -228,12 +237,22 @@ def mx_quantize[Ty, K, N](
     # as a scalar local (`w` below), never stored into an array.
     for b in range(N // K):
         blk: float32[K]
-        for i in range(K):
-            blk[i] = X[b * K + i]
+        for i0 in range(K):
+            blk[i0] = X[b * K + i0]
         s, w = mx_quantize_block[Ty, K](blk)
         scales[b] = s
-        for i in range(K):
-            data[b, i] = w[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+        for i1 in range(K):
+            data[b, i1] = w[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits]
+
+
+def schedule_mx_quantize(s):
+    s.pipeline("mx_quantize:i0")
+    s.pipeline("mx_quantize:i1")
+    # Also pipeline the outer per-block loop itself: without this, each
+    # block's mx_quantize_block call must fully drain before the next
+    # block starts, leaving the inner loops' own pipelines idle between
+    # blocks instead of kept continuously fed.
+    s.pipeline("mx_quantize:b")
 
 
 def mx_block_dot[Ty, K](
@@ -366,6 +385,15 @@ def mx_block_dot[Ty, K](
             acc = acc + int(a_i) * int(b_i)
 
     return scale_out, acc, has_nan, has_inf
+
+
+def schedule_mx_block_dot(s):
+    # dev-plan Fig 1: pipelining the K-element multiply/Kulisch-accumulate
+    # loop overlaps the per-element multipliers across iterations and lets
+    # Vitis HLS's reduction-variable optimization rebalance the acc +=/-=
+    # dependency chain into a tree internally, hitting II=1 despite the
+    # apparent sequential dependency in the source.
+    s.pipeline("mx_block_dot:i")
 
 
 def mx_normalize_add[Ty](
@@ -504,6 +532,21 @@ def mx_dot_general[Ty, K, N](
             has_inf = 1
 
     return acc_scale, acc_val, has_nan, has_inf
+
+
+def schedule_mx_dot_general(s):
+    # Pipeline the word-reconstruction loop (see its own comment on why the
+    # packed Ty word is rebuilt from bytes here rather than stored in an
+    # array). mx_block_dot's own K-loop is pipelined separately by
+    # schedule_mx_block_dot when that's scheduled as part of the same
+    # kernel; this is the N//K cross-block loop's own inner K-loop.
+    s.pipeline("mx_dot_general:i")
+    # Also pipeline the outer per-block (N // K) loop -- it calls
+    # mx_block_dot and mx_normalize_add once per block; without this, each
+    # block's full compute (including mx_block_dot's own internally
+    # pipelined K-loop) must fully drain before the next block's starts,
+    # rather than overlapping consecutive blocks through the same hardware.
+    s.pipeline("mx_dot_general:b")
 
 
 def mx_to_float32[Ty](
