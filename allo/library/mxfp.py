@@ -223,15 +223,36 @@ def _mx_dequantize_elem_fp[Ty](bits: "UInt(Ty.elem_bits)") -> float32:
     return val
 
 
-def mx_block_dot[Ty, K](
-    scale_a: uint8, data_a: "Ty", scale_b: uint8, data_b: "Ty"
-) -> float32:
+def _mx_pack_word[Ty, K](scale: uint8, elems: "uint8[K]") -> "Ty":
+    # Constructor for the packed Ty word: scale in the top 8 bits, the K
+    # per-element bytes below it (same layout mx_quantize_block builds).
+    # Callers pass a plain uint8[K] byte array (never a Ty[...] array --
+    # see mx_quantize's docstring for why that crashes the MLIR JIT), so
+    # the wide word only ever exists as this function's scalar local.
+    word: Ty = 0
+    word[Ty.bits - 8 : Ty.bits] = scale
+    for i in range(K):
+        word[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = elems[i]
+    return word
+
+
+def _mx_get_scale[Ty](word: "Ty") -> uint8:
+    return word[Ty.bits - 8 : Ty.bits]
+
+
+def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
     # Simple (non-Kulisch) block dot product: dequantize each element back
     # to float32 and accumulate with ordinary float32 multiply-add. Every
     # add rounds (unlike an exact/Kulisch integer accumulator), trading
     # per-block accumulation accuracy for a much simpler datapath -- no
     # wide fixed-point accumulator sizing, no separate cross-block
     # scale-alignment step (mx_normalize_add) needed either.
+    #
+    # data_a/data_b are the full packed Ty word (scale in the top 8 bits,
+    # elements in the rest -- the layout mx_quantize_block already builds),
+    # not scale+data passed separately.
+    scale_a: uint8 = _mx_get_scale[Ty](data_a)
+    scale_b: uint8 = _mx_get_scale[Ty](data_b)
     scale_a_val: float32 = _mx_scale_to_float32(scale_a)
     scale_b_val: float32 = _mx_scale_to_float32(scale_b)
 
@@ -277,16 +298,19 @@ def mx_dot_general[Ty, K, N](
     # data_a/data_b hold per-element raw bytes, not `Ty[N // K]` arrays --
     # see mx_quantize's comment for why a live array of the wide packed Ty
     # word crashes the MLIR JIT ExecutionEngine. Each block's packed word
-    # is rebuilt as a scalar local (word_a/word_b) immediately before use.
+    # is rebuilt (via _mx_pack_word) as a scalar local immediately before
+    # use, never stored into an array.
     total: float32 = 0.0
 
     for b in range(N // K):
-        word_a: Ty = 0
-        word_b: Ty = 0
+        block_a: uint8[K]
+        block_b: uint8[K]
         for i in range(K):
-            word_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = data_a[b, i]
-            word_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits] = data_b[b, i]
-        total = total + mx_block_dot[Ty, K](scales_a[b], word_a, scales_b[b], word_b)
+            block_a[i] = data_a[b, i]
+            block_b[i] = data_b[b, i]
+        word_a: Ty = _mx_pack_word[Ty, K](scales_a[b], block_a)
+        word_b: Ty = _mx_pack_word[Ty, K](scales_b[b], block_b)
+        total = total + mx_block_dot[Ty, K](word_a, word_b)
 
     return total
 
@@ -298,7 +322,7 @@ def schedule_mx_dot_general(s):
     # schedule_mx_block_dot when that's scheduled as part of the same
     # kernel; this is the N//K cross-block loop's own inner K-loop.
     s.pipeline("mx_dot_general:i")
-    # Also pipeline the outer per-block (N // K) loop -- it calls
+    # Also pipeline the  outer per-block (N // K) loop -- it calls
     # mx_block_dot once per block; without this, each block's full compute
     # (including mx_block_dot's own internally pipelined K-loop) must fully
     # drain before the next block's starts, rather than overlapping
@@ -313,4 +337,20 @@ def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
     data_b: uint8[N // K, K]
     mx_quantize[Ty, K, N](A, scales_a, data_a)
     mx_quantize[Ty, K, N](B, scales_b, data_b)
-    return mx_dot_general[Ty, K, N](scales_a, data_a, scales_b, data_b)
+
+    # Inlined from mx_dot_general: dot_product itself builds each block's
+    # packed Ty word (via _mx_pack_word, as a scalar local -- never as an
+    # array, see mx_quantize's docstring for why) and hands it directly to
+    # mx_block_dot.
+    total: float32 = 0.0
+    for b in range(N // K):
+        block_a: uint8[K]
+        block_b: uint8[K]
+        for i in range(K):
+            block_a[i] = data_a[b, i]
+            block_b[i] = data_b[b, i]
+        word_a: Ty = _mx_pack_word[Ty, K](scales_a[b], block_a)
+        word_b: Ty = _mx_pack_word[Ty, K](scales_b[b], block_b)
+        total = total + mx_block_dot[Ty, K](word_a, word_b)
+
+    return total

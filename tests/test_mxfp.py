@@ -233,7 +233,7 @@ def make_block_dot_kernel(Ty, K):
             b_bytes[i] = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
 
         result: float32[1]
-        result[0] = mx_block_dot[Ty, K](scale_a, data_a, scale_b, data_b)
+        result[0] = mx_block_dot[Ty, K](data_a, data_b)
         return sa, sb, a_bytes, b_bytes, result
 
     kernel.__name__ = f"block_dot_{Ty.name}"
