@@ -3,19 +3,29 @@
 # pylint: disable=used-before-assignment, unsubscriptable-object
 
 import allo
-from ..ir.types import Int, UInt, int32, uint8, float32
+from ..ir.types import Int, UInt, int32, uint8, uint16, float32, bfloat16
 
 
-def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
-    # Requantize one float32 element into Ty's (1 + exp_bits + mantissa_bits)
+def _bf16_to_f32(v: bfloat16) -> float32:
+    bits16: uint16 = v.bitcast()
+    bits32: int32 = int(bits16) << 16
+    return bits32.bitcast()
+
+
+def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+    # Requantize one bfloat16 element into Ty's (1 + exp_bits + mantissa_bits)
     # narrow FP element, given the block's shared (already-clamped) exponent.
     # Follows Algorithm 1 of arXiv:2310.10537: v is divided by the block
     # scale (implicitly, via exponent subtraction) then clamped/rounded
-    # (round-to-nearest-even) into the element format.
-    bits: int32 = v.bitcast()
-    sign: int32 = bits[31:32]
-    exp_field: int32 = bits[23:31]
-    mant32: int32 = bits[0:23]
+    # (round-to-nearest-even) into the element format. Pure bit manipulation
+    # (no floating-point arithmetic on v itself), so this operates directly
+    # on bf16's own (1 + 8 + 7)-bit layout -- same 8-bit exponent field/127
+    # bias as float32, just a narrower 7-bit mantissa -- no float32 widening
+    # needed (contrast _mx_quantize_elem_int, which does a real division).
+    bits: uint16 = v.bitcast()
+    sign: int32 = bits[15:16]
+    exp_field: int32 = bits[7:15]
+    mant16: int32 = bits[0:7]
 
     max_exp_code: int32 = (1 << Ty.exp_bits) - 1
     max_mant_code: int32 = (1 << Ty.mantissa_bits) - 1
@@ -23,44 +33,21 @@ def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bit
     out: UInt(Ty.elem_bits) = 0
 
     if exp_field == 0:
-        # subnormal/zero float32 input -> zero (per Algorithm 1's note)
+        # subnormal/zero bf16 input -> zero (per Algorithm 1's note)
         out = sign << (Ty.exp_bits + Ty.mantissa_bits)
     else:
         unbiased_exp: int32 = exp_field - 127
         target_exp: int32 = unbiased_exp - shared_exp + Ty.bias
-        full_mant: int32 = (1 << 23) | mant32
+        full_mant: int32 = (1 << 7) | mant16
 
-        # Round to Ty.mantissa_bits (round-to-nearest-even). Widths only
-        # depend on compile-time constants, so this is safe regardless
-        # of how large/small target_exp is; overflow (including the
-        # rounding-carry case) is caught once at the end by the final clamp.
         result_exp: int32 = 0
         result_mant: int32 = 0
-        if target_exp <= 0:
-            total_shift: int32 = (23 - Ty.mantissa_bits) + (1 - target_exp)
-            if total_shift > 24:
-                result_exp = 0
-                result_mant = 0
-            else:
-                kept: int32 = full_mant >> total_shift
-                remainder: int32 = full_mant & ((1 << total_shift) - 1)
-                halfpoint: int32 = 1 << (total_shift - 1)
-                round_up: int32 = 0
-                if remainder > halfpoint:
-                    round_up = 1
-                elif remainder == halfpoint:
-                    if (kept & 1) == 1:
-                        round_up = 1
-                if round_up == 1:
-                    kept = kept + 1
-                if kept >= (1 << Ty.mantissa_bits):
-                    result_exp = 1
-                    result_mant = 0
-                else:
-                    result_exp = 0
-                    result_mant = kept
+        extra_shift: int32 = max(0, 1 - target_exp)
+        total_shift: int32 = (7 - Ty.mantissa_bits) + extra_shift
+        if total_shift > 8:
+            result_exp = 0
+            result_mant = 0
         else:
-            total_shift: int32 = 23 - Ty.mantissa_bits
             kept: int32 = full_mant >> total_shift
             remainder: int32 = full_mant & ((1 << total_shift) - 1)
             halfpoint: int32 = 1 << (total_shift - 1)
@@ -72,12 +59,21 @@ def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bit
                     round_up = 1
             if round_up == 1:
                 kept = kept + 1
-            if kept >= (1 << (Ty.mantissa_bits + 1)):
-                result_exp = target_exp + 1
-                result_mant = 0
+
+            if target_exp <= 0:
+                if kept >= (1 << Ty.mantissa_bits):
+                    result_exp = 1
+                    result_mant = 0
+                else:
+                    result_exp = 0
+                    result_mant = kept
             else:
-                result_exp = target_exp
-                result_mant = kept & ((1 << Ty.mantissa_bits) - 1)
+                if kept >= (1 << (Ty.mantissa_bits + 1)):
+                    result_exp = target_exp + 1
+                    result_mant = 0
+                else:
+                    result_exp = target_exp
+                    result_mant = kept & ((1 << Ty.mantissa_bits) - 1)
 
         if (result_exp > max_exp_code) or (
             result_exp == max_exp_code and result_mant > max_mant_code
@@ -93,11 +89,9 @@ def _mx_quantize_elem_fp[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bit
     return out
 
 
-def _mx_quantize_elem_int[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
-    # Requantize one float32 element into Ty's elem_bits-wide two's
-    # complement integer, given the block's shared (already-clamped)
-    # exponent. round-half-away-from-zero, clamp on overflow.
-    bits: int32 = v.bitcast()
+def _mx_quantize_elem_int[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+    v_f32: float32 = _bf16_to_f32(v)
+    bits: int32 = v_f32.bitcast()
     exp_field: int32 = bits[23:31]
     max_val: int32 = (1 << (Ty.elem_bits - 1)) - 1
     min_val: int32 = -(1 << (Ty.elem_bits - 1))
@@ -108,7 +102,7 @@ def _mx_quantize_elem_int[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bi
     else:
         scale_bits: int32 = (shared_exp + 127) << 23
         scale: float32 = scale_bits.bitcast()
-        scaled: float32 = v / scale
+        scaled: float32 = v_f32 / scale
         if scaled >= 0.0:
             rounded = int(scaled + 0.5)
         else:
@@ -118,15 +112,11 @@ def _mx_quantize_elem_int[Ty](v: float32, shared_exp: int32) -> "UInt(Ty.elem_bi
     return rounded
 
 
-def mx_quantize_block[Ty, K](x: "float32[K]") -> ("uint8", "Ty"):
-    # Encode step (not part of the no-dequant dot-product datapath): one
-    # K-element float32 block -> (E8M0 scale, packed Ty word). Shared
-    # exponent is found from the max IEEE exponent field among the block's
-    # elements (a bit-extraction, not a real log2), per Algorithm 1.
+def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> ("uint8", "Ty"):
     max_exp_field: int32 = 0
     for i0 in range(K):
-        bits_i: int32 = x[i0].bitcast()
-        exp_field_i: int32 = bits_i[23:31]
+        bits_i: uint16 = x[i0].bitcast()
+        exp_field_i: int32 = bits_i[7:15]
         if exp_field_i > max_exp_field:
             max_exp_field = exp_field_i
 
@@ -160,21 +150,10 @@ def schedule_mx_quantize_block(s):
 
 
 def mx_quantize[Ty, K, N](
-    X: "float32[N]", scales: "uint8[N // K]", data: "uint8[N // K, K]"
+    X: "bfloat16[N]", scales: "uint8[N // K]", data: "uint8[N // K, K]"
 ):
-    # out-params (not a tuple return): Allo does not support a plain
-    # function returning multiple array-typed (memref) results and
-    # destructuring them at the call site, only scalar tuple-returns.
-    #
-    # `data` holds per-element raw bytes, not an array of the packed Ty
-    # word (`Ty[N // K]`): a local/live memref whose element type is wider
-    # than 64 bits and has 3+ elements crashes the MLIR JIT's
-    # ExecutionEngine at MLIRContext teardown (StorageUniquer heap
-    # corruption -- reproduced with plain UInt(72)[N] independent of any
-    # mxfp-specific logic). The packed Ty word is only ever materialized
-    # as a scalar local (`w` below), never stored into an array.
     for b in range(N // K):
-        blk: float32[K]
+        blk: bfloat16[K]
         for i0 in range(K):
             blk[i0] = X[b * K + i0]
         s, w = mx_quantize_block[Ty, K](blk)
@@ -327,11 +306,7 @@ def schedule_mx_dot_general(s):
     s.pipeline("mx_dot_general:b")
 
 
-def dot_product[Ty, K, N](A: "float32[N]", B: "float32[N]") -> float32:
-    # Top-level user-facing kernel: plain float32[N] operands in, a single
-    # float32 scalar out. Quantize -> block_dot -> cross-block float
-    # accumulation (mx_dot_general), dequantizing each block back to
-    # float32 rather than staying in an exact packed-integer accumulator.
+def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
     scales_a: uint8[N // K]
     scales_b: uint8[N // K]
     data_a: uint8[N // K, K]

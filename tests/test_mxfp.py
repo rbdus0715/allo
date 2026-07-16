@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import ml_dtypes
 import pytest
 import allo
 from allo.library.mxfp import (
@@ -11,7 +12,7 @@ from allo.library.mxfp import (
     mx_dot_general,
     dot_product,
 )
-from allo.ir.types import float32, uint8, int32
+from allo.ir.types import float32, uint8, bfloat16
 import allo.ir.types as T
 
 # (format name, Allo type)
@@ -31,7 +32,7 @@ def make_quantize_block_kernel(Ty):
     # cross the LLVM/numpy boundary without touching the wide packed Ty
     # word directly (see mxfp_dev notes: wide (>64-bit) memref marshalling
     # is fragile in the current LLVM backend, unrelated to this op's logic)
-    def kernel(x: float32[K]) -> ("uint8[1]", "uint8[K]"):
+    def kernel(x: bfloat16[K]) -> ("uint8[1]", "uint8[K]"):
         scale_out: uint8[1]
         scale, w = mx_quantize_block[Ty, K](x)
         scale_out[0] = scale
@@ -119,13 +120,19 @@ def test_mx_quantize_block_all_formats():
     for name, Ty in MXFP_FORMATS:
         mod = allo.customize(make_quantize_block_kernel(Ty)).build()
         for trial in range(20):
-            x = (rng.standard_normal(K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
+            x_f32 = (rng.standard_normal(K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
             if trial == 0:
-                x[:] = 0.0
+                x_f32[:] = 0.0
             elif trial == 1:
-                x[0] = 0.0
+                x_f32[0] = 0.0
+            # bf16-truncate first: that's the actual value the kernel's
+            # bfloat16[K] input sees, widened back to float32 (lossless,
+            # matches _bf16_to_f32) so the reference operates on the same
+            # value, not the pre-truncation original.
+            x_bf16 = x_f32.astype(ml_dtypes.bfloat16)
+            x = x_bf16.astype(np.float32)
 
-            scale, elem_bits = mod(x)
+            scale, elem_bits = mod(x_bf16)
             scale = int(np.asarray(scale).flatten()[0])
             elem_bits = np.asarray(elem_bits).flatten()
 
@@ -146,13 +153,15 @@ def test_mx_quantize_block_mxint8():
     elem_max_unbiased = Ty.max_unbiased_exp  # elem_bits - 2 == 6
 
     for trial in range(20):
-        x = (rng.standard_normal(K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
+        x_f32 = (rng.standard_normal(K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
         if trial == 0:
-            x[:] = 0.0
+            x_f32[:] = 0.0
         elif trial == 1:
-            x[0] = 0.0
+            x_f32[0] = 0.0
+        x_bf16 = x_f32.astype(ml_dtypes.bfloat16)
+        x = x_bf16.astype(np.float32)
 
-        scale, elem_bits = mod(x)
+        scale, elem_bits = mod(x_bf16)
         scale = int(np.asarray(scale).flatten()[0])
         elem_bits = np.asarray(elem_bits).flatten()
 
@@ -182,15 +191,16 @@ def test_mx_quantize_full_tensor():
 
     # mx_quantize writes data_bits directly as per-element bytes (see its
     # docstring comment): no local Ty[N//K] array or manual unpack needed.
-    def kernel2(x: float32[N], scales: uint8[N // K], data_bits: uint8[N // K, K]):
+    def kernel2(x: bfloat16[N], scales: uint8[N // K], data_bits: uint8[N // K, K]):
         mx_quantize[Ty, K, N](x, scales, data_bits)
 
     mod = allo.customize(kernel2).build()
     rng = np.random.default_rng(2)
-    x = (rng.standard_normal(N) * 4.0).astype(np.float32)
+    x_bf16 = ((rng.standard_normal(N) * 4.0).astype(np.float32)).astype(ml_dtypes.bfloat16)
+    x = x_bf16.astype(np.float32)
     scales = np.zeros(N // K, dtype=np.uint8)
     data_bits = np.zeros((N // K, K), dtype=np.uint8)
-    mod(x, scales, data_bits)
+    mod(x_bf16, scales, data_bits)
 
     for b in range(N // K):
         ref_scale, ref_bits = ref_mxfp_quantize(x[b * K : (b + 1) * K], Ty)
@@ -208,7 +218,7 @@ DOT_K = 16
 
 def make_block_dot_kernel(Ty, K):
     def kernel(
-        a: float32[K], b: float32[K]
+        a: bfloat16[K], b: bfloat16[K]
     ) -> ("uint8[1]", "uint8[1]", "uint8[K]", "uint8[K]", "float32[1]"):
         sa: uint8[1]
         sb: uint8[1]
@@ -255,10 +265,10 @@ def test_mx_block_dot_all_formats():
         for trial in range(10):
             a = (rng.standard_normal(DOT_K) * 2.0 ** rng.integers(-6, 6)).astype(
                 np.float32
-            )
+            ).astype(ml_dtypes.bfloat16)
             b = (rng.standard_normal(DOT_K) * 2.0 ** rng.integers(-6, 6)).astype(
                 np.float32
-            )
+            ).astype(ml_dtypes.bfloat16)
             sa, sb, a_bytes, b_bytes, result = mod(a, b)
             sa = int(np.asarray(sa).flatten()[0])
             sb = int(np.asarray(sb).flatten()[0])
@@ -284,9 +294,11 @@ def test_mx_block_dot_mxint8():
     mod = allo.customize(make_block_dot_kernel(Ty, DOT_K)).build()
     rng = np.random.default_rng(4)
     for trial in range(10):
+        # small integers are exactly representable in bf16 (7 mantissa bits
+        # covers magnitudes well past 100), so this bf16-truncation is lossless.
         a = rng.integers(-100, 100, DOT_K).astype(np.float32)
         b = rng.integers(-100, 100, DOT_K).astype(np.float32)
-        _, _, _, _, result = mod(a, b)
+        _, _, _, _, result = mod(a.astype(ml_dtypes.bfloat16), b.astype(ml_dtypes.bfloat16))
         our_dot = float(np.asarray(result).flatten()[0])
         ref_dot = float(np.dot(a.astype(np.float64), b.astype(np.float64)))
         assert our_dot == pytest.approx(ref_dot, rel=1e-3), (
@@ -309,8 +321,8 @@ def make_dot_general_kernel(Ty, K, NB):
     N = K * NB
 
     def kernel(
-        a: float32[N],
-        b: float32[N],
+        a: bfloat16[N],
+        b: bfloat16[N],
         scales_a: uint8[NB],
         scales_b: uint8[NB],
         a_bytes: uint8[NB, K],
@@ -343,7 +355,7 @@ def test_mx_dot_general_all_formats():
                     )
                     for _ in range(NB)
                 ]
-            )
+            ).astype(ml_dtypes.bfloat16)
             b = np.concatenate(
                 [
                     (rng.standard_normal(K) * 2.0 ** rng.integers(-10, 10)).astype(
@@ -351,7 +363,7 @@ def test_mx_dot_general_all_formats():
                     )
                     for _ in range(NB)
                 ]
-            )
+            ).astype(ml_dtypes.bfloat16)
             scales_a = np.zeros(NB, dtype=np.uint8)
             scales_b = np.zeros(NB, dtype=np.uint8)
             a_bytes = np.zeros((NB, K), dtype=np.uint8)
@@ -380,7 +392,7 @@ def test_mx_dot_general_all_formats():
 
 
 ######################################################################
-# dot_product (top-level kernel: float32[N], float32[N] -> float32)
+# dot_product (top-level kernel: bfloat16[N], bfloat16[N] -> float32)
 ######################################################################
 
 DOT_PRODUCT_K = 32  # OCP MX spec default block_size
@@ -437,14 +449,26 @@ def test_dot_product_all_formats():
     all_formats = MXFP_FORMATS + [("mxint8", T.mxint8)]
     for name, Ty in all_formats:
 
-        def kernel(a: float32[N], b: float32[N]) -> float32:
+        def kernel(a: bfloat16[N], b: bfloat16[N]) -> float32:
             return dot_product[Ty, K, N](a, b)
 
         mod = allo.customize(kernel).build()
         for trial in range(5):
-            a = (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
-            b = (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
-            our_dot = float(mod(a, b))
+            a_bf16 = (
+                (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8))
+                .astype(np.float32)
+                .astype(ml_dtypes.bfloat16)
+            )
+            b_bf16 = (
+                (rng.standard_normal(N) * 2.0 ** rng.integers(-8, 8))
+                .astype(np.float32)
+                .astype(ml_dtypes.bfloat16)
+            )
+            # widen back to float32 (lossless, matches _bf16_to_f32) so the
+            # reference quantizes/decodes the SAME value the kernel sees.
+            a = a_bf16.astype(np.float32)
+            b = b_bf16.astype(np.float32)
+            our_dot = float(mod(a_bf16, b_bf16))
 
             if name == "mxint8":
                 ref_dot = _ref_dot_product_mxint8(a, b, K, Ty)
