@@ -325,8 +325,6 @@ class ASTTransformer(ASTBuilder):
             "block_size",
             "scale_bits",
             "bias",
-            "has_nan",
-            "has_inf",
             "is_float",
             "max_unbiased_exp",
             "block_accum_bits",
