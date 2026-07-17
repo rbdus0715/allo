@@ -11,6 +11,7 @@ from allo.library.mxfp import (
     mx_block_dot,
     mx_dot_general,
     dot_product,
+    _mx_get_scale,
 )
 from allo.ir.types import float32, uint8, bfloat16
 import allo.ir.types as T
@@ -34,8 +35,8 @@ def make_quantize_block_kernel(Ty):
     # is fragile in the current LLVM backend, unrelated to this op's logic)
     def kernel(x: bfloat16[K]) -> ("uint8[1]", "uint8[K]"):
         scale_out: uint8[1]
-        scale, w = mx_quantize_block[Ty, K](x)
-        scale_out[0] = scale
+        w: Ty = mx_quantize_block[Ty, K](x)
+        scale_out[0] = _mx_get_scale[Ty](w)
         elem_bits: uint8[K]
         for i in range(K):
             elem_bits[i] = w[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
@@ -210,7 +211,8 @@ def test_mx_quantize_full_tensor():
 
 
 ######################################################################
-# mx_block_dot (dequantize each element to float32, accumulate in float32)
+# mx_block_dot (multiply-accumulate in a fixed-width integer accumulator,
+# convert to float32 only once at the end)
 ######################################################################
 
 DOT_K = 16
@@ -224,10 +226,10 @@ def make_block_dot_kernel(Ty, K):
         sb: uint8[1]
         a_bytes: uint8[K]
         b_bytes: uint8[K]
-        scale_a, data_a = mx_quantize_block[Ty, K](a)
-        scale_b, data_b = mx_quantize_block[Ty, K](b)
-        sa[0] = scale_a
-        sb[0] = scale_b
+        data_a: Ty = mx_quantize_block[Ty, K](a)
+        data_b: Ty = mx_quantize_block[Ty, K](b)
+        sa[0] = _mx_get_scale[Ty](data_a)
+        sb[0] = _mx_get_scale[Ty](data_b)
         for i in range(K):
             a_bytes[i] = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
             b_bytes[i] = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
@@ -257,8 +259,11 @@ def test_mx_block_dot_all_formats():
     # (decoded and dot-producted in fp64), not the original unquantized
     # inputs: this isolates mx_block_dot's own accumulation error from
     # mx_quantize_block's (already separately verified) quantization
-    # error. mx_block_dot dequantizes to float32 and accumulates in
-    # float32 (no exact/Kulisch accumulator), so some rounding is expected.
+    # error. mx_block_dot accumulates exactly in a fixed-width integer
+    # accumulator (Kulisch-style, no per-term rounding), but the final
+    # cast to float32 (and the scale_a_val * scale_b_val multiply) can
+    # still round once the accumulator exceeds float32's 24-bit mantissa,
+    # so some rounding is expected.
     rng = np.random.default_rng(3)
     for name, Ty in MXFP_FORMATS:
         mod = allo.customize(make_block_dot_kernel(Ty, DOT_K)).build()

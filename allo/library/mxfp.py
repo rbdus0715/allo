@@ -112,7 +112,7 @@ def _mx_quantize_elem_int[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_b
     return rounded
 
 
-def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> ("uint8", "Ty"):
+def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
     max_exp_field: int32 = 0
     for i0 in range(K):
         bits_i: uint16 = x[i0].bitcast()
@@ -137,7 +137,7 @@ def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> ("uint8", "Ty"):
             elem = _mx_quantize_elem_int[Ty](x[i1], shared_exp)
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
-    return scale_field, word
+    return word
 
 
 def schedule_mx_quantize_block(s):
@@ -156,8 +156,8 @@ def mx_quantize[Ty, K, N](
         blk: bfloat16[K]
         for i0 in range(K):
             blk[i0] = X[b * K + i0]
-        s, w = mx_quantize_block[Ty, K](blk)
-        scales[b] = s
+        w: Ty = mx_quantize_block[Ty, K](blk)
+        scales[b] = _mx_get_scale[Ty](w)
         for i1 in range(K):
             data[b, i1] = w[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits]
 
@@ -190,45 +190,7 @@ def _mx_scale_to_float32(scale: uint8) -> float32:
     return val
 
 
-def _mx_dequantize_elem_fp[Ty](bits: "UInt(Ty.elem_bits)") -> float32:
-    # Reconstruct one Ty-encoded (1 + exp_bits + mantissa_bits) narrow FP
-    # element back to float32: value = (-1)**sign * significand * 2**exponent,
-    # built via repeated doubling/halving (exact in binary) rather than
-    # float32 bit reconstruction, so subnormal Ty elements (exp_field == 0)
-    # need no separate leading-zero-count renormalize step.
-    sign: int32 = bits[Ty.elem_bits - 1 : Ty.elem_bits]
-    exp_field: int32 = bits[Ty.mantissa_bits : Ty.elem_bits - 1]
-    mant: int32 = bits[0 : Ty.mantissa_bits]
-
-    sig: float32 = float(mant) / float(1 << Ty.mantissa_bits)
-    exp_val: int32 = 1 - Ty.bias
-    if exp_field != 0:
-        sig = sig + 1.0
-        exp_val = exp_field - Ty.bias
-
-    val: float32 = sig
-    if exp_val >= 0:
-        s: int32 = 0
-        while s < exp_val:
-            val = val * 2.0
-            s = s + 1
-    else:
-        s: int32 = 0
-        while s < -exp_val:
-            val = val / 2.0
-            s = s + 1
-
-    if sign == 1:
-        val = -val
-    return val
-
-
 def _mx_pack_word[Ty, K](scale: uint8, elems: "uint8[K]") -> "Ty":
-    # Constructor for the packed Ty word: scale in the top 8 bits, the K
-    # per-element bytes below it (same layout mx_quantize_block builds).
-    # Callers pass a plain uint8[K] byte array (never a Ty[...] array --
-    # see mx_quantize's docstring for why that crashes the MLIR JIT), so
-    # the wide word only ever exists as this function's scalar local.
     word: Ty = 0
     word[Ty.bits - 8 : Ty.bits] = scale
     for i in range(K):
@@ -240,47 +202,92 @@ def _mx_get_scale[Ty](word: "Ty") -> uint8:
     return word[Ty.bits - 8 : Ty.bits]
 
 
+def _mx_acc_bits(Ty, K):
+    if Ty.is_float:
+        return Ty.block_accum_bits + (K - 1).bit_length()
+    return 2 * Ty.elem_bits + (K - 1).bit_length()
+
+
+def _mx_fp_mul[Ty, K](
+    a_i: "UInt(Ty.elem_bits)", b_i: "UInt(Ty.elem_bits)"
+) -> "Int(_mx_acc_bits(Ty, K))":
+    a_sign: int32 = a_i[Ty.elem_bits - 1 : Ty.elem_bits]
+    a_exp_field: int32 = a_i[Ty.mantissa_bits : Ty.elem_bits - 1]
+    a_mant: int32 = a_i[0 : Ty.mantissa_bits]
+    a_exp: int32 = 1 - Ty.bias
+    if a_exp_field != 0:
+        a_mant = (1 << Ty.mantissa_bits) | a_mant
+        a_exp = a_exp_field - Ty.bias
+
+    b_sign: int32 = b_i[Ty.elem_bits - 1 : Ty.elem_bits]
+    b_exp_field: int32 = b_i[Ty.mantissa_bits : Ty.elem_bits - 1]
+    b_mant: int32 = b_i[0 : Ty.mantissa_bits]
+    b_exp: int32 = 1 - Ty.bias
+    if b_exp_field != 0:
+        b_mant = (1 << Ty.mantissa_bits) | b_mant
+        b_exp = b_exp_field - Ty.bias
+
+    prod_mant: int32 = a_mant * b_mant
+    shift_amt: int32 = (a_exp + b_exp) - 2 * (1 - Ty.bias)
+    prod_mant_wide: "Int(_mx_acc_bits(Ty, K))" = prod_mant
+    magnitude: "Int(_mx_acc_bits(Ty, K))" = prod_mant_wide << shift_amt
+
+    term: "Int(_mx_acc_bits(Ty, K))" = magnitude
+    if (a_sign ^ b_sign) == 1:
+        term = -magnitude
+    return term
+
+
 def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
-    # Simple (non-Kulisch) block dot product: dequantize each element back
-    # to float32 and accumulate with ordinary float32 multiply-add. Every
-    # add rounds (unlike an exact/Kulisch integer accumulator), trading
-    # per-block accumulation accuracy for a much simpler datapath -- no
-    # wide fixed-point accumulator sizing, no separate cross-block
-    # scale-alignment step (mx_normalize_add) needed either.
-    #
-    # data_a/data_b are the full packed Ty word (scale in the top 8 bits,
-    # elements in the rest -- the layout mx_quantize_block already builds),
-    # not scale+data passed separately.
     scale_a: uint8 = _mx_get_scale[Ty](data_a)
     scale_b: uint8 = _mx_get_scale[Ty](data_b)
     scale_a_val: float32 = _mx_scale_to_float32(scale_a)
     scale_b_val: float32 = _mx_scale_to_float32(scale_b)
 
-    acc: float32 = 0.0
-    for i in range(K):
-        with allo.meta_if(Ty.is_float):
+    total: float32 = 0.0
+    with allo.meta_if(Ty.is_float):
+        acc: "Int(_mx_acc_bits(Ty, K))" = 0
+        for i in range(K):
             a_i: UInt(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
             b_i: UInt(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-            a_val: float32 = _mx_dequantize_elem_fp[Ty](a_i)
-            b_val: float32 = _mx_dequantize_elem_fp[Ty](b_i)
-            acc = acc + a_val * b_val
-        with allo.meta_else():
+            term: "Int(_mx_acc_bits(Ty, K))" = _mx_fp_mul[Ty, K](a_i, b_i)
+            acc = acc + term
+
+        pow2_val: float32 = 2.0 ** (2 * (1 - Ty.bias) - 2 * Ty.mantissa_bits)
+        total = float(acc) * pow2_val
+    with allo.meta_else():
+        acc_i: "Int(_mx_acc_bits(Ty, K))" = 0
+        for i in range(K):
             a_i: Int(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
             b_i: Int(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-            a_val: float32 = float(a_i)
-            b_val: float32 = float(b_i)
-            acc = acc + a_val * b_val
+            a_wide: "Int(_mx_acc_bits(Ty, K))" = a_i
+            b_wide: "Int(_mx_acc_bits(Ty, K))" = b_i
+            acc_i = acc_i + a_wide * b_wide
+        total = float(acc_i)
 
-    return acc * scale_a_val * scale_b_val
+    return total * scale_a_val * scale_b_val
 
 
 def schedule_mx_block_dot(s):
-    # pipelining the K-element dequantize/multiply/accumulate loop overlaps
-    # the per-element dequantizers and multipliers across iterations and
-    # lets Vitis HLS's reduction-variable optimization rebalance the acc +=
-    # dependency chain into a tree internally, hitting II=1 despite the
-    # apparent sequential dependency in the source.
-    s.pipeline("mx_block_dot:i")
+    s.unroll("mx_block_dot:i")
+
+
+def block_dot_product[Ty, K](A: "bfloat16[K]", B: "bfloat16[K]") -> float32:
+    # Single-block convenience composition: quantize both bfloat16[K]
+    # operands and take their block dot product directly. Unlike
+    # dot_product/mx_dot_general (which additionally tile over N // K
+    # blocks and round-trip each block's scale/data through uint8 arrays
+    # via mx_quantize/_mx_pack_word), this goes straight from
+    # mx_quantize_block's packed Ty word into mx_block_dot, with no
+    # intermediate byte unpacking/repacking.
+    word_a: Ty = mx_quantize_block[Ty, K](A)
+    word_b: Ty = mx_quantize_block[Ty, K](B)
+    return mx_block_dot[Ty, K](word_a, word_b)
+
+
+def schedule_block_dot_product(s):
+    schedule_mx_quantize_block(s)
+    schedule_mx_block_dot(s)
 
 
 def mx_dot_general[Ty, K, N](
