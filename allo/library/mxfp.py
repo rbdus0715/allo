@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=used-before-assignment, unsubscriptable-object
 
+import re
+
 import allo
-from ..ir.types import Int, UInt, int32, uint8, uint16, float32, bfloat16
+import allo.dataflow as df
+from ..ir.types import Int, UInt, int32, uint8, uint16, float32, bfloat16, Stream
 from .._mlir.exceptions import AlloValueError
 
 
@@ -91,26 +94,11 @@ def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bi
 
 
 def _mx_quantize_elem_int[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+    # See _mx_quantize_elem_int_f32's docstring for the actual (division-free)
+    # implementation -- this just widens bf16 to float32 first (a cheap
+    # shift, see _bf16_to_f32) and delegates.
     v_f32: float32 = _bf16_to_f32(v)
-    bits: int32 = v_f32.bitcast()
-    exp_field: int32 = bits[23:31]
-    max_val: int32 = (1 << (Ty.elem_bits - 1)) - 1
-    min_val: int32 = -(1 << (Ty.elem_bits - 1))
-
-    rounded: int32 = 0
-    if exp_field == 0:
-        rounded = 0
-    else:
-        scale_bits: int32 = (shared_exp + 127) << 23
-        scale: float32 = scale_bits.bitcast()
-        scaled: float32 = v_f32 / scale
-        if scaled >= 0.0:
-            rounded = int(scaled + 0.5)
-        else:
-            rounded = int(scaled - 0.5)
-        rounded = min(rounded, max_val)
-        rounded = max(rounded, min_val)
-    return rounded
+    return _mx_quantize_elem_int_f32[Ty](v_f32, shared_exp)
 
 
 def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
@@ -148,6 +136,106 @@ def schedule_mx_quantize_block(s):
     # the dependency chain into a tree internally to still hit II=1.
     s.pipeline("mx_quantize_block:i0")
     s.pipeline("mx_quantize_block:i1")
+
+
+def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+    # float32-input counterpart to _mx_quantize_elem_int (same math, minus
+    # the bfloat16->float32 widening step): needed because Allo's Vitis
+    # HLS C++ emitter (getTypeName in mlir/lib/Translation/EmitVivadoHLS.cpp)
+    # has a case for Float16/32/64Type but none for BFloat16Type, so any
+    # bfloat16-typed value -- function arg, local, stream element, anything
+    # -- crashes csynth the moment it needs to be emitted as C++. Only
+    # mxint (Ty.is_float == False) formats are implemented here; mxfp
+    # (float) formats aren't wired up on this path yet.
+    #
+    # Division-free: the divisor (2**shared_exp) is always a power of two,
+    # and dividing a float by a power of two only ever shifts its exponent
+    # field -- it never touches sign or mantissa. So v_f32 / 2**shared_exp
+    # is computed by extracting v_f32's own sign/exponent/mantissa and
+    # subtracting shared_exp from the exponent (target_exp), the same
+    # exponent-subtraction trick _mx_quantize_elem_fp already uses to
+    # requantize into a *narrower float* -- here the result is a plain
+    # rounded integer instead, so the shifted mantissa is rounded and kept
+    # directly rather than repacked into exponent+mantissa fields. This
+    # avoids ever instantiating float division hardware (measured: this
+    # was the dominant DSP/LUT cost of make_mx_dot_general_dataflow's
+    # quantize_ab stage -- ~256 DSP, mostly float dividers, for what
+    # should be simple fixed-point rounding).
+    bits: int32 = v_f32.bitcast()
+    sign: int32 = bits[31:32]
+    exp_field: int32 = bits[23:31]
+    mant: int32 = bits[0:23]
+    max_val: int32 = (1 << (Ty.elem_bits - 1)) - 1
+    min_val: int32 = -(1 << (Ty.elem_bits - 1))
+
+    rounded: int32 = 0
+    if exp_field == 0:
+        rounded = 0
+    else:
+        unbiased_exp: int32 = exp_field - 127
+        target_exp: int32 = unbiased_exp - shared_exp
+        # full_mant is the 24-bit (1 + 23-bit) mantissa with its implicit
+        # leading 1 restored, representing 1.mant as an integer scaled by
+        # 2**23. v_f32 / 2**shared_exp == full_mant * 2**(target_exp - 23),
+        # so total_shift is how far to shift full_mant right to land on
+        # the (unrounded) integer part.
+        full_mant: int32 = (1 << 23) | mant
+        total_shift: int32 = 23 - target_exp
+
+        mag: int32 = 0
+        if total_shift <= 0:
+            # target_exp >= 23 -> magnitude >= 2**24, certainly clamps;
+            # avoid shifting full_mant left by a huge/negative amount.
+            mag = max_val + 1
+        elif total_shift > 30:
+            # Shifting the entire 24-bit mantissa out (and then some) --
+            # rounds to zero. (Also keeps the shift amount used below,
+            # total_shift - 1, safely within int32 range.)
+            mag = 0
+        else:
+            kept: int32 = full_mant >> total_shift
+            remainder: int32 = full_mant & ((1 << total_shift) - 1)
+            halfpoint: int32 = 1 << (total_shift - 1)
+            # round half away from zero, matching the original
+            # int(scaled +/- 0.5) behavior exactly.
+            if remainder >= halfpoint:
+                kept = kept + 1
+            mag = kept
+
+        if sign == 1:
+            rounded = -mag
+        else:
+            rounded = mag
+        rounded = min(rounded, max_val)
+        rounded = max(rounded, min_val)
+    return rounded
+
+
+def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
+    # float32-input counterpart to mx_quantize_block -- see
+    # _mx_quantize_elem_int_f32's docstring for why this exists (mxint
+    # formats only, no meta_if(Ty.is_float) branch).
+    max_exp_field: int32 = 0
+    for i0 in range(K):
+        bits_i: int32 = x[i0].bitcast()
+        exp_field_i: int32 = bits_i[23:31]
+        if exp_field_i > max_exp_field:
+            max_exp_field = exp_field_i
+
+    shared_exp: int32 = max_exp_field - 127 - Ty.max_unbiased_exp
+    shared_exp = min(shared_exp, 127)
+    shared_exp = max(shared_exp, -127)
+
+    scale_field: uint8 = shared_exp + 127
+
+    word: Ty = 0
+    word[Ty.bits - 8 : Ty.bits] = scale_field
+
+    for i1 in range(K):
+        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](x[i1], shared_exp)
+        word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
+
+    return word
 
 
 def mx_quantize[Ty, K, N](
@@ -374,3 +462,180 @@ def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
         total = total + mx_block_dot[Ty, K](word_a, word_b)
 
     return total
+
+
+def patch_extern_c_for_class_return_types(kernel_cpp_path):
+    """v++/vitis_hls wraps kernel.cpp in `extern "C" { ... }`, and a
+    C-linkage function returning a non-POD class type (e.g. `ap_uint<264>`,
+    what _mx_pack_word/mx_quantize_block_f32 return for mxint8) is rejected
+    by the front end. Pulls each such function out of the extern "C" block
+    in-place. Required after s.build() and before invoking the returned
+    hls_mod for any kernel built from this module's Ty-returning helpers
+    (mx_dot_general, make_mx_dot_general_dataflow, etc.) -- csynth will
+    fail to compile without it.
+    """
+    with open(kernel_cpp_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    out = []
+    i = 0
+    sig_re = re.compile(r"^ap_u?int<\d+>\s+\w+\(")
+    patched = []
+    while i < len(lines):
+        line = lines[i]
+        if sig_re.match(line):
+            out.append('} // extern "C"\n')
+            out.append(line)
+            fn_name = line.split()[1].split("(")[0]
+            i += 1
+            while not lines[i].startswith("}"):
+                out.append(lines[i])
+                i += 1
+            out.append(lines[i])
+            out.append('extern "C" {\n')
+            patched.append(fn_name)
+            i += 1
+        else:
+            out.append(line)
+            i += 1
+    with open(kernel_cpp_path, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    return patched
+
+
+def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
+    """Factory for a 3-stage task-level dataflow dot-product kernel: read,
+    quantize, and dot_product run as concurrent hls::stream-connected
+    processes (allo.dataflow's df.region/df.kernel/Stream) instead of one
+    function synthesized as a single pipelined loop -- Vitis can start
+    quantizing block b+1 while dot_product_stage is still reducing block b,
+    and start reading block b+2 while block b+1 is being quantized. See
+    test/mxint8_dataflow_3stage_check.py for the derivation and measured
+    numbers.
+
+    Only supports mxint formats (Ty.is_float == False) -- see
+    mx_quantize_block_f32's docstring.
+
+    A/B are `UInt(K * 32)[NB]`: each element is a wide word packing K
+    float32 values (not this module's usual bfloat16 -- see
+    mx_quantize_block_f32's docstring for why), so a single m_axi beat
+    loads a whole K-element block instead of one float32 at a time.
+    Measured for mxint8/K=32/NB=128/P=4 on u55c/300MHz: this wide-word
+    load cuts the load stage from ~4106 to ~138 cycles and total top
+    latency from ~4337 to ~369 cycles, versus a plain `float32[N]` input.
+
+    Returns the customized+scheduled allo Schedule (not yet built).
+    Typical use:
+
+        s = make_mx_dot_general_dataflow(T.mxint8, K=32, NB=128, P=4)
+        hls_mod = s.build(target="vitis_hls", mode="csyn", project=...,
+                           configs={"device": "u55c", "frequency": 300},
+                           wrap_io=True)
+        patch_extern_c_for_class_return_types(
+            os.path.join(project, "kernel.cpp"))
+        hls_mod()  # runs csynth_design
+
+    The patch_extern_c_for_class_return_types call is not optional --
+    csynth will fail to compile without it (see that function's
+    docstring). quantize_ab handles both operands in one df.kernel (not
+    split into quantize_a/quantize_b) because Allo's dataflow lowering
+    errors ("redefinition of symbol") if the same shared helper is called
+    from two different df.kernel functions in the same df.region; for the
+    same reason the scale byte is pulled out via a direct bit-slice rather
+    than a shared get-scale helper call (mx_block_dot inside
+    dot_product_stage already reaches this module's _mx_get_scale
+    transitively).
+    """
+    N = K * NB
+
+    @df.region()
+    def top(A: "UInt(K * 32)[NB]", B: "UInt(K * 32)[NB]", out: "float32[1]"):
+        pipe_a_raw: Stream[float32[K], depth]
+        pipe_b_raw: Stream[float32[K], depth]
+        pipe_a_q: Stream["uint8[K + 1]", depth]
+        pipe_b_q: Stream["uint8[K + 1]", depth]
+
+        @df.kernel(mapping=[1], args=[A])
+        def read_a(local_A: "UInt(K * 32)[NB]"):
+            for b in range(NB):
+                word: UInt(K * 32) = local_A[b]
+                blk: float32[K]
+                for j in range(K):
+                    bits: int32 = word[j * 32 : (j + 1) * 32]
+                    blk[j] = bits.bitcast()
+                pipe_a_raw.put(blk)
+
+        @df.kernel(mapping=[1], args=[B])
+        def read_b(local_B: "UInt(K * 32)[NB]"):
+            for b in range(NB):
+                word: UInt(K * 32) = local_B[b]
+                blk: float32[K]
+                for j in range(K):
+                    bits: int32 = word[j * 32 : (j + 1) * 32]
+                    blk[j] = bits.bitcast()
+                pipe_b_raw.put(blk)
+
+        @df.kernel(mapping=[1])
+        def quantize_ab():
+            for b in range(NB):
+                blk_a: float32[K] = pipe_a_raw.get()
+                word_a: Ty = mx_quantize_block_f32[Ty, K](blk_a)
+                bundle_a: uint8[K + 1]
+                bundle_a[0] = word_a[Ty.bits - 8 : Ty.bits]
+                for k in range(K):
+                    bundle_a[k + 1] = word_a[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
+                pipe_a_q.put(bundle_a)
+
+                blk_b: float32[K] = pipe_b_raw.get()
+                word_b: Ty = mx_quantize_block_f32[Ty, K](blk_b)
+                bundle_b: uint8[K + 1]
+                bundle_b[0] = word_b[Ty.bits - 8 : Ty.bits]
+                for k in range(K):
+                    bundle_b[k + 1] = word_b[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
+                pipe_b_q.put(bundle_b)
+
+        @df.kernel(mapping=[1], args=[out])
+        def dot_product_stage(local_out: "float32[1]"):
+            partials: float32[P]
+            for p0 in range(P):
+                partials[p0] = 0.0
+
+            for i in range(NB // P):
+                for j in range(P):
+                    bundle_a: uint8[K + 1] = pipe_a_q.get()
+                    bundle_b: uint8[K + 1] = pipe_b_q.get()
+                    scale_a: uint8 = bundle_a[0]
+                    scale_b: uint8 = bundle_b[0]
+                    block_a: uint8[K]
+                    block_b: uint8[K]
+                    for k in range(K):
+                        block_a[k] = bundle_a[k + 1]
+                        block_b[k] = bundle_b[k + 1]
+                    word_a: Ty = _mx_pack_word[Ty, K](scale_a, block_a)
+                    word_b: Ty = _mx_pack_word[Ty, K](scale_b, block_b)
+                    partials[j] = partials[j] + mx_block_dot[Ty, K](word_a, word_b)
+
+            total: float32 = 0.0
+            for r in range(P):
+                total = total + partials[r]
+            local_out[0] = total
+
+    s = df.customize(top, opt_default=False)
+    schedule_mx_block_dot(s)
+    s.pipeline("read_a_0:j")
+    s.pipeline("read_b_0:j")
+    # Also pipeline the outer per-block loop itself -- without this, each
+    # block's inner K-wide copy (already pipelined via ":j" above) must
+    # fully drain before the next block starts, leaving read_a/read_b's
+    # own achieved II unset ("Pipelined: no") and inflating their latency
+    # ~70x (128 blocks * ~75 cycles/block instead of ~1 cycle/block).
+    s.pipeline("read_a_0:b")
+    s.pipeline("read_b_0:b")
+    s.pipeline("quantize_ab_0:b")
+    s.unroll("quantize_ab_0:k")
+    s.pipeline("dot_product_stage_0:i", initiation_interval=P)
+    s.unroll("dot_product_stage_0:j")
+    s.unroll("dot_product_stage_0:k")
+    s.unroll("dot_product_stage_0:p0")
+    s.unroll("dot_product_stage_0:r")
+    s.partition("dot_product_stage_0:partials", dim=0)
+    return s
