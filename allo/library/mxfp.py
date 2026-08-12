@@ -4,6 +4,7 @@
 
 import allo
 from ..ir.types import Int, UInt, int32, uint8, uint16, float32, bfloat16
+from .._mlir.exceptions import AlloValueError
 
 
 def _bf16_to_f32(v: bfloat16) -> float32:
@@ -173,21 +174,18 @@ def schedule_mx_quantize(s):
 
 
 def _mx_scale_to_float32(scale: uint8) -> float32:
-    # E8M0 (127-biased power-of-two) scale -> float32 value 2**(scale-127),
-    # built via repeated doubling/halving (exact in binary, no rounding).
-    shift: int32 = int(scale) - 127
-    val: float32 = 1.0
-    if shift >= 0:
-        s: int32 = 0
-        while s < shift:
-            val = val * 2.0
-            s = s + 1
-    else:
-        s: int32 = 0
-        while s < -shift:
-            val = val / 2.0
-            s = s + 1
-    return val
+    # E8M0 (127-biased power-of-two) scale -> float32 value 2**(scale-127).
+    # A float32 with biased exponent field = scale and zero sign/mantissa
+    # is exactly 2**(scale-127) by the IEEE754 encoding itself, so the
+    # value is assembled with a single shift + bitcast -- no data-dependent
+    # loop trip count, unlike the previous repeated-doubling/halving
+    # version, which made mx_block_dot's latency variable and blocked
+    # Vitis HLS from pipelining mx_dot_general's per-block loop around it.
+    # (At the extreme low clamp, scale == 0 now yields 0.0 rather than the
+    # previous version's subnormal 2**-127 -- a ~1e-39 discrepancy with no
+    # measurable effect on any dot product.)
+    bits: int32 = int(scale) << 23
+    return bits.bitcast()
 
 
 def _mx_pack_word[Ty, K](scale: uint8, elems: "uint8[K]") -> "Ty":
@@ -198,7 +196,7 @@ def _mx_pack_word[Ty, K](scale: uint8, elems: "uint8[K]") -> "Ty":
     return word
 
 
-def _mx_get_scale[Ty](word: "Ty") -> uint8:
+def  _mx_get_scale[Ty](word: "Ty") -> uint8:
     return word[Ty.bits - 8 : Ty.bits]
 
 
@@ -246,40 +244,41 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
 
     total: float32 = 0.0
     with allo.meta_if(Ty.is_float):
+        mul: "Int(_mx_acc_bits(Ty, K))[K]"
+        for j0 in range(K):
+            a_i: UInt(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+            b_i: UInt(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+            mul[j0] = _mx_fp_mul[Ty, K](a_i, b_i)
+
         acc: "Int(_mx_acc_bits(Ty, K))" = 0
-        for i in range(K):
-            a_i: UInt(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-            b_i: UInt(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-            term: "Int(_mx_acc_bits(Ty, K))" = _mx_fp_mul[Ty, K](a_i, b_i)
-            acc = acc + term
+        for j1 in range(K):
+            acc = acc + mul[j1]
 
         pow2_val: float32 = 2.0 ** (2 * (1 - Ty.bias) - 2 * Ty.mantissa_bits)
         total = float(acc) * pow2_val
     with allo.meta_else():
-        acc_i: "Int(_mx_acc_bits(Ty, K))" = 0
-        for i in range(K):
-            a_i: Int(Ty.elem_bits) = data_a[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
-            b_i: Int(Ty.elem_bits) = data_b[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
+        mul_i: "Int(_mx_acc_bits(Ty, K))[K]"
+        for j0 in range(K):
+            a_i: Int(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+            b_i: Int(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
             a_wide: "Int(_mx_acc_bits(Ty, K))" = a_i
             b_wide: "Int(_mx_acc_bits(Ty, K))" = b_i
-            acc_i = acc_i + a_wide * b_wide
+            mul_i[j0] = a_wide * b_wide
+
+        acc_i: "Int(_mx_acc_bits(Ty, K))" = 0
+        for j1 in range(K):
+            acc_i = acc_i + mul_i[j1]
         total = float(acc_i)
 
     return total * scale_a_val * scale_b_val
 
 
 def schedule_mx_block_dot(s):
-    s.unroll("mx_block_dot:i")
+    s.unroll("mx_block_dot:j0")
+    s.unroll("mx_block_dot:j1")
 
 
 def block_dot_product[Ty, K](A: "bfloat16[K]", B: "bfloat16[K]") -> float32:
-    # Single-block convenience composition: quantize both bfloat16[K]
-    # operands and take their block dot product directly. Unlike
-    # dot_product/mx_dot_general (which additionally tile over N // K
-    # blocks and round-trip each block's scale/data through uint8 arrays
-    # via mx_quantize/_mx_pack_word), this goes straight from
-    # mx_quantize_block's packed Ty word into mx_block_dot, with no
-    # intermediate byte unpacking/repacking.
     word_a: Ty = mx_quantize_block[Ty, K](A)
     word_b: Ty = mx_quantize_block[Ty, K](B)
     return mx_block_dot[Ty, K](word_a, word_b)
@@ -290,51 +289,69 @@ def schedule_block_dot_product(s):
     schedule_mx_block_dot(s)
 
 
-def mx_dot_general[Ty, K, N](
+def mx_dot_general[Ty, K, N, P](
     scales_a: "uint8[N // K]",
     data_a: "uint8[N // K, K]",
     scales_b: "uint8[N // K]",
     data_b: "uint8[N // K, K]",
 ) -> float32:
-    # Cross-block reduction: each block's dequantized dot product
-    # (mx_block_dot, already a plain float32) is added directly into a
-    # running float32 total -- ordinary float32 addition already handles
-    # aligning different blocks' magnitudes, so no separate scale-tracking
-    # or exponent-alignment step is needed here.
+    # P independent partial-sum accumulators (one per lane) break the
+    # loop-carried float-add dependency that a single running
+    # `total = total + block_dot` would put on one register: each lane's
+    # own accumulate is still a loop-carried float add across outer trips
+    # i and i+1, but with P lanes the same slot is only revisited every P
+    # outer trips instead of every one. `j` is unrolled, so `partials[j]`
+    # is a compile-time-constant index for each of the P lanes -- no
+    # data-dependent index for Vitis's dependence analysis to reason
+    # about, and no manual `#pragma HLS dependence` patch needed (see
+    # test/mxint8_dot_general_partial_check.py and its P=4 sibling
+    # mxint8_dot_general_partial_p4_check.py for the derivation).
     #
-    # data_a/data_b hold per-element raw bytes, not `Ty[N // K]` arrays --
-    # see mx_quantize's comment for why a live array of the wide packed Ty
-    # word crashes the MLIR JIT ExecutionEngine. Each block's packed word
-    # is rebuilt (via _mx_pack_word) as a scalar local immediately before
-    # use, never stored into an array.
+    # P should be picked to match mx_block_dot's own achievable
+    # throughput on the target device/frequency, not just the float
+    # adder's raw latency -- Vitis's scheduler resolves the exact
+    # per-cycle dependency, which can be tighter than that rule of thumb
+    # (measured: P=4 already reaches II=4 for mxint8 at K=32 on
+    # u55c/300MHz, half the DSPs of the naive P=8 choice, at the same
+    # overall latency).
+    partials: float32[P]
+    for p0 in range(P):
+        partials[p0] = 0.0
+
+    for i in range(N // K // P):
+        for j in range(P):
+            b: int32 = i * P + j
+            block_a: uint8[K]
+            block_b: uint8[K]
+            for k in range(K):
+                block_a[k] = data_a[b, k]
+                block_b[k] = data_b[b, k]
+            word_a: Ty = _mx_pack_word[Ty, K](scales_a[b], block_a)
+            word_b: Ty = _mx_pack_word[Ty, K](scales_b[b], block_b)
+            partials[j] = partials[j] + mx_block_dot[Ty, K](word_a, word_b)
+
     total: float32 = 0.0
-
-    for b in range(N // K):
-        block_a: uint8[K]
-        block_b: uint8[K]
-        for i in range(K):
-            block_a[i] = data_a[b, i]
-            block_b[i] = data_b[b, i]
-        word_a: Ty = _mx_pack_word[Ty, K](scales_a[b], block_a)
-        word_b: Ty = _mx_pack_word[Ty, K](scales_b[b], block_b)
-        total = total + mx_block_dot[Ty, K](word_a, word_b)
-
+    for r in range(P):
+        total = total + partials[r]
     return total
 
 
-def schedule_mx_dot_general(s):
-    # Pipeline the word-reconstruction loop (see its own comment on why the
-    # packed Ty word is rebuilt from bytes here rather than stored in an
-    # array). mx_block_dot's own K-loop is pipelined separately by
-    # schedule_mx_block_dot when that's scheduled as part of the same
-    # kernel; this is the N//K cross-block loop's own inner K-loop.
-    s.pipeline("mx_dot_general:i")
-    # Also pipeline the  outer per-block (N // K) loop -- it calls
-    # mx_block_dot once per block; without this, each block's full compute
-    # (including mx_block_dot's own internally pipelined K-loop) must fully
-    # drain before the next block's starts, rather than overlapping
-    # consecutive blocks through the same hardware.
-    s.pipeline("mx_dot_general:b")
+def schedule_mx_dot_general(s, P):
+    schedule_mx_block_dot(s)
+    # Each lane's own accumulate is still a loop-carried float add across
+    # outer trips i and i+1 (P trips apart) -- see mx_dot_general's
+    # docstring for why this must be P, not the default 1.
+    s.pipeline("mx_dot_general:i", initiation_interval=P)
+    s.unroll("mx_dot_general:j")
+    s.unroll("mx_dot_general:k")
+    s.unroll("mx_dot_general:p0")
+    s.unroll("mx_dot_general:r")
+    s.partition("mx_dot_general:partials", dim=0)
+    for name in ("data_a", "data_b"):
+        try:
+            s.partition(f"mx_dot_general:{name}", dim=2)
+        except AlloValueError:
+            pass
 
 
 def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
@@ -345,10 +362,6 @@ def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
     mx_quantize[Ty, K, N](A, scales_a, data_a)
     mx_quantize[Ty, K, N](B, scales_b, data_b)
 
-    # Inlined from mx_dot_general: dot_product itself builds each block's
-    # packed Ty word (via _mx_pack_word, as a scalar local -- never as an
-    # array, see mx_quantize's docstring for why) and hands it directly to
-    # mx_block_dot.
     total: float32 = 0.0
     for b in range(N // K):
         block_a: uint8[K]

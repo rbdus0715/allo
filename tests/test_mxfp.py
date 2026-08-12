@@ -336,7 +336,7 @@ def make_dot_general_kernel(Ty, K, NB):
     ):
         mx_quantize[Ty, K, N](a, scales_a, a_bytes)
         mx_quantize[Ty, K, N](b, scales_b, b_bytes)
-        result[0] = mx_dot_general[Ty, K, N](scales_a, a_bytes, scales_b, b_bytes)
+        result[0] = mx_dot_general[Ty, K, N, NB](scales_a, a_bytes, scales_b, b_bytes)
 
     kernel.__name__ = f"dot_general_{Ty.name}"
     return kernel
