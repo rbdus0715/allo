@@ -17,15 +17,6 @@ def _bf16_to_f32(v: bfloat16) -> float32:
 
 
 def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
-    # Requantize one bfloat16 element into Ty's (1 + exp_bits + mantissa_bits)
-    # narrow FP element, given the block's shared (already-clamped) exponent.
-    # Follows Algorithm 1 of arXiv:2310.10537: v is divided by the block
-    # scale (implicitly, via exponent subtraction) then clamped/rounded
-    # (round-to-nearest-even) into the element format. Pure bit manipulation
-    # (no floating-point arithmetic on v itself), so this operates directly
-    # on bf16's own (1 + 8 + 7)-bit layout -- same 8-bit exponent field/127
-    # bias as float32, just a narrower 7-bit mantissa -- no float32 widening
-    # needed (contrast _mx_quantize_elem_int, which does a real division).
     bits: uint16 = v.bitcast()
     sign: int32 = bits[15:16]
     exp_field: int32 = bits[7:15]
@@ -37,7 +28,6 @@ def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bi
     out: UInt(Ty.elem_bits) = 0
 
     if exp_field == 0:
-        # subnormal/zero bf16 input -> zero (per Algorithm 1's note)
         out = sign << (Ty.exp_bits + Ty.mantissa_bits)
     else:
         unbiased_exp: int32 = exp_field - 127
@@ -94,9 +84,6 @@ def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bi
 
 
 def _mx_quantize_elem_int[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
-    # See _mx_quantize_elem_int_f32's docstring for the actual (division-free)
-    # implementation -- this just widens bf16 to float32 first (a cheap
-    # shift, see _bf16_to_f32) and delegates.
     v_f32: float32 = _bf16_to_f32(v)
     return _mx_quantize_elem_int_f32[Ty](v_f32, shared_exp)
 
@@ -130,37 +117,11 @@ def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
 
 
 def schedule_mx_quantize_block(s):
-    # dev-plan Fig 1 "parallel structure": pipelining a reduction/elementwise
-    # loop lets Vitis HLS's own scheduler overlap iterations (parallel-like
-    # multiplier throughput) and, for the max_exp_field reduction, rebalance
-    # the dependency chain into a tree internally to still hit II=1.
     s.pipeline("mx_quantize_block:i0")
     s.pipeline("mx_quantize_block:i1")
 
 
 def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
-    # float32-input counterpart to _mx_quantize_elem_int (same math, minus
-    # the bfloat16->float32 widening step): needed because Allo's Vitis
-    # HLS C++ emitter (getTypeName in mlir/lib/Translation/EmitVivadoHLS.cpp)
-    # has a case for Float16/32/64Type but none for BFloat16Type, so any
-    # bfloat16-typed value -- function arg, local, stream element, anything
-    # -- crashes csynth the moment it needs to be emitted as C++. Only
-    # mxint (Ty.is_float == False) formats are implemented here; mxfp
-    # (float) formats aren't wired up on this path yet.
-    #
-    # Division-free: the divisor (2**shared_exp) is always a power of two,
-    # and dividing a float by a power of two only ever shifts its exponent
-    # field -- it never touches sign or mantissa. So v_f32 / 2**shared_exp
-    # is computed by extracting v_f32's own sign/exponent/mantissa and
-    # subtracting shared_exp from the exponent (target_exp), the same
-    # exponent-subtraction trick _mx_quantize_elem_fp already uses to
-    # requantize into a *narrower float* -- here the result is a plain
-    # rounded integer instead, so the shifted mantissa is rounded and kept
-    # directly rather than repacked into exponent+mantissa fields. This
-    # avoids ever instantiating float division hardware (measured: this
-    # was the dominant DSP/LUT cost of make_mx_dot_general_dataflow's
-    # quantize_ab stage -- ~256 DSP, mostly float dividers, for what
-    # should be simple fixed-point rounding).
     bits: int32 = v_f32.bitcast()
     sign: int32 = bits[31:32]
     exp_field: int32 = bits[23:31]
@@ -174,30 +135,19 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty
     else:
         unbiased_exp: int32 = exp_field - 127
         target_exp: int32 = unbiased_exp - shared_exp
-        # full_mant is the 24-bit (1 + 23-bit) mantissa with its implicit
-        # leading 1 restored, representing 1.mant as an integer scaled by
-        # 2**23. v_f32 / 2**shared_exp == full_mant * 2**(target_exp - 23),
-        # so total_shift is how far to shift full_mant right to land on
-        # the (unrounded) integer part.
         full_mant: int32 = (1 << 23) | mant
         total_shift: int32 = 23 - target_exp
 
         mag: int32 = 0
         if total_shift <= 0:
-            # target_exp >= 23 -> magnitude >= 2**24, certainly clamps;
-            # avoid shifting full_mant left by a huge/negative amount.
             mag = max_val + 1
         elif total_shift > 30:
-            # Shifting the entire 24-bit mantissa out (and then some) --
-            # rounds to zero. (Also keeps the shift amount used below,
-            # total_shift - 1, safely within int32 range.)
             mag = 0
         else:
             kept: int32 = full_mant >> total_shift
             remainder: int32 = full_mant & ((1 << total_shift) - 1)
             halfpoint: int32 = 1 << (total_shift - 1)
-            # round half away from zero, matching the original
-            # int(scaled +/- 0.5) behavior exactly.
+            
             if remainder >= halfpoint:
                 kept = kept + 1
             mag = kept
@@ -212,9 +162,6 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty
 
 
 def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
-    # float32-input counterpart to mx_quantize_block -- see
-    # _mx_quantize_elem_int_f32's docstring for why this exists (mxint
-    # formats only, no meta_if(Ty.is_float) branch).
     max_exp_field: int32 = 0
     for i0 in range(K):
         bits_i: int32 = x[i0].bitcast()
@@ -254,24 +201,10 @@ def mx_quantize[Ty, K, N](
 def schedule_mx_quantize(s):
     s.pipeline("mx_quantize:i0")
     s.pipeline("mx_quantize:i1")
-    # Also pipeline the outer per-block loop itself: without this, each
-    # block's mx_quantize_block call must fully drain before the next
-    # block starts, leaving the inner loops' own pipelines idle between
-    # blocks instead of kept continuously fed.
     s.pipeline("mx_quantize:b")
 
 
 def _mx_scale_to_float32(scale: uint8) -> float32:
-    # E8M0 (127-biased power-of-two) scale -> float32 value 2**(scale-127).
-    # A float32 with biased exponent field = scale and zero sign/mantissa
-    # is exactly 2**(scale-127) by the IEEE754 encoding itself, so the
-    # value is assembled with a single shift + bitcast -- no data-dependent
-    # loop trip count, unlike the previous repeated-doubling/halving
-    # version, which made mx_block_dot's latency variable and blocked
-    # Vitis HLS from pipelining mx_dot_general's per-block loop around it.
-    # (At the extreme low clamp, scale == 0 now yields 0.0 rather than the
-    # previous version's subnormal 2**-127 -- a ~1e-39 discrepancy with no
-    # measurable effect on any dot product.)
     bits: int32 = int(scale) << 23
     return bits.bitcast()
 
@@ -383,25 +316,7 @@ def mx_dot_general[Ty, K, N, P](
     scales_b: "uint8[N // K]",
     data_b: "uint8[N // K, K]",
 ) -> float32:
-    # P independent partial-sum accumulators (one per lane) break the
-    # loop-carried float-add dependency that a single running
-    # `total = total + block_dot` would put on one register: each lane's
-    # own accumulate is still a loop-carried float add across outer trips
-    # i and i+1, but with P lanes the same slot is only revisited every P
-    # outer trips instead of every one. `j` is unrolled, so `partials[j]`
-    # is a compile-time-constant index for each of the P lanes -- no
-    # data-dependent index for Vitis's dependence analysis to reason
-    # about, and no manual `#pragma HLS dependence` patch needed (see
-    # test/mxint8_dot_general_partial_check.py and its P=4 sibling
-    # mxint8_dot_general_partial_p4_check.py for the derivation).
-    #
-    # P should be picked to match mx_block_dot's own achievable
-    # throughput on the target device/frequency, not just the float
-    # adder's raw latency -- Vitis's scheduler resolves the exact
-    # per-cycle dependency, which can be tighter than that rule of thumb
-    # (measured: P=4 already reaches II=4 for mxint8 at K=32 on
-    # u55c/300MHz, half the DSPs of the naive P=8 choice, at the same
-    # overall latency).
+
     partials: float32[P]
     for p0 in range(P):
         partials[p0] = 0.0
@@ -426,9 +341,6 @@ def mx_dot_general[Ty, K, N, P](
 
 def schedule_mx_dot_general(s, P):
     schedule_mx_block_dot(s)
-    # Each lane's own accumulate is still a loop-carried float add across
-    # outer trips i and i+1 (P trips apart) -- see mx_dot_general's
-    # docstring for why this must be P, not the default 1.
     s.pipeline("mx_dot_general:i", initiation_interval=P)
     s.unroll("mx_dot_general:j")
     s.unroll("mx_dot_general:k")
@@ -465,15 +377,8 @@ def dot_product[Ty, K, N](A: "bfloat16[N]", B: "bfloat16[N]") -> float32:
 
 
 def patch_extern_c_for_class_return_types(kernel_cpp_path):
-    """v++/vitis_hls wraps kernel.cpp in `extern "C" { ... }`, and a
-    C-linkage function returning a non-POD class type (e.g. `ap_uint<264>`,
-    what _mx_pack_word/mx_quantize_block_f32 return for mxint8) is rejected
-    by the front end. Pulls each such function out of the extern "C" block
-    in-place. Required after s.build() and before invoking the returned
-    hls_mod for any kernel built from this module's Ty-returning helpers
-    (mx_dot_general, make_mx_dot_general_dataflow, etc.) -- csynth will
-    fail to compile without it.
-    """
+    # remove extern "C" block and add it back with the function signature
+    # issue #603 (https://github.com/alloy-lang/allo/issues/603)
     with open(kernel_cpp_path, encoding="utf-8") as f:
         lines = f.readlines()
     out = []
@@ -503,48 +408,6 @@ def patch_extern_c_for_class_return_types(kernel_cpp_path):
 
 
 def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
-    """Factory for a 3-stage task-level dataflow dot-product kernel: read,
-    quantize, and dot_product run as concurrent hls::stream-connected
-    processes (allo.dataflow's df.region/df.kernel/Stream) instead of one
-    function synthesized as a single pipelined loop -- Vitis can start
-    quantizing block b+1 while dot_product_stage is still reducing block b,
-    and start reading block b+2 while block b+1 is being quantized. See
-    test/mxint8_dataflow_3stage_check.py for the derivation and measured
-    numbers.
-
-    Only supports mxint formats (Ty.is_float == False) -- see
-    mx_quantize_block_f32's docstring.
-
-    A/B are `UInt(K * 32)[NB]`: each element is a wide word packing K
-    float32 values (not this module's usual bfloat16 -- see
-    mx_quantize_block_f32's docstring for why), so a single m_axi beat
-    loads a whole K-element block instead of one float32 at a time.
-    Measured for mxint8/K=32/NB=128/P=4 on u55c/300MHz: this wide-word
-    load cuts the load stage from ~4106 to ~138 cycles and total top
-    latency from ~4337 to ~369 cycles, versus a plain `float32[N]` input.
-
-    Returns the customized+scheduled allo Schedule (not yet built).
-    Typical use:
-
-        s = make_mx_dot_general_dataflow(T.mxint8, K=32, NB=128, P=4)
-        hls_mod = s.build(target="vitis_hls", mode="csyn", project=...,
-                           configs={"device": "u55c", "frequency": 300},
-                           wrap_io=True)
-        patch_extern_c_for_class_return_types(
-            os.path.join(project, "kernel.cpp"))
-        hls_mod()  # runs csynth_design
-
-    The patch_extern_c_for_class_return_types call is not optional --
-    csynth will fail to compile without it (see that function's
-    docstring). quantize_ab handles both operands in one df.kernel (not
-    split into quantize_a/quantize_b) because Allo's dataflow lowering
-    errors ("redefinition of symbol") if the same shared helper is called
-    from two different df.kernel functions in the same df.region; for the
-    same reason the scale byte is pulled out via a direct bit-slice rather
-    than a shared get-scale helper call (mx_block_dot inside
-    dot_product_stage already reaches this module's _mx_get_scale
-    transitively).
-    """
     N = K * NB
 
     @df.region()
@@ -623,11 +486,6 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     schedule_mx_block_dot(s)
     s.pipeline("read_a_0:j")
     s.pipeline("read_b_0:j")
-    # Also pipeline the outer per-block loop itself -- without this, each
-    # block's inner K-wide copy (already pipelined via ":j" above) must
-    # fully drain before the next block starts, leaving read_a/read_b's
-    # own achieved II unset ("Pipelined: no") and inflating their latency
-    # ~70x (128 blocks * ~75 cycles/block instead of ~1 cycle/block).
     s.pipeline("read_a_0:b")
     s.pipeline("read_b_0:b")
     s.pipeline("quantize_ab_0:b")
