@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import tempfile
+import shutil
 
 import numpy as np
 import ml_dtypes
@@ -303,13 +303,8 @@ def test_mx_dot_general_dataflow_mxint8():
     if not hls.is_available("vitis_hls"):
         return
 
-    # Which HLS mode to build/run. Override at invocation time, e.g.:
-    #   ALLO_HLS_MODE=hw_emu python tests/test_mxfp.py
-    #   ALLO_HLS_MODE=hw_emu pytest tests/test_mxfp.py -k dataflow_mxint8
-    # ...or just edit the default here.
-    mode = os.environ.get("ALLO_HLS_MODE", "csyn")  # csyn | sw_emu | hw_emu | hw
-    # mode = "hw_emu"
-    assert mode in {"csyn", "sw_emu", "hw_emu", "hw"}, f"unsupported mode {mode!r}"
+    mode = os.environ.get("ALLO_HLSMODE")
+    project = os.environ.get("ALLO_PROJECT")
 
     # sw_emu/hw_emu/hw go through the v++ Makefile flow, which needs XDEVICE
     # pointing at a platform .xpfm (same env var Allo already reads).
@@ -317,65 +312,59 @@ def test_mx_dot_general_dataflow_mxint8():
         print(f"Skipping {mode} run: set XDEVICE to a platform .xpfm to run this mode")
         return
 
-    with tempfile.TemporaryDirectory(dir=_REPO_TMP_DIR) as tmpdir:
-        hls_mod = s.build(
-            target="vitis_hls",
-            mode=mode,
-            project=tmpdir,
-            wrap_io=True,
-        )
-        # issue #603 (https://github.com/alloy-lang/allo/issues/603)
-        patched = patch_extern_c_for_class_return_types(f"{tmpdir}/kernel.cpp")
-        assert patched, "expected _mx_pack_word/mx_quantize_block_f32 to need the patch"
+    hls_mod = s.build(
+        target="vitis_hls",
+        mode=mode,
+        project=project,
+        wrap_io=True,
+    )
 
-        if mode == "csyn":
-            hls_mod()
-            csynth_rpt = os.path.join(
-                tmpdir, "out.prj", "solution1", "syn", "report", "top_csynth.rpt"
-            )
-            assert os.path.isfile(csynth_rpt)
-            with open(csynth_rpt, encoding="utf-8") as f:
-                report = f.read()
-            assert "dataflow" in report
-        else:
-            # sw_emu/hw_emu/hw can't be called with zero args like csyn -- pack
-            # real float32 input blocks into the wide UInt(K*32)[NB] words.
-            N = K * NB
-            rng = np.random.default_rng(0)
-            A = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
-            B = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
-            pack = lambda x: (
-                np.frombuffer(x.tobytes(), dtype=np.uint8)
-                .reshape(NB, K * 4)
-                .copy()
-                .view(f"V{K * 4}")
-                .reshape(NB)
-            )
-            result = np.zeros((1,), dtype=np.float32)
-            hls_mod(pack(A), pack(B), result)
-            ref = float(np.dot(A.astype(np.float64), B.astype(np.float64)))
-            print(f"[{mode}] result={result[0]} ref={ref}")
+    # issue #603 (https://github.com/alloy-lang/allo/issues/603)
+    patched = patch_extern_c_for_class_return_types(f"{project}/kernel.cpp")
+    assert patched, "expected _mx_pack_word/mx_quantize_block_f32 to need the patch"
+
+    if mode == "csyn":
+        hls_mod()
+        csynth_rpt = os.path.join(
+            tmpdir, "out.prj", "solution1", "syn", "report", "top_csynth.rpt"
+        )
+        assert os.path.isfile(csynth_rpt)
+        with open(csynth_rpt, encoding="utf-8") as f:
+            report = f.read()
+        assert "dataflow" in report
+    else:
+        # sw_emu/hw_emu/hw can't be called with zero args like csyn -- pack
+        # real float32 input blocks into the wide UInt(K*32)[NB] words.
+        N = K * NB
+        rng = np.random.default_rng(0)
+        A = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
+        B = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
+        pack = lambda x: (
+            np.frombuffer(x.tobytes(), dtype=np.uint8)
+            .reshape(NB, K * 4)
+            .copy()
+            .view(f"V{K * 4}")
+            .reshape(NB)
+        )
+        result = np.zeros((1,), dtype=np.float32)
+        hls_mod(pack(A), pack(B), result)
+        ref = float(np.dot(A.astype(np.float64), B.astype(np.float64)))
+        print(f"[{mode}] result={result[0]} ref={ref}")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--csyn", action="store_const", dest="mode", const="csyn")
-    mode_group.add_argument(
-        "--sw_emu", action="store_const", dest="mode", const="sw_emu"
-    )
-    mode_group.add_argument(
-        "--hw_emu", action="store_const", dest="mode", const="hw_emu"
-    )
-    mode_group.add_argument("--hw", action="store_const", dest="mode", const="hw")
-    parser.add_argument(
-        "--xdevice", default=None, help="platform .xpfm path (sets XDEVICE)"
-    )
+    parser.add_argument("--mode", choices=["csyn", "sw_emu", "hw_emu", "hw"], default="csyn")
+    parser.add_argument("--project", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "mxfp.prj"))
+    parser.add_argument("--clean", action="store_true", help="Clean the project dir")
+    
     args, pytest_args = parser.parse_known_args()
-    if args.mode:
-        os.environ["ALLO_HLS_MODE"] = args.mode
-    if args.xdevice:
-        os.environ["XDEVICE"] = args.xdevice
+
+    os.environ["ALLO_HLSMODE"] = args.mode
+    os.environ["ALLO_PROJECT"] = args.project
+    if args.clean:
+        shutil.rmtree(args.project, ignore_errors=True)
+
     pytest.main([__file__, *pytest_args])
