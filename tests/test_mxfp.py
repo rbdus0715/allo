@@ -296,7 +296,7 @@ def test_dot_product_mxint8():
 def test_mx_dot_general_dataflow_mxint8():
     Ty = T.mxint8
     K = 32  # mxint8's actual block_size
-    NB = 16
+    NB = 128
     P = 4
     s = make_mx_dot_general_dataflow(Ty, K, NB, P)
 
@@ -327,7 +327,7 @@ def test_mx_dot_general_dataflow_mxint8():
         hls_mod()
         csynth_rpt = os.path.join(
             tmpdir, "out.prj", "solution1", "syn", "report", "top_csynth.rpt"
-        )
+        ) 
         assert os.path.isfile(csynth_rpt)
         with open(csynth_rpt, encoding="utf-8") as f:
             report = f.read()
