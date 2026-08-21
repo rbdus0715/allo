@@ -22,7 +22,11 @@ from allo.library.mxfp import (
 from allo.ir.types import float32, uint8, bfloat16
 import allo.ir.types as T
 
-K = 8
+# Small block size used only by the standalone mx_quantize_block tests below.
+# Named distinctly (not "K") so it can't be picked up by accident when Allo
+# re-resolves type annotations for dataflow kernels built elsewhere in this
+# file with their own local `K` (see test_mx_dot_general_dataflow_mxint8).
+BLOCK8_K = 8
 
 # HLS csynth builds write substantial scratch output; keep it inside the repo
 # (gitignored) instead of the system /tmp.
@@ -31,12 +35,12 @@ os.makedirs(_REPO_TMP_DIR, exist_ok=True)
 
 
 def make_quantize_block_kernel(Ty):
-    def kernel(x: bfloat16[K]) -> ("uint8[1]", "uint8[K]"):
+    def kernel(x: bfloat16[BLOCK8_K]) -> ("uint8[1]", "uint8[BLOCK8_K]"):
         scale_out: uint8[1]
-        w: Ty = mx_quantize_block[Ty, K](x)
+        w: Ty = mx_quantize_block[Ty, BLOCK8_K](x)
         scale_out[0] = _mx_get_scale[Ty](w)
-        elem_bits: uint8[K]
-        for i in range(K):
+        elem_bits: uint8[BLOCK8_K]
+        for i in range(BLOCK8_K):
             elem_bits[i] = w[i * Ty.elem_bits : (i + 1) * Ty.elem_bits]
         return scale_out, elem_bits
 
@@ -63,7 +67,7 @@ def test_mx_quantize_block_mxint8():
     elem_max_unbiased = Ty.max_unbiased_exp  # elem_bits - 2 == 6
 
     for trial in range(20):
-        x_f32 = (rng.standard_normal(K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
+        x_f32 = (rng.standard_normal(BLOCK8_K) * 2.0 ** rng.integers(-8, 8)).astype(np.float32)
         if trial == 0:
             x_f32[:] = 0.0
         elif trial == 1:
@@ -78,7 +82,7 @@ def test_mx_quantize_block_mxint8():
         ref_scale, _, ref_signed = _mxint8_quantize_ref(x, elem_max_unbiased)
         assert scale == ref_scale, f"trial {trial}: scale {scale} != {ref_scale}"
 
-        for i in range(K):
+        for i in range(BLOCK8_K):
             ours = int(elem_bits[i])
             ours_signed = ours - 256 if ours >= 128 else ours
             assert ours_signed == ref_signed[i], (
@@ -90,24 +94,26 @@ def test_mx_quantize_full_tensor():
     Ty = T.mxint8
     N = 16
 
-    def kernel2(x: bfloat16[N], scales: uint8[N // K], data_bits: uint8[N // K, K]):
-        mx_quantize[Ty, K, N](x, scales, data_bits)
+    def kernel2(
+        x: bfloat16[N], scales: uint8[N // BLOCK8_K], data_bits: uint8[N // BLOCK8_K, BLOCK8_K]
+    ):
+        mx_quantize[Ty, BLOCK8_K, N](x, scales, data_bits)
 
     mod = allo.customize(kernel2).build()
     rng = np.random.default_rng(2)
     x_bf16 = ((rng.standard_normal(N) * 4.0).astype(np.float32)).astype(ml_dtypes.bfloat16)
     x = x_bf16.astype(np.float32)
-    scales = np.zeros(N // K, dtype=np.uint8)
-    data_bits = np.zeros((N // K, K), dtype=np.uint8)
+    scales = np.zeros(N // BLOCK8_K, dtype=np.uint8)
+    data_bits = np.zeros((N // BLOCK8_K, BLOCK8_K), dtype=np.uint8)
     mod(x_bf16, scales, data_bits)
 
     elem_max_unbiased = Ty.max_unbiased_exp
-    for b in range(N // K):
+    for b in range(N // BLOCK8_K):
         ref_scale, _, ref_signed = _mxint8_quantize_ref(
-            x[b * K : (b + 1) * K], elem_max_unbiased
+            x[b * BLOCK8_K : (b + 1) * BLOCK8_K], elem_max_unbiased
         )
         assert int(scales[b]) == ref_scale
-        for i in range(K):
+        for i in range(BLOCK8_K):
             ours = int(data_bits[b, i])
             ours_signed = ours - 256 if ours >= 128 else ours
             assert ours_signed == ref_signed[i]
@@ -316,7 +322,7 @@ def test_mx_dot_general_dataflow_mxint8():
         target="vitis_hls",
         mode=mode,
         project=project,
-        wrap_io=True,
+        wrap_io=False,
     )
 
     # issue #603 (https://github.com/alloy-lang/allo/issues/603)
@@ -326,8 +332,8 @@ def test_mx_dot_general_dataflow_mxint8():
     if mode == "csyn":
         hls_mod()
         csynth_rpt = os.path.join(
-            tmpdir, "out.prj", "solution1", "syn", "report", "top_csynth.rpt"
-        ) 
+            project, "out.prj", "solution1", "syn", "report", "top_csynth.rpt"
+        )
         assert os.path.isfile(csynth_rpt)
         with open(csynth_rpt, encoding="utf-8") as f:
             report = f.read()

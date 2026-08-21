@@ -123,9 +123,9 @@ def schedule_mx_quantize_block(s):
 
 def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
     bits: int32 = v_f32.bitcast()
-    sign: UInt(1) = bits[31:32]
-    exp_field: UInt(8) = bits[23:31]
-    mant: UInt(23) = bits[0:23]
+    sign: int32 = bits[31:32]
+    exp_field: int32 = bits[23:31]
+    mant: int32 = bits[0:23]
     max_val: int32 = (1 << (Ty.elem_bits - 1)) - 1
     min_val: int32 = -(1 << (Ty.elem_bits - 1))
 
@@ -133,10 +133,10 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty
     if exp_field == 0:
         rounded = 0
     else:
-        unbiased_exp: Int(9) = int(exp_field) - 127
-        target_exp: Int(10) = int(unbiased_exp) - shared_exp
-        full_mant: UInt(24) = (1 << 23) | int(mant)
-        total_shift: Int(10) = 23 - int(target_exp)
+        unbiased_exp: int32 = exp_field - 127
+        target_exp: int32 = unbiased_exp - shared_exp
+        full_mant: int32 = (1 << 23) | mant
+        total_shift: int32 = 23 - target_exp
 
         mag: int32 = 0
         if total_shift <= 0:
@@ -144,13 +144,13 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty
         elif total_shift > 30:
             mag = 0
         else:
-            shifted: UInt(24) = full_mant >> (int(total_shift) - 1)
-            kept: UInt(24) = shifted >> 1
-            round_up: UInt(1) = shifted & 1
+            shifted: int32 = full_mant >> (total_shift - 1)
+            kept: int32 = shifted >> 1
+            round_up: int32 = shifted & 1
 
             if round_up == 1:
                 kept = kept + 1
-            mag = int(kept)
+            mag = kept
 
         if sign == 1:
             rounded = -mag
