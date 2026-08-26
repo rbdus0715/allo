@@ -414,32 +414,48 @@ def patch_extern_c_for_class_return_types(kernel_cpp_path):
 
 def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     N = K * NB
+    WORD_BITS = 512
+    HALF = WORD_BITS // 32  # float32 elements per 512b half
 
     @df.region()
-    def top(A: "UInt(K * 32)[NB]", B: "UInt(K * 32)[NB]", out: "float32[1]"):
+    def top(
+        A0: "UInt(WORD_BITS)[NB]",
+        A1: "UInt(WORD_BITS)[NB]",
+        B0: "UInt(WORD_BITS)[NB]",
+        B1: "UInt(WORD_BITS)[NB]",
+        out: "float32[1]",
+    ):
         pipe_a_raw: Stream[float32[K], depth]
         pipe_b_raw: Stream[float32[K], depth]
         pipe_a_q: Stream["uint8[K + 1]", depth]
         pipe_b_q: Stream["uint8[K + 1]", depth]
 
-        @df.kernel(mapping=[1], args=[A])
-        def read_a(local_A: "UInt(K * 32)[NB]"):
+        @df.kernel(mapping=[1], args=[A0, A1])
+        def read_a(local_A0: "UInt(WORD_BITS)[NB]", local_A1: "UInt(WORD_BITS)[NB]"):
             for b in range(NB):
-                word: UInt(K * 32) = local_A[b]
                 blk: float32[K]
-                for j in range(K):
-                    bits: int32 = word[j * 32 : (j + 1) * 32]
-                    blk[j] = bits.bitcast()
+                word_lo: UInt(WORD_BITS) = local_A0[b]
+                for j0 in range(HALF):
+                    bits: int32 = word_lo[j0 * 32 : (j0 + 1) * 32]
+                    blk[j0] = bits.bitcast()
+                word_hi: UInt(WORD_BITS) = local_A1[b]
+                for j1 in range(HALF):
+                    bits: int32 = word_hi[j1 * 32 : (j1 + 1) * 32]
+                    blk[HALF + j1] = bits.bitcast()
                 pipe_a_raw.put(blk)
 
-        @df.kernel(mapping=[1], args=[B])
-        def read_b(local_B: "UInt(K * 32)[NB]"):
+        @df.kernel(mapping=[1], args=[B0, B1])
+        def read_b(local_B0: "UInt(WORD_BITS)[NB]", local_B1: "UInt(WORD_BITS)[NB]"):
             for b in range(NB):
-                word: UInt(K * 32) = local_B[b]
                 blk: float32[K]
-                for j in range(K):
-                    bits: int32 = word[j * 32 : (j + 1) * 32]
-                    blk[j] = bits.bitcast()
+                word_lo: UInt(WORD_BITS) = local_B0[b]
+                for j0 in range(HALF):
+                    bits: int32 = word_lo[j0 * 32 : (j0 + 1) * 32]
+                    blk[j0] = bits.bitcast()
+                word_hi: UInt(WORD_BITS) = local_B1[b]
+                for j1 in range(HALF):
+                    bits: int32 = word_hi[j1 * 32 : (j1 + 1) * 32]
+                    blk[HALF + j1] = bits.bitcast()
                 pipe_b_raw.put(blk)
 
         @df.kernel(mapping=[1])
@@ -490,8 +506,10 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     s = df.customize(top, opt_default=False)
     schedule_mx_block_dot(s)
     schedule_mx_quantize_block_f32(s)
-    s.pipeline("read_a_0:j")
-    s.pipeline("read_b_0:j")
+    s.pipeline("read_a_0:j0")
+    s.pipeline("read_b_0:j0")
+    s.pipeline("read_a_0:j1")
+    s.pipeline("read_b_0:j1")
     s.pipeline("read_a_0:b")
     s.pipeline("read_b_0:b")
     s.pipeline("quantize_ab_0:b")

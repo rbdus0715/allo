@@ -340,20 +340,31 @@ def test_mx_dot_general_dataflow_mxint8():
         assert "dataflow" in report
     else:
         # sw_emu/hw_emu/hw can't be called with zero args like csyn -- pack
-        # real float32 input blocks into the wide UInt(K*32)[NB] words.
+        # real float32 input blocks into two UInt(512)[NB] halves each
+        # (512b is the platform's m_axi limit; each half is a separate
+        # top-level array so it gets its own m_axi bundle/port -- see
+        # make_mx_dot_general_dataflow).
         N = K * NB
+        HALF = K // 2  # float32 elements per 512b half
         rng = np.random.default_rng(0)
         A = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
         B = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(np.float32)
-        pack = lambda x: (
-            np.frombuffer(x.tobytes(), dtype=np.uint8)
-            .reshape(NB, K * 4)
-            .copy()
-            .view(f"V{K * 4}")
-            .reshape(NB)
-        )
+
+        def split(x):
+            blocks = x.reshape(NB, K)
+            to_words = lambda chunk: (
+                np.frombuffer(chunk.tobytes(), dtype=np.uint8)
+                .reshape(NB, HALF * 4)
+                .copy()
+                .view(f"V{HALF * 4}")
+                .reshape(NB)
+            )
+            return to_words(blocks[:, :HALF].copy()), to_words(blocks[:, HALF:].copy())
+
+        a_lo, a_hi = split(A)
+        b_lo, b_hi = split(B)
         result = np.zeros((1,), dtype=np.float32)
-        hls_mod(pack(A), pack(B), result)
+        hls_mod(a_lo, a_hi, b_lo, b_hi, result)
         ref = float(np.dot(A.astype(np.float64), B.astype(np.float64)))
         print(f"[{mode}] result={result[0]} ref={ref}")
 
