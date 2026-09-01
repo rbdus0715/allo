@@ -83,9 +83,9 @@ def _mx_quantize_elem_fp[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bi
     return out
 
 
-def _mx_quantize_elem_int[Ty](v: bfloat16, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+def _mx_quantize_elem_int[Ty](v: bfloat16, max_exp_field: uint8) -> "UInt(Ty.elem_bits)":
     v_f32: float32 = _bf16_to_f32(v)
-    return _mx_quantize_elem_int_f32[Ty](v_f32, shared_exp)
+    return _mx_quantize_elem_int_f32[Ty](v_f32, max_exp_field)
 
 
 def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
@@ -101,6 +101,9 @@ def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
     shared_exp = max(shared_exp, -127)
 
     scale_field: uint8 = shared_exp + 127
+    # Passed to _mx_quantize_elem_int raw (not offset by Ty.max_unbiased_exp
+    # like scale_field is) -- see _mx_quantize_elem_int_f32's comment.
+    max_exp_field_u8: uint8 = max_exp_field
 
     word: Ty = 0
     word[Ty.bits - 8 : Ty.bits] = scale_field
@@ -110,7 +113,7 @@ def mx_quantize_block[Ty, K](x: "bfloat16[K]") -> "Ty":
         with allo.meta_if(Ty.is_float):
             elem = _mx_quantize_elem_fp[Ty](x[i1], shared_exp)
         with allo.meta_else():
-            elem = _mx_quantize_elem_int[Ty](x[i1], shared_exp)
+            elem = _mx_quantize_elem_int[Ty](x[i1], max_exp_field_u8)
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return word
@@ -121,43 +124,31 @@ def schedule_mx_quantize_block(s):
     s.pipeline("mx_quantize_block:i1")
 
 
-def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_exp: int32) -> "UInt(Ty.elem_bits)":
+def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
     bits: int32 = v_f32.bitcast()
-    sign: int32 = bits[31:32]
-    exp_field: int32 = bits[23:31]
-    mant: int32 = bits[0:23]
+    sign: UInt(1) = bits[31:32]
+    exp_field: uint8 = bits[23:31]
+    mant: UInt(24) = bits[0:23]
     max_val: int32 = (1 << (Ty.elem_bits - 1)) - 1
     min_val: int32 = -(1 << (Ty.elem_bits - 1))
 
-    rounded: int32 = 0
+    rounded: Int(Ty.elem_bits) = 0
     if exp_field == 0:
         rounded = 0
     else:
-        unbiased_exp: int32 = exp_field - 127
-        target_exp: int32 = unbiased_exp - shared_exp
-        full_mant: int32 = (1 << 23) | mant
-        total_shift: int32 = 23 - target_exp
-
-        mag: int32 = 0
-        if total_shift <= 0:
-            mag = max_val + 1
-        elif total_shift > 30:
-            mag = 0
-        else:
-            shifted: int32 = full_mant >> (total_shift - 1)
-            kept: int32 = shifted >> 1
-            round_up: int32 = shifted & 1
-
-            if round_up == 1:
-                kept = kept + 1
-            mag = kept
+        deficit: uint8 = shared_field - exp_field
+        total_shift: UInt(9) = (23 - Ty.max_unbiased_exp) + deficit
+        full_mant: UInt(25) = (1 << 23) | mant
+        mag: Int(Ty.elem_bits) = full_mant >> total_shift
 
         if sign == 1:
             rounded = -mag
         else:
             rounded = mag
-        rounded = min(rounded, max_val)
-        rounded = max(rounded, min_val)
+        if rounded > max_val:
+            rounded = max_val
+        if rounded < min_val:
+            rounded = min_val
     return rounded
 
 
@@ -174,17 +165,17 @@ def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
         if exp_field_i > max_exp_field:
             max_exp_field = exp_field_i
 
-    shared_exp: int32 = max_exp_field - 127 - Ty.max_unbiased_exp
-    shared_exp = min(shared_exp, 127)
-    shared_exp = max(shared_exp, -127)
-
-    scale_field: uint8 = shared_exp + 127
+    scale_wide: int32 = max_exp_field - Ty.max_unbiased_exp
+    scale_wide = min(scale_wide, 254)
+    scale_wide = max(scale_wide, 0)
+    scale_field: uint8 = scale_wide
+    max_exp_field_u8: uint8 = max_exp_field
 
     word: Ty = 0
     word[Ty.bits - 8 : Ty.bits] = scale_field
 
     for i1 in range(K):
-        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](x[i1], shared_exp)
+        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](x[i1], max_exp_field_u8)
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return word
@@ -313,6 +304,111 @@ def block_dot_product[Ty, K](A: "bfloat16[K]", B: "bfloat16[K]") -> float32:
 def schedule_block_dot_product(s):
     schedule_mx_quantize_block(s)
     schedule_mx_block_dot(s)
+
+
+######################################################################
+# Truncating quantizer (INT Ty only): shared scale = max exponent field + 1,
+# mantissa truncated to elem_bits before a narrow (<= elem_bits-wide) shift,
+# sign-magnitude output. No rounding, no saturate -- much cheaper in LUTs
+# than mx_quantize_block_f32 (dynamic shift over the full 24-bit mantissa +
+# round-to-nearest + two's-complement negate) at the cost of accuracy.
+######################################################################
+
+
+def _mx_quantize_elem_trunc_f32[Ty](v_f32: float32, shared_field: int32) -> "UInt(Ty.elem_bits)":
+    bits: int32 = v_f32.bitcast()
+    sign: int32 = bits[31:32]
+    exp_field: int32 = bits[23:31]
+    mant: int32 = bits[0:23]
+
+    mant_bits: int32 = Ty.elem_bits - 1
+    narrow_mant: int32 = (1 << mant_bits) | (mant >> (23 - mant_bits))
+    shift_amt: int32 = shared_field - exp_field
+
+    magnitude: int32 = 0
+    if exp_field != 0 and shift_amt <= Ty.elem_bits:
+        magnitude = narrow_mant >> shift_amt
+
+    return (sign << mant_bits) | (magnitude & ((1 << mant_bits) - 1))
+
+
+def mx_quantize_block_f32_trunc[Ty, K](x: "float32[K]") -> "Ty":
+    max_exp_field: int32 = 0
+    for i0 in range(K):
+        bits_i: int32 = x[i0].bitcast()
+        exp_field_i: int32 = bits_i[23:31]
+        if exp_field_i > max_exp_field:
+            max_exp_field = exp_field_i
+
+    shared_field: int32 = max_exp_field + 1
+    scale_field: uint8 = shared_field
+
+    word: Ty = 0
+    word[Ty.bits - 8 : Ty.bits] = scale_field
+
+    for i1 in range(K):
+        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_trunc_f32[Ty](x[i1], shared_field)
+        word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
+
+    return word
+
+
+def schedule_mx_quantize_block_f32_trunc(s):
+    s.unroll("mx_quantize_block_f32_trunc:i0")
+    s.unroll("mx_quantize_block_f32_trunc:i1")
+
+
+def _mx_scale_to_float32_trunc[Ty](scale: uint8) -> float32:
+    # shared_field encodes max_exp_field + 1 directly, but elements were
+    # also divided by 2**mant_bits when narrow_mant was formed -- undo both.
+    mant_bits: int32 = Ty.elem_bits - 1
+    biased: int32 = int(scale) - mant_bits
+    bits: int32 = biased << 23
+    return bits.bitcast()
+
+
+def _mx_decode_trunc[Ty](raw: "UInt(Ty.elem_bits)") -> "Int(Ty.elem_bits)":
+    sign: int32 = raw[Ty.elem_bits - 1 : Ty.elem_bits]
+    mag: int32 = raw[0 : Ty.elem_bits - 1]
+    result: int32 = mag
+    if sign == 1:
+        result = -mag
+    return result
+
+
+def mx_block_dot_trunc[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
+    scale_a: uint8 = _mx_get_scale[Ty](data_a)
+    scale_b: uint8 = _mx_get_scale[Ty](data_b)
+    scale_a_val: float32 = _mx_scale_to_float32_trunc[Ty](scale_a)
+    scale_b_val: float32 = _mx_scale_to_float32_trunc[Ty](scale_b)
+
+    acc: "Int(_mx_acc_bits(Ty, K))" = 0
+    for j0 in range(K):
+        raw_a: UInt(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+        raw_b: UInt(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+        a_i: Int(Ty.elem_bits) = _mx_decode_trunc[Ty](raw_a)
+        b_i: Int(Ty.elem_bits) = _mx_decode_trunc[Ty](raw_b)
+        a_wide: "Int(_mx_acc_bits(Ty, K))" = a_i
+        b_wide: "Int(_mx_acc_bits(Ty, K))" = b_i
+        acc = acc + a_wide * b_wide
+
+    total: float32 = float(acc)
+    return total * scale_a_val * scale_b_val
+
+
+def schedule_mx_block_dot_trunc(s):
+    s.unroll("mx_block_dot_trunc:j0")
+
+
+def block_dot_product_trunc[Ty, K](A: "float32[K]", B: "float32[K]") -> float32:
+    word_a: Ty = mx_quantize_block_f32_trunc[Ty, K](A)
+    word_b: Ty = mx_quantize_block_f32_trunc[Ty, K](B)
+    return mx_block_dot_trunc[Ty, K](word_a, word_b)
+
+
+def schedule_block_dot_product_trunc(s):
+    schedule_mx_quantize_block_f32_trunc(s)
+    schedule_mx_block_dot_trunc(s)
 
 
 def mx_dot_general[Ty, K, N, P](
@@ -506,6 +602,120 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     s = df.customize(top, opt_default=False)
     schedule_mx_block_dot(s)
     schedule_mx_quantize_block_f32(s)
+    s.pipeline("read_a_0:j0")
+    s.pipeline("read_b_0:j0")
+    s.pipeline("read_a_0:j1")
+    s.pipeline("read_b_0:j1")
+    s.pipeline("read_a_0:b")
+    s.pipeline("read_b_0:b")
+    s.pipeline("quantize_ab_0:b")
+    s.unroll("quantize_ab_0:k")
+    s.pipeline("dot_product_stage_0:i", initiation_interval=P)
+    s.unroll("dot_product_stage_0:j")
+    s.unroll("dot_product_stage_0:k")
+    s.unroll("dot_product_stage_0:p0")
+    s.unroll("dot_product_stage_0:r")
+    s.partition("dot_product_stage_0:partials", dim=0)
+    return s
+
+
+def make_mx_dot_general_dataflow_trunc(Ty, K, NB, P, depth=4):
+    # Same 4-stage dataflow as make_mx_dot_general_dataflow, but quantize_ab
+    # and dot_product_stage use the truncating (mx_quantize_block_f32_trunc /
+    # mx_block_dot_trunc) quantizer instead.
+    N = K * NB
+    WORD_BITS = 512
+    HALF = WORD_BITS // 32
+
+    @df.region()
+    def top(
+        A0: "UInt(WORD_BITS)[NB]",
+        A1: "UInt(WORD_BITS)[NB]",
+        B0: "UInt(WORD_BITS)[NB]",
+        B1: "UInt(WORD_BITS)[NB]",
+        out: "float32[1]",
+    ):
+        pipe_a_raw: Stream[float32[K], depth]
+        pipe_b_raw: Stream[float32[K], depth]
+        pipe_a_q: Stream["uint8[K + 1]", depth]
+        pipe_b_q: Stream["uint8[K + 1]", depth]
+
+        @df.kernel(mapping=[1], args=[A0, A1])
+        def read_a(local_A0: "UInt(WORD_BITS)[NB]", local_A1: "UInt(WORD_BITS)[NB]"):
+            for b in range(NB):
+                blk: float32[K]
+                word_lo: UInt(WORD_BITS) = local_A0[b]
+                for j0 in range(HALF):
+                    bits: int32 = word_lo[j0 * 32 : (j0 + 1) * 32]
+                    blk[j0] = bits.bitcast()
+                word_hi: UInt(WORD_BITS) = local_A1[b]
+                for j1 in range(HALF):
+                    bits: int32 = word_hi[j1 * 32 : (j1 + 1) * 32]
+                    blk[HALF + j1] = bits.bitcast()
+                pipe_a_raw.put(blk)
+
+        @df.kernel(mapping=[1], args=[B0, B1])
+        def read_b(local_B0: "UInt(WORD_BITS)[NB]", local_B1: "UInt(WORD_BITS)[NB]"):
+            for b in range(NB):
+                blk: float32[K]
+                word_lo: UInt(WORD_BITS) = local_B0[b]
+                for j0 in range(HALF):
+                    bits: int32 = word_lo[j0 * 32 : (j0 + 1) * 32]
+                    blk[j0] = bits.bitcast()
+                word_hi: UInt(WORD_BITS) = local_B1[b]
+                for j1 in range(HALF):
+                    bits: int32 = word_hi[j1 * 32 : (j1 + 1) * 32]
+                    blk[HALF + j1] = bits.bitcast()
+                pipe_b_raw.put(blk)
+
+        @df.kernel(mapping=[1])
+        def quantize_ab():
+            for b in range(NB):
+                blk_a: float32[K] = pipe_a_raw.get()
+                word_a: Ty = mx_quantize_block_f32_trunc[Ty, K](blk_a)
+                bundle_a: uint8[K + 1]
+                bundle_a[0] = word_a[Ty.bits - 8 : Ty.bits]
+                for k in range(K):
+                    bundle_a[k + 1] = word_a[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
+                pipe_a_q.put(bundle_a)
+
+                blk_b: float32[K] = pipe_b_raw.get()
+                word_b: Ty = mx_quantize_block_f32_trunc[Ty, K](blk_b)
+                bundle_b: uint8[K + 1]
+                bundle_b[0] = word_b[Ty.bits - 8 : Ty.bits]
+                for k in range(K):
+                    bundle_b[k + 1] = word_b[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
+                pipe_b_q.put(bundle_b)
+
+        @df.kernel(mapping=[1], args=[out])
+        def dot_product_stage(local_out: "float32[1]"):
+            partials: float32[P]
+            for p0 in range(P):
+                partials[p0] = 0.0
+
+            for i in range(NB // P):
+                for j in range(P):
+                    bundle_a: uint8[K + 1] = pipe_a_q.get()
+                    bundle_b: uint8[K + 1] = pipe_b_q.get()
+                    scale_a: uint8 = bundle_a[0]
+                    scale_b: uint8 = bundle_b[0]
+                    block_a: uint8[K]
+                    block_b: uint8[K]
+                    for k in range(K):
+                        block_a[k] = bundle_a[k + 1]
+                        block_b[k] = bundle_b[k + 1]
+                    word_a: Ty = _mx_pack_word[Ty, K](scale_a, block_a)
+                    word_b: Ty = _mx_pack_word[Ty, K](scale_b, block_b)
+                    partials[j] = partials[j] + mx_block_dot_trunc[Ty, K](word_a, word_b)
+
+            total: float32 = 0.0
+            for r in range(P):
+                total = total + partials[r]
+            local_out[0] = total
+
+    s = df.customize(top, opt_default=False)
+    schedule_mx_block_dot_trunc(s)
+    schedule_mx_quantize_block_f32_trunc(s)
     s.pipeline("read_a_0:j0")
     s.pipeline("read_b_0:j0")
     s.pipeline("read_a_0:j1")
