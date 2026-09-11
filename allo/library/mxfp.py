@@ -85,23 +85,35 @@ def _mx_acc_bits(Ty, K):
 def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
     scale_a: uint8 = _mx_get_scale[Ty](data_a)
     scale_b: uint8 = _mx_get_scale[Ty](data_b)
-    scale_a_val: float32 = _mx_scale_to_float32(scale_a)
-    scale_b_val: float32 = _mx_scale_to_float32(scale_b)
 
     mul_i: "Int(_mx_acc_bits(Ty, K))[K]"
     for j0 in range(K):
         a_i: Int(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
         b_i: Int(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
-        a_wide: "Int(_mx_acc_bits(Ty, K))" = a_i
-        b_wide: "Int(_mx_acc_bits(Ty, K))" = b_i
-        mul_i[j0] = a_wide * b_wide
+        mul_i[j0] = a_i * b_i
 
     acc_i: "Int(_mx_acc_bits(Ty, K))" = 0
     for j1 in range(K):
         acc_i = acc_i + mul_i[j1]
     total: float32 = float(acc_i)
 
-    return total * scale_a_val * scale_b_val
+    total_bits: int32 = total.bitcast()
+    sign: int32 = total_bits[31:32]
+    exp_t: int32 = total_bits[23:31]
+    mant_t: int32 = total_bits[0:23]
+
+    new_exp: int32 = exp_t + int(scale_a) + int(scale_b) - 254
+
+    result_bits: int32 = 0
+    if exp_t == 0 or scale_a == 0 or scale_b == 0:
+        result_bits = 0
+    elif new_exp <= 0:
+        result_bits = sign << 31
+    elif new_exp >= 255:
+        result_bits = (sign << 31) | (255 << 23)
+    else:
+        result_bits = (sign << 31) | (new_exp << 23) | mant_t
+    return result_bits.bitcast()
 
 
 def schedule_mx_block_dot(s):
@@ -212,7 +224,9 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
                 partials[p0] = 0.0
 
             for i in range(NB // P):
+            #pragma pipeline II=P(4)
                 for j in range(P):
+                #pragma unroll
                     bundle_a: uint8[K + 1] = pipe_a_q.get()
                     bundle_b: uint8[K + 1] = pipe_b_q.get()
                     scale_a: uint8 = bundle_a[0]
