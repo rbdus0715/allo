@@ -98,21 +98,21 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
     total: float32 = float(acc_i)
 
     total_bits: int32 = total.bitcast()
-    sign: int32 = total_bits[31:32]
-    exp_t: int32 = total_bits[23:31]
-    mant_t: int32 = total_bits[0:23]
+    sign: UInt(1) = total_bits[31:32]
+    exp_t: uint8 = total_bits[23:31]
+    mant_t: UInt(23) = total_bits[0:23]
 
-    new_exp: int32 = exp_t + int(scale_a) + int(scale_b) - 254
+    new_exp: int32 = int(exp_t) + int(scale_a) + int(scale_b) - 254
 
     result_bits: int32 = 0
     if exp_t == 0 or scale_a == 0 or scale_b == 0:
         result_bits = 0
     elif new_exp <= 0:
-        result_bits = sign << 31
+        result_bits = int(sign) << 31
     elif new_exp >= 255:
-        result_bits = (sign << 31) | (255 << 23)
+        result_bits = (int(sign) << 31) | (255 << 23)
     else:
-        result_bits = (sign << 31) | (new_exp << 23) | mant_t
+        result_bits = (int(sign) << 31) | (new_exp << 23) | mant_t
     return result_bits.bitcast()
 
 
