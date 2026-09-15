@@ -8,10 +8,8 @@ import numpy as np
 import ml_dtypes
 import pytest
 import allo.backend.hls as hls
-from allo.library.mxfp import (
-    make_mx_dot_general_dataflow_bf16,
-    patch_extern_c_for_class_return_types,
-)
+from allo.library.mxfp import patch_extern_c_for_class_return_types
+from allo.library.mxfp_bf16 import make_mx_dot_general_dataflow_bf16
 import allo.ir.types as T
 
 

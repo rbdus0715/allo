@@ -2401,7 +2401,7 @@ class ASTTransformer(ASTBuilder):
                 ]
                 predicate = IntegerAttr.get(IntegerType.get_signless(64), op)
                 return allo_d.CmpFixedOp(predicate, lhs_res, rhs_res, ip=ctx.get_ip())
-            if dtype.startswith("f"):
+            if dtype.startswith("f") or dtype.startswith("bf"):
                 op = ATTR_MAP["float"][type(node.ops[0])]
                 predicate = IntegerAttr.get(IntegerType.get_signless(64), op)
                 return arith_d.CmpFOp(predicate, lhs_res, rhs_res, ip=ctx.get_ip())

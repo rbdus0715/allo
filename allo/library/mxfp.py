@@ -4,8 +4,9 @@
 
 import re
 
+import allo
 import allo.dataflow as df
-from ..ir.types import Int, UInt, int32, uint8, float32, Stream
+from ..ir.types import Int, UInt, int32, uint8, float32, Stream, ConstExpr
 
 
 def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
@@ -33,17 +34,26 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(
 
 
 def schedule_mx_quantize_block_f32(s):
-    s.unroll("mx_quantize_block_f32:i0")
+    # i0's max-exponent extraction/reduction is now meta_for (unrolled at
+    # trace time), only the per-element quantize loop (i1) remains a real
+    # loop that needs scheduling.
     s.unroll("mx_quantize_block_f32:i1")
 
 
 def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
-    max_exp_field: int32 = 0
-    for i0 in range(K):
+  
+    exp_fields: uint8[K]
+    with allo.meta_for(K) as i0:
         bits_i: int32 = x[i0].bitcast()
-        exp_field_i: uint8 = bits_i[23:31]
-        if exp_field_i > max_exp_field:
-            max_exp_field = exp_field_i
+        exp_fields[i0] = bits_i[23:31]
+
+    with allo.meta_for(K.bit_length() - 1) as stage:
+        stride: ConstExpr[int32] = K >> (stage + 1)
+        with allo.meta_for(stride) as lane:
+            if int(exp_fields[lane + stride]) > int(exp_fields[lane]):
+                exp_fields[lane] = exp_fields[lane + stride]
+
+    max_exp_field: int32 = exp_fields[0]
 
     scale_wide: int32 = max_exp_field - Ty.max_unbiased_exp
     scale_wide = min(scale_wide, 254)
@@ -83,8 +93,14 @@ def _mx_acc_bits(Ty, K):
 
 
 def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
-    scale_a: uint8 = _mx_get_scale[Ty](data_a)
-    scale_b: uint8 = _mx_get_scale[Ty](data_b)
+    # scale/exp are widened to int32 in the same statement that produces
+    # them (rather than stored as uint8 locals and widened later) to dodge
+    # an HLS-backend codegen bug: `int(x)` on a *previously stored* uint8
+    # local mis-widens through the source's narrow width, silently
+    # corrupting values >= 128 (a very common range for biased exponents/
+    # scales) via sign-extension of a bogus negative reinterpretation.
+    scale_a: int32 = int(_mx_get_scale[Ty](data_a))
+    scale_b: int32 = int(_mx_get_scale[Ty](data_b))
 
     mul_i: "Int(_mx_acc_bits(Ty, K))[K]"
     for j0 in range(K):
@@ -99,10 +115,10 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
 
     total_bits: int32 = total.bitcast()
     sign: UInt(1) = total_bits[31:32]
-    exp_t: uint8 = total_bits[23:31]
+    exp_t: int32 = int(total_bits[23:31])
     mant_t: UInt(23) = total_bits[0:23]
 
-    new_exp: int32 = int(exp_t) + int(scale_a) + int(scale_b) - 254
+    new_exp: int32 = exp_t + scale_a + scale_b - 254
 
     result_bits: int32 = 0
     if exp_t == 0 or scale_a == 0 or scale_b == 0:
@@ -263,3 +279,4 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     s.unroll("dot_product_stage_0:r")
     s.partition("dot_product_stage_0:partials", dim=0)
     return s
+
