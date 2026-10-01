@@ -4,6 +4,14 @@
 
 from .. import dsl
 from .systolic import systolic
+from .mxint8 import (
+    mx_quantize_block_f32,
+    mx_block_dot,
+    _mx_pack_word,
+    schedule_mx_quantize_block_f32,
+    schedule_mx_block_dot,
+)
+from ..ir.types import float32, uint8, int32, ConstExpr, Stream
 
 
 def linear2d[
@@ -56,6 +64,308 @@ def schedule_linear3d(s):
     s.pipeline("linear3d:j")
     s.pipeline("linear3d:j_init")
     s.pipeline("linear3d:j_back")
+    return s
+
+
+def mx_matmul[Ty, M, N, K](A: "float32[M, K]", B: "float32[N, K]") -> "float32[M, N]":
+    # https://pytorch.org/docs/stable/generated/torch.matmul.html
+    # B is stored row-major transposed, i.e. [N, K] like nn.Linear.weight,
+    # so this computes A @ B^T. Each K-sized row is split into MX blocks
+    # (mx_quantize_block_f32) and reduced with mx_block_dot.
+    #
+    # Quantized blocks are kept only as scalar Ty temporaries (qa/qb below),
+    # never gathered into a Ty[] array: an array of Ty (mxint8's ~264-bit
+    # packed word) corrupts the LLVM JIT's ExecutionEngine at interpreter
+    # shutdown -- a backend bug in wide-custom-integer array lowering,
+    # confirmed independent of the array's shape/length; plain Ty scalars
+    # are unaffected. The cost is that A's row is re-quantized once per
+    # output column instead of once per row -- acceptable here since this
+    # `customize`-based version is for functional/software use, not the
+    # actual HLS-accelerator path (see make_mx_matmul_dataflow for that).
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = K // BS
+    Z: float32[M, N]
+    for i in range(M):
+        for j in range(N):
+            acc: float32 = 0.0
+            for b in range(NB):
+                blk_a: float32[BS]
+                blk_b: float32[BS]
+                for e in range(BS):
+                    blk_a[e] = A[i, b * BS + e]
+                    blk_b[e] = B[j, b * BS + e]
+                qa: Ty = mx_quantize_block_f32[Ty, BS](blk_a)
+                qb: Ty = mx_quantize_block_f32[Ty, BS](blk_b)
+                acc += mx_block_dot[Ty, BS](qa, qb)
+            Z[i, j] = acc
+    return Z
+
+
+def schedule_mx_matmul(s):
+    schedule_mx_quantize_block_f32(s)
+    schedule_mx_block_dot(s)
+    s.unroll("mx_matmul:e")
+    s.pipeline("mx_matmul:b")
+    s.pipeline("mx_matmul:j")
+    return s
+
+
+def mx_linear2d[
+    Ty, M, N, K
+](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
+    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
+    # Same interface/semantics as linear2d above (W is [out_features,
+    # in_features]), but the matmul reduction runs through mxint8 blocks.
+    Z = mx_matmul[Ty, M, N, K](X, W)
+    for i in range(M):
+        for j in range(N):
+            Z[i, j] = Z[i, j] + bias[j]
+    return Z
+
+
+def schedule_mx_linear2d(s):
+    schedule_mx_matmul(s)
+    s.pipeline("mx_linear2d:j")
+    return s
+
+
+def mx_linear3d[
+    Ty, B, L, D, M
+](X: "float32[B, L, D]", W: "float32[M, D]", bias: "float32[M]") -> "float32[B, L, M]":
+    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
+    # 3D input variant of mx_linear2d (batch of sequences), matching
+    # linear3d's interface.
+    Z: float32[B, L, M]
+    for b in range(B):
+        X_b: float32[L, D]
+        for i in range(L):
+            for k in range(D):
+                X_b[i, k] = X[b, i, k]
+        Z_b = mx_linear2d[Ty, L, M, D](X_b, W, bias)
+        for i in range(L):
+            for j in range(M):
+                Z[b, i, j] = Z_b[i, j]
+    return Z
+
+
+def schedule_mx_linear3d(s):
+    schedule_mx_linear2d(s)
+    s.pipeline("mx_linear3d:k")
+    s.pipeline("mx_linear3d:j")
+    return s
+
+
+######################################################################
+# Dataflow (streaming) variants, generalizing allo/library/mxint8.py's
+# make_mx_dot_general_dataflow from a single dot product to a full
+# [M, K] x [N, K]^T matmul:
+#   - quantize_ab streams each of the M rows of A, then each of the N rows
+#     of B, through mx_quantize_block_f32 exactly once.
+#   - dot_product_stage first fully drains B's bundles into an on-chip
+#     buffer (B is reused M times), then streams each A row once and dots
+#     it against every cached B row with mx_block_dot (A is reused N times
+#     but quantized only once, unlike mx_matmul above).
+#
+# A quantized block is shipped as a (scale, elements) uint8 bundle, exactly
+# like make_mx_dot_general_dataflow's bundle_a/bundle_b, and repacked into
+# the Ty word right before mx_block_dot with _mx_pack_word -- never as a Ty
+# (or Ty[]) value on a stream or in a buffer. This isn't just the AXI-width
+# workaround the comment in mxint8.py describes: it also sidesteps the same
+# wide-custom-integer array bug mx_matmul's docstring above describes,
+# which affects Ty arrays wherever they appear (stream element type or
+# plain on-chip buffer), not only function returns.
+######################################################################
+
+
+def make_mx_matmul_dataflow(Ty, M, N, K, P, depth=4):
+    # Imported lazily -- a module-level `import allo.dataflow` here would
+    # break `import allo`: allo.dataflow's own import chain needs
+    # allo.library.KERNEL2SCHEDULE, which doesn't exist yet while
+    # allo/library/__init__.py is still executing its top-level imports
+    # (this module is reachable from there, to register mx_matmul etc.).
+    import allo.dataflow as df
+
+    BS = Ty.block_size
+    NB = K // BS
+
+    @df.region()
+    def top(A: "float32[M, K]", B: "float32[N, K]", Z: "float32[M, N]"):
+        pipe_a_q: Stream["uint8[NB, BS + 1]", depth]
+        pipe_b_q: Stream["uint8[NB, BS + 1]", depth]
+
+        # A and B are quantized by a single kernel (rather than one kernel
+        # each): mx_quantize_block_f32[Ty, BS] is a generic instantiation,
+        # and two kernels each instantiating it independently emit two
+        # copies of the same helper function name into the region's shared
+        # module, which the dataflow lowering rejects as a symbol
+        # redefinition. mxint8.py's quantize_ab kernel has the same shape
+        # for the same reason.
+        @df.kernel(mapping=[1], args=[A, B])
+        def quantize_ab(local_A: "float32[M, K]", local_B: "float32[N, K]"):
+            # loop names are suffixed (ba/ea/ka vs bb/eb/kb) because the
+            # A-side and B-side loops would otherwise share the same bare
+            # names within this one kernel, which makes s.unroll/s.pipeline
+            # below unable to tell the two loop bands apart.
+            for i in range(M):
+                bundle: uint8[NB, BS + 1]
+                for ba in range(NB):
+                    blk: float32[BS]
+                    for ea in range(BS):
+                        blk[ea] = local_A[i, ba * BS + ea]
+                    word: Ty = mx_quantize_block_f32[Ty, BS](blk)
+                    bundle[ba, 0] = word[Ty.bits - 8 : Ty.bits]
+                    for ka in range(BS):
+                        bundle[ba, ka + 1] = word[
+                            ka * Ty.elem_bits : (ka + 1) * Ty.elem_bits
+                        ]
+                pipe_a_q.put(bundle)
+
+            for j in range(N):
+                bundle: uint8[NB, BS + 1]
+                for bb in range(NB):
+                    blk: float32[BS]
+                    for eb in range(BS):
+                        blk[eb] = local_B[j, bb * BS + eb]
+                    word: Ty = mx_quantize_block_f32[Ty, BS](blk)
+                    bundle[bb, 0] = word[Ty.bits - 8 : Ty.bits]
+                    for kb in range(BS):
+                        bundle[bb, kb + 1] = word[
+                            kb * Ty.elem_bits : (kb + 1) * Ty.elem_bits
+                        ]
+                pipe_b_q.put(bundle)
+
+        @df.kernel(mapping=[1], args=[Z])
+        def dot_product_stage(local_Z: "float32[M, N]"):
+            # b_buf is filled element-by-element from a freshly-`get()`
+            # bundle rather than `b_buf[jd] = pipe_b_q.get()` directly --
+            # assigning a whole stream item straight into an indexed slot
+            # of a bigger array silently drops the data (a separate, plain
+            # bug from the Ty-array one above); copying through a fresh
+            # local first works.
+            b_buf: uint8[N, NB, BS + 1]
+            for jd in range(N):
+                tmp: uint8[NB, BS + 1] = pipe_b_q.get()
+                for bd in range(NB):
+                    for kd in range(BS + 1):
+                        b_buf[jd, bd, kd] = tmp[bd, kd]
+
+            for i in range(M):
+                a_bundle: uint8[NB, BS + 1] = pipe_a_q.get()
+                for j in range(N):
+                    acc: float32 = 0.0
+                    for b in range(NB):
+                        scale_a: uint8 = a_bundle[b, 0]
+                        scale_b: uint8 = b_buf[j, b, 0]
+                        block_a: uint8[BS]
+                        block_b: uint8[BS]
+                        for k in range(BS):
+                            block_a[k] = a_bundle[b, k + 1]
+                            block_b[k] = b_buf[j, b, k + 1]
+                        word_a: Ty = _mx_pack_word[Ty, BS](scale_a, block_a)
+                        word_b: Ty = _mx_pack_word[Ty, BS](scale_b, block_b)
+                        acc += mx_block_dot[Ty, BS](word_a, word_b)
+                    local_Z[i, j] = acc
+
+    s = df.customize(top, opt_default=False)
+    schedule_mx_quantize_block_f32(s)
+    schedule_mx_block_dot(s)
+    s.unroll("quantize_ab_0:ea")
+    s.unroll("quantize_ab_0:eb")
+    s.unroll("quantize_ab_0:ka")
+    s.unroll("quantize_ab_0:kb")
+    s.pipeline("quantize_ab_0:ba")
+    s.pipeline("quantize_ab_0:bb")
+    s.unroll("dot_product_stage_0:k")
+    s.pipeline("dot_product_stage_0:j", initiation_interval=P)
+    s.unroll("dot_product_stage_0:b")
+    return s
+
+
+def make_mx_linear2d_dataflow(Ty, M, N, K, P, depth=4):
+    import allo.dataflow as df
+
+    BS = Ty.block_size
+    NB = K // BS
+
+    @df.region()
+    def top(
+        X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]", Z: "float32[M, N]"
+    ):
+        pipe_a_q: Stream["uint8[NB, BS + 1]", depth]
+        pipe_b_q: Stream["uint8[NB, BS + 1]", depth]
+
+        # See make_mx_matmul_dataflow: X and W must be quantized by a single
+        # kernel, not one each, or the shared mx_quantize_block_f32[Ty, BS]
+        # instantiation gets emitted twice and the dataflow lowering rejects
+        # the duplicate symbol.
+        @df.kernel(mapping=[1], args=[X, W])
+        def quantize_ab(local_X: "float32[M, K]", local_W: "float32[N, K]"):
+            for i in range(M):
+                bundle: uint8[NB, BS + 1]
+                for ba in range(NB):
+                    blk: float32[BS]
+                    for ea in range(BS):
+                        blk[ea] = local_X[i, ba * BS + ea]
+                    word: Ty = mx_quantize_block_f32[Ty, BS](blk)
+                    bundle[ba, 0] = word[Ty.bits - 8 : Ty.bits]
+                    for ka in range(BS):
+                        bundle[ba, ka + 1] = word[
+                            ka * Ty.elem_bits : (ka + 1) * Ty.elem_bits
+                        ]
+                pipe_a_q.put(bundle)
+
+            for j in range(N):
+                bundle: uint8[NB, BS + 1]
+                for bb in range(NB):
+                    blk: float32[BS]
+                    for eb in range(BS):
+                        blk[eb] = local_W[j, bb * BS + eb]
+                    word: Ty = mx_quantize_block_f32[Ty, BS](blk)
+                    bundle[bb, 0] = word[Ty.bits - 8 : Ty.bits]
+                    for kb in range(BS):
+                        bundle[bb, kb + 1] = word[
+                            kb * Ty.elem_bits : (kb + 1) * Ty.elem_bits
+                        ]
+                pipe_b_q.put(bundle)
+
+        @df.kernel(mapping=[1], args=[bias, Z])
+        def dot_product_stage(local_bias: "float32[N]", local_Z: "float32[M, N]"):
+            b_buf: uint8[N, NB, BS + 1]
+            for jd in range(N):
+                tmp: uint8[NB, BS + 1] = pipe_b_q.get()
+                for bd in range(NB):
+                    for kd in range(BS + 1):
+                        b_buf[jd, bd, kd] = tmp[bd, kd]
+
+            for i in range(M):
+                a_bundle: uint8[NB, BS + 1] = pipe_a_q.get()
+                for j in range(N):
+                    acc: float32 = 0.0
+                    for b in range(NB):
+                        scale_a: uint8 = a_bundle[b, 0]
+                        scale_b: uint8 = b_buf[j, b, 0]
+                        block_a: uint8[BS]
+                        block_b: uint8[BS]
+                        for k in range(BS):
+                            block_a[k] = a_bundle[b, k + 1]
+                            block_b[k] = b_buf[j, b, k + 1]
+                        word_a: Ty = _mx_pack_word[Ty, BS](scale_a, block_a)
+                        word_b: Ty = _mx_pack_word[Ty, BS](scale_b, block_b)
+                        acc += mx_block_dot[Ty, BS](word_a, word_b)
+                    local_Z[i, j] = acc + local_bias[j]
+
+    s = df.customize(top, opt_default=False)
+    schedule_mx_quantize_block_f32(s)
+    schedule_mx_block_dot(s)
+    s.unroll("quantize_ab_0:ea")
+    s.unroll("quantize_ab_0:eb")
+    s.unroll("quantize_ab_0:ka")
+    s.unroll("quantize_ab_0:kb")
+    s.pipeline("quantize_ab_0:ba")
+    s.pipeline("quantize_ab_0:bb")
+    s.unroll("dot_product_stage_0:k")
+    s.pipeline("dot_product_stage_0:j", initiation_interval=P)
+    s.unroll("dot_product_stage_0:b")
     return s
 
 

@@ -5,7 +5,7 @@
 import allo
 import allo.dataflow as df
 from ..ir.types import Int, UInt, int32, uint8, uint16, float32, Stream, ConstExpr
-from .mxfp import _mx_pack_word, mx_block_dot, schedule_mx_block_dot
+from .mxint8 import _mx_pack_word, mx_block_dot, schedule_mx_block_dot
 
 
 def _mx_quantize_elem_int_bf16[Ty](v_bf16: uint16, shared_field: uint8) -> "UInt(Ty.elem_bits)":

@@ -7,7 +7,7 @@ import shutil
 import numpy as np
 import pytest
 import allo.backend.hls as hls
-from allo.library.mxfp import (
+from allo.library.mxint8 import (
     make_mx_dot_general_dataflow,
     patch_extern_c_for_class_return_types,
 )

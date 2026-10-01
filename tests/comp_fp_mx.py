@@ -10,7 +10,7 @@ from allo.backend.config import PART_NUMBER
 from allo.backend.report import parse_xml
 from allo.ir.types import float32, int32, UInt, Stream
 import allo.ir.types as T
-from allo.library.mxfp import (
+from allo.library.mxint8 import (
     make_mx_dot_general_dataflow,
     patch_extern_c_for_class_return_types,
 )

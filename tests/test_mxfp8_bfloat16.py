@@ -9,22 +9,25 @@ import ml_dtypes
 import pytest
 import allo.backend.hls as hls
 from allo.library.mxint8 import patch_extern_c_for_class_return_types
-from allo.library.mxint8_bf16 import make_mx_dot_general_dataflow_bf16
+from allo.library.mxfp8_bf16 import make_mxfp8_dot_general_dataflow_bf16
 import allo.ir.types as T
 
 
-def test_mx_dot_general_dataflow_bf16_mxint8():
-    Ty = T.mxint8
-    K = 32  # mxint8's actual block_size
+@pytest.mark.parametrize("ty_name", ["mxfp8_e4m3", "mxfp8_e5m2"])
+def test_mxfp8_dot_general_dataflow_bf16(ty_name):
+    Ty = getattr(T, ty_name)
+    K = 32  # Ty's actual block_size
     NB = 128
     P = 4
-    s = make_mx_dot_general_dataflow_bf16(Ty, K, NB, P)
+    s = make_mxfp8_dot_general_dataflow_bf16(Ty, K, NB, P)
 
     if not hls.is_available("vitis_hls"):
         return
 
     mode = os.environ.get("ALLO_HLSMODE")
     project = os.environ.get("ALLO_PROJECT")
+    if project:
+        project = f"{project}_{ty_name}"
 
     # sw_emu/hw_emu/hw go through the v++ Makefile flow, which needs XDEVICE
     # pointing at a platform .xpfm (same env var Allo already reads).
@@ -41,7 +44,7 @@ def test_mx_dot_general_dataflow_bf16_mxint8():
 
     # issue #603 (https://github.com/alloy-lang/allo/issues/603)
     patched = patch_extern_c_for_class_return_types(f"{project}/kernel.cpp")
-    assert patched, "expected _mx_pack_word/mx_quantize_block_bf16 to need the patch"
+    assert patched, "expected _mx_pack_word/mx_quantize_block_fp_bf16 to need the patch"
 
     if mode == "csyn":
         hls_mod()
@@ -55,8 +58,8 @@ def test_mx_dot_general_dataflow_bf16_mxint8():
     else:
         # sw_emu/hw_emu/hw can't be called with zero args like csyn -- pack
         # real bf16 input blocks into a single UInt(512)[NB] array each (a
-        # K=32 bf16 block is exactly 512b, unlike f32's 1024b, so there's no
-        # A0/A1 half-split here -- see make_mx_dot_general_dataflow_bf16).
+        # K=32 bf16 block is exactly 512b, matching mxint8_bf16's layout
+        # since e4m3/e5m2 elements are also 8 bits).
         N = K * NB
         rng = np.random.default_rng(0)
         A = (rng.standard_normal(N) * 2.0 ** rng.integers(-4, 4, N)).astype(
@@ -85,7 +88,7 @@ def test_mx_dot_general_dataflow_bf16_mxint8():
         abs_diff = abs(hw_dot - ref)
         rel_diff = abs_diff / abs(ref) if ref != 0 else float("nan")
         print(
-            f"[{mode}] hw_result={hw_dot} ref={ref} "
+            f"[{mode}][{ty_name}] hw_result={hw_dot} ref={ref} "
             f"abs_diff={abs_diff} rel_diff={rel_diff:.6%}"
         )
 
@@ -97,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["csyn", "sw_emu", "hw_emu", "hw"], default="csyn")
     parser.add_argument(
         "--project",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "mxfp_bf16.prj"),
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "mxfp8_bf16.prj"),
     )
     parser.add_argument("--clean", action="store_true", help="Clean the project dir")
 
@@ -106,6 +109,7 @@ if __name__ == "__main__":
     os.environ["ALLO_HLSMODE"] = args.mode
     os.environ["ALLO_PROJECT"] = args.project
     if args.clean:
-        shutil.rmtree(args.project, ignore_errors=True)
+        shutil.rmtree(f"{args.project}_mxfp8_e4m3", ignore_errors=True)
+        shutil.rmtree(f"{args.project}_mxfp8_e5m2", ignore_errors=True)
 
     pytest.main([__file__, *pytest_args])

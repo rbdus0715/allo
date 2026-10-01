@@ -1268,6 +1268,10 @@ class TypeInferer(ASTVisitor):
                 node.shape = tuple()
                 node.dtype = new_args[0].dtype
                 return node
+            if fn_name == "linear":
+                mx_dispatch = TypeInferer.try_dispatch_mx_linear(ctx, node, new_args)
+                if mx_dispatch is not None:
+                    return mx_dispatch
             # return node
             return TypeInferer.visit_library_op(
                 ctx, node=node, op_name=fn_name, new_args=new_args
@@ -1296,6 +1300,47 @@ class TypeInferer(ASTVisitor):
             node.shape = stmts[-1].shape
         ctx.func_id = original_func_id
         return node
+
+    @staticmethod
+    def try_dispatch_mx_linear(
+        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST]
+    ):
+        if not (
+            ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType)
+        ):
+            return None
+        mx_type_node = node.func.slice
+        assert len(node.args) >= 3, "mx_type linear requires an explicit bias argument"
+        argAshape = new_args[0].shape
+        argBshape = new_args[1].shape
+        assert len(argBshape) == 2, "mx_type linear's weight must be 2D [out, in]"
+        if len(argAshape) == 2:
+            target_name = "__allo_mx_linear2d__"
+            m, k = argAshape
+            n = argBshape[0]
+            dims = [m, n, k]
+        elif len(argAshape) == 3:
+            target_name = "__allo_mx_linear3d__"
+            b, l, d = argAshape
+            m = argBshape[0]
+            dims = [b, l, d, m]
+        else:
+            raise NotImplementedError(
+                f"mx_type linear only supports 2D/3D inputs, got shape {argAshape}"
+            )
+        new_func = ast.Subscript(
+            value=ast.Name(id=target_name, ctx=ast.Load()),
+            slice=ast.Tuple(
+                elts=[mx_type_node] + [ast.Constant(value=d) for d in dims],
+                ctx=ast.Load(),
+            ),
+            ctx=ast.Load(),
+        )
+        ast.copy_location(new_func, node)
+        ast.fix_missing_locations(new_func)
+        node.func = new_func
+        node.args = node.args[:3]
+        return TypeInferer.visit_Call(ctx, node)
 
     @staticmethod
     def visit_library_op(

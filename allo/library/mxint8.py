@@ -5,7 +5,6 @@
 import re
 
 import allo
-import allo.dataflow as df
 from ..ir.types import Int, UInt, int32, uint8, float32, Stream, ConstExpr
 
 
@@ -169,6 +168,13 @@ def patch_extern_c_for_class_return_types(kernel_cpp_path):
 
 
 def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
+    # Imported lazily (not at module level): allo.dataflow's own import chain
+    # pulls in allo.library.KERNEL2SCHEDULE, and this module is now imported
+    # (via mxint8_nn) from allo/library/__init__.py itself while that
+    # registry is still being built -- a module-level `import allo.dataflow`
+    # here would make `import allo` fail with a circular-import error.
+    import allo.dataflow as df
+
     N = K * NB
     WORD_BITS = 512
     HALF = WORD_BITS // 32  # float32 elements per 512b half

@@ -70,6 +70,24 @@ from .backend.hls import HLSModule
 from .backend.xls import XLSCCModule
 from .library import KERNEL2SCHEDULE
 from .library.systolic import check_systolic, prepare_systolic
+from .library.nn import mx_linear2d, mx_linear3d, mx_matmul
+from .library.mxint8 import (
+    mx_quantize_block_f32,
+    mx_block_dot,
+    _mx_quantize_elem_int_f32,
+    _mx_get_scale,
+    _mx_pack_word,
+    _mx_acc_bits,
+)
+from .ir.types import (
+    Int as _mx_Int,
+    UInt as _mx_UInt,
+    int32 as _mx_int32,
+    uint8 as _mx_uint8,
+    float32 as _mx_float32,
+    Stream as _mx_Stream,
+    ConstExpr as _mx_ConstExpr,
+)
 from .logging import print_error_message
 
 
@@ -1355,6 +1373,26 @@ def customize(
         instantiate = []
     if global_vars is None:
         global_vars = get_global_vars(fn)
+    global_vars.setdefault("__allo_mx_linear2d__", mx_linear2d)
+    global_vars.setdefault("__allo_mx_linear3d__", mx_linear3d)
+    global_vars.setdefault("mx_matmul", mx_matmul)
+    global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
+    global_vars.setdefault("mx_block_dot", mx_block_dot)
+    global_vars.setdefault("_mx_quantize_elem_int_f32", _mx_quantize_elem_int_f32)
+    global_vars.setdefault("_mx_get_scale", _mx_get_scale)
+    global_vars.setdefault("_mx_pack_word", _mx_pack_word)
+    global_vars.setdefault("_mx_acc_bits", _mx_acc_bits)
+    # Those same function bodies also reference these type names bare (e.g.
+    # `BS: ConstExpr[int32] = Ty.block_size`, `sign: UInt(1) = ...`) --
+    # same reasoning as above: present here regardless of whether the
+    # calling user's own module happens to import them under these names.
+    global_vars.setdefault("Int", _mx_Int)
+    global_vars.setdefault("UInt", _mx_UInt)
+    global_vars.setdefault("int32", _mx_int32)
+    global_vars.setdefault("uint8", _mx_uint8)
+    global_vars.setdefault("float32", _mx_float32)
+    global_vars.setdefault("Stream", _mx_Stream)
+    global_vars.setdefault("ConstExpr", _mx_ConstExpr)
     # Type construction
     ctx_type_inf = ASTContext(
         tree=tree,
