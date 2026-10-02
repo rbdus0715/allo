@@ -19,6 +19,7 @@ from .types import (
     UFixed,
     Index,
     MXScaledType,
+    E8M0,
     uint1,
     int4,
     int8,
@@ -1268,8 +1269,14 @@ class TypeInferer(ASTVisitor):
                 node.shape = tuple()
                 node.dtype = new_args[0].dtype
                 return node
-            if fn_name == "linear":
-                mx_dispatch = TypeInferer.try_dispatch_mx_linear(ctx, node, new_args)
+            if fn_name in {"linear", "matmul"}:
+                mx_dispatch = TypeInferer.try_dispatch_mx_operand_linear(
+                    ctx, node, new_args, fn_name
+                )
+                if mx_dispatch is None:
+                    mx_dispatch = TypeInferer.try_dispatch_mx_linear(
+                        ctx, node, new_args, fn_name
+                    )
                 if mx_dispatch is not None:
                     return mx_dispatch
             # return node
@@ -1302,31 +1309,114 @@ class TypeInferer(ASTVisitor):
         return node
 
     @staticmethod
-    def try_dispatch_mx_linear(
-        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST]
+    def try_dispatch_mx_operand_linear(
+        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
     ):
+        """allo.linear / allo.matmul with MX operands lower to the MX library
+        implementation chosen by the operand types, like any typed op. An MX
+        operand is a pair of arrays, int8 elements followed by their E8M0
+        scales (one per 32-element block along K; see mxint8.mx_quantize):
+
+            allo.linear(X, Wq, Ws, bias)        -> nn.mx_linear2d_wq  (X float32)
+            allo.linear(Xq, Xs, Wq, Ws, bias)   -> nn.mx_linear2d_q
+            allo.matmul(A, Bq, Bs)              -> nn.mx_matmul_wq    (A float32)
+            allo.matmul(Aq, As, Bq, Bs)         -> nn.mx_matmul_q
+        """
+        is_scale = [isinstance(getattr(a, "dtype", None), E8M0) for a in new_args]
+        if not any(is_scale):
+            return None
+        n_out = 1 if fn_name == "linear" else 0  # trailing bias
+        n_ops = len(new_args) - n_out
+        if n_ops == 3 and is_scale == [False, False, True] + [False] * n_out:
+            x_quantized = False
+        elif n_ops == 4 and is_scale == [False, True, False, True] + [False] * n_out:
+            x_quantized = True
+        else:
+            raise RuntimeError(
+                f"MX allo.{fn_name} takes each MX operand as an (int8 elems, e8m0 "
+                f"scales) pair, e.g. allo.{fn_name}(X, Wq, Ws{', bias' if n_out else ''})"
+            )
+        wq, ws = new_args[n_ops - 2], new_args[n_ops - 1]
+        if fn_name == "linear":
+            (n, k), nb = wq.shape, ws.shape[1]
+        else:
+            (k, n), nb = wq.shape, ws.shape[0]
+        m = new_args[0].shape[0]
+        assert k % nb == 0, f"K={k} is not a whole number of {nb} blocks"
+        block = k // nb
+        type_name = next(
+            (
+                name
+                for name, t in ctx.global_vars.items()
+                if name.startswith("__allo_mx_type_")
+                and not t.is_float
+                and t.elem_bits == wq.dtype.bits
+                and t.block_size == block
+            ),
+            None,
+        )
+        assert type_name, f"no MX type with {wq.dtype.bits}-bit elements, block {block}"
+        suffix = "q" if x_quantized else "wq"
+        impl = "linear2d" if fn_name == "linear" else "matmul"
+        tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](
+            n, nb, block_bytes=block + 1
+        )
+        new_func = ast.Subscript(
+            value=ast.Name(id=f"__allo_mx_{impl}_{suffix}__", ctx=ast.Load()),
+            slice=ast.Tuple(
+                elts=[ast.Name(id=type_name, ctx=ast.Load())]
+                + [ast.Constant(value=d) for d in (m, n, k, nb, units, tile)],
+                ctx=ast.Load(),
+            ),
+            ctx=ast.Load(),
+        )
+        ast.copy_location(new_func, node)
+        ast.fix_missing_locations(new_func)
+        node.func = new_func
+        return TypeInferer.visit_Call(ctx, node)
+
+    @staticmethod
+    def try_dispatch_mx_linear(
+        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
+    ):
+        """allo.linear[Ty](X, W, bias) / allo.matmul[Ty](A, B) on float32
+        operands: both are quantized on chip into the MX format Ty (which the
+        float operands cannot carry themselves) and fused with the block dot
+        into one dataflow region (nn.mx_linear2d_ff / nn.mx_matmul_ff).
+        3D linear inputs keep the sequential nn.mx_linear3d."""
         if not (
             ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType)
         ):
             return None
+        mx_type = ctx.inst[0]
         mx_type_node = node.func.slice
-        assert len(node.args) >= 3, "mx_type linear requires an explicit bias argument"
         argAshape = new_args[0].shape
         argBshape = new_args[1].shape
-        assert len(argBshape) == 2, "mx_type linear's weight must be 2D [out, in]"
-        if len(argAshape) == 2:
-            target_name = "__allo_mx_linear2d__"
-            m, k = argAshape
-            n = argBshape[0]
-            dims = [m, n, k]
-        elif len(argAshape) == 3:
-            target_name = "__allo_mx_linear3d__"
+        assert len(argBshape) == 2, f"MX allo.{fn_name}'s second operand must be 2D"
+        if fn_name == "linear":
+            assert (
+                len(node.args) >= 3
+            ), "mx_type linear requires an explicit bias argument"
+        if fn_name == "linear" and len(argAshape) == 3:
             b, l, d = argAshape
             m = argBshape[0]
-            dims = [b, l, d, m]
+            target_name, dims = "__allo_mx_linear3d__", [b, l, d, m]
+        elif len(argAshape) == 2:
+            m, k = argAshape
+            n = argBshape[0] if fn_name == "linear" else argBshape[1]
+            nb = k // mx_type.block_size
+            tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](
+                n, nb, block_bytes=mx_type.block_size + 1
+            )
+            target_name = (
+                "__allo_mx_linear2d_ff__"
+                if fn_name == "linear"
+                else "__allo_mx_matmul_ff__"
+            )
+            dims = [m, n, k, nb, units, tile]
         else:
             raise NotImplementedError(
-                f"mx_type linear only supports 2D/3D inputs, got shape {argAshape}"
+                f"MX allo.{fn_name} supports 2D inputs (linear also 3D), got {argAshape}"
             )
         new_func = ast.Subscript(
             value=ast.Name(id=target_name, ctx=ast.Load()),
@@ -1339,7 +1429,7 @@ class TypeInferer(ASTVisitor):
         ast.copy_location(new_func, node)
         ast.fix_missing_locations(new_func)
         node.func = new_func
-        node.args = node.args[:3]
+        node.args = node.args[:3] if fn_name == "linear" else node.args[:2]
         return TypeInferer.visit_Call(ctx, node)
 
     @staticmethod

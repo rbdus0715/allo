@@ -39,6 +39,7 @@ from ..utils import (
     make_anywidth_numpy_array,
     struct_array_to_int_array,
     get_np_struct_type,
+    get_llvm_wide_int_struct_type,
     create_output_struct,
     extract_out_np_arrays_from_out_struct,
     ranked_memref_to_numpy,
@@ -229,6 +230,8 @@ class LLVMModule:
                 if len(shape) > 0:
                     if is_anywidth_int_type_and_not_np(target_in_type):
                         bitwidth = get_bitwidth_from_type(target_in_type)
+                        if bitwidth > 64:
+                            continue
                         arg[:] = struct_array_to_int_array(
                             new_arg, bitwidth, target_in_type[0] == "i"
                         )
@@ -269,7 +272,11 @@ class LLVMModule:
                 elif result_type.startswith("i") or result_type.startswith("ui"):
                     width = get_bitwidth_from_type(result_type)
                     bitwidth = max(get_clostest_pow2(width), 8)
-                    dtype = np.ctypeslib.as_ctypes_type(get_np_struct_type(bitwidth))
+                    dtype = np.ctypeslib.as_ctypes_type(
+                        get_llvm_wide_int_struct_type(width)
+                        if width > 64
+                        else get_np_struct_type(bitwidth)
+                    )
                 elif result_type.startswith("fixed") or result_type.startswith(
                     "ufixed"
                 ):
@@ -294,7 +301,11 @@ class LLVMModule:
                 elif elt_res_type.startswith("i") or elt_res_type.startswith("ui"):
                     width = get_bitwidth_from_type(elt_res_type)
                     bitwidth = max(get_clostest_pow2(width), 8)
-                    dtype = np.ctypeslib.as_ctypes_type(get_np_struct_type(bitwidth))
+                    dtype = np.ctypeslib.as_ctypes_type(
+                        get_llvm_wide_int_struct_type(width)
+                        if width > 64
+                        else get_np_struct_type(bitwidth)
+                    )
                 elif elt_res_type.startswith("fixed") or elt_res_type.startswith(
                     "ufixed"
                 ):
@@ -319,9 +330,10 @@ class LLVMModule:
                 ret = ranked_memref_to_numpy(return_ptr[0][0])
                 if is_anywidth_int_type_and_not_np(result_type):
                     bitwidth = get_bitwidth_from_type(result_type)
-                    ret = struct_array_to_int_array(
-                        ret, bitwidth, result_type[0] == "i"
-                    )
+                    if bitwidth <= 64:  # wider: keep LLVM-layout struct array
+                        ret = struct_array_to_int_array(
+                            ret, bitwidth, result_type[0] == "i"
+                        )
                 elif result_type == "f16":
                     ret = np.array(ret, dtype=np.int16).view(np.float16)
                 elif result_type == "bf16":
@@ -359,8 +371,12 @@ class LLVMModule:
             ):
                 if is_anywidth_int_type_and_not_np(res_type):
                     bitwidth = get_bitwidth_from_type(res_type)
-                    ret_i = struct_array_to_int_array(
-                        np_arr, bitwidth, res_type[0] == "i"
+                    ret_i = (
+                        np_arr  # wider: keep LLVM-layout struct array
+                        if bitwidth > 64
+                        else struct_array_to_int_array(
+                            np_arr, bitwidth, res_type[0] == "i"
+                        )
                     )
                 elif res_type == "f16":
                     ret_i = np.array(np_arr, dtype=np.int16).view(np.float16)

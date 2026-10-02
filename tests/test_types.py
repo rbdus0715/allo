@@ -720,14 +720,9 @@ def test_type_comparison():
                 assert list_of_types[i] != list_of_types[j]
 
 
-######################################################################
-# MXFP / MXINT (OCP Microscaling) tests
-######################################################################
 
 
 def test_mxfp_bitwidth_formulas():
-    # elem_bits = 1 + exp_bits + mantissa_bits; bits = 8 (scale) + k * elem_bits
-    # block_accum_bits/final_accum_bits follow the paper's Table III formulas
     assert T.mxfp8_e4m3.elem_bits == 8
     assert T.mxfp8_e4m3.bits == 264
     assert T.mxfp8_e4m3.block_accum_bits == 38
@@ -760,16 +755,12 @@ def test_mxfp_bitwidth_formulas():
 
 
 def test_mxfp_type_equality():
-    # same construction params + explicit name -> equal
     assert T.MXFP(4, 3, 32, "mxfp8_e4m3") == T.mxfp8_e4m3
     assert T.MXInt(8, 32, "mxint8") == T.mxint8
-    # different params -> not equal
     assert T.mxfp8_e4m3 != T.mxfp8_e5m2
     assert T.mxfp6_e2m3 != T.mxfp6_e3m2
     assert T.mxfp8_e4m3 != T.mxint8
-    # default (auto-generated) name differs from the predefined explicit name
     assert T.MXFP(4, 3, 32) != T.mxfp8_e4m3
-    # isinstance helpers
     assert T.MXFP.isinstance(T.mxfp8_e4m3)
     assert not T.MXFP.isinstance(T.mxint8)
     assert T.MXInt.isinstance(T.mxint8)
@@ -777,8 +768,6 @@ def test_mxfp_type_equality():
 
 
 def test_mxfp_bit_slice_smoke():
-    # End-to-end smoke test: a scalar MXFP-typed word can be built, and its
-    # packed scale field can be written/read via ordinary bit-slice syntax.
     mxfp8_e4m3 = T.mxfp8_e4m3
     uint8 = T.uint8
 
@@ -791,6 +780,21 @@ def test_mxfp_bit_slice_smoke():
     print(s.module)
     mod = s.build()
     assert mod(200) == 200
+
+
+def test_wide_uint_array_stride():
+    from allo.utils import get_llvm_wide_int_struct_type
+
+    def kernel(A: "UInt(264)[4]") -> int32:
+        v: int32 = A[3][0:32]
+        return v
+
+    dt = get_llvm_wide_int_struct_type(264)
+    assert dt.itemsize == 48
+    raw = np.zeros((4, dt.itemsize), np.uint8)
+    raw[:, 0] = np.arange(4) + 0xA0
+    mod = allo.customize(kernel).build(target="llvm")
+    assert mod(raw.view(dt).reshape(4)) == 0xA3
 
 
 if __name__ == "__main__":

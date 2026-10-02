@@ -9,16 +9,10 @@ from .mxint8 import _mx_pack_word, mx_block_dot, schedule_mx_block_dot
 
 
 def _mx_quantize_elem_int_bf16[Ty](v_bf16: uint16, shared_field: uint8) -> "UInt(Ty.elem_bits)":
-    # bf16 layout: sign(1) | exp(8) | mant(7) -- same exponent field as f32,
-    # just a 7-bit (not 23-bit) mantissa, so the shifter below is 8 bits
-    # instead of 24.
     sign: UInt(1) = v_bf16[15:16]
-    exp_field: uint8 = v_bf16[7:15]
-    mant: UInt(8) = v_bf16[0:7]
-
-    deficit: uint8 = shared_field - exp_field
-    total_shift: uint8 = (7 - Ty.max_unbiased_exp) + deficit
-    full_mant: UInt(8) = (1 << 7) | mant
+    exp_field: Int(9) = v_bf16[7:15]
+    full_mant: Int(9) = (1 << 7) | v_bf16[0:7]
+    total_shift: Int(10) = (7 - Ty.max_unbiased_exp) + shared_field - exp_field
 
     mag: Int(Ty.elem_bits) = 0
     if total_shift < 8:
@@ -69,9 +63,6 @@ def mx_quantize_block_bf16[Ty, K](x: "uint16[K]") -> "Ty":
 
 
 def make_mx_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
-    # bf16 elements are half the width of f32, so a K=32 block (K*16b=512b)
-    # fits exactly one 512b m_axi word -- unlike make_mx_dot_general_dataflow
-    # (f32, K*32b=1024b), no A0/A1 half-split is needed.
     WORD_BITS = 512
     HALF = WORD_BITS // 16  # bf16 elements per 512b word
 
@@ -130,9 +121,7 @@ def make_mx_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
                 partials[p0] = 0.0
 
             for i in range(NB // P):
-            #pragma pipeline II=P(4)
                 for j in range(P):
-                #pragma unroll
                     bundle_a: uint8[K + 1] = pipe_a_q.get()
                     bundle_b: uint8[K + 1] = pipe_b_q.get()
                     scale_a: uint8 = bundle_a[0]
@@ -150,9 +139,6 @@ def make_mx_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
             for r in range(P):
                 total = total + partials[r]
 
-            # Narrow the f32 accumulator to bf16 (top 16 bits, round-to-
-            # nearest-even) -- bf16 shares f32's sign/exponent layout, so
-            # this is a pure bit truncation, no float hardware needed.
             total_bits: int32 = total.bitcast()
             total_bits_u: UInt(32) = total_bits
             lsb: UInt(1) = total_bits_u[16:17]

@@ -70,7 +70,29 @@ from .backend.hls import HLSModule
 from .backend.xls import XLSCCModule
 from .library import KERNEL2SCHEDULE
 from .library.systolic import check_systolic, prepare_systolic
-from .library.nn import mx_linear2d, mx_linear3d, mx_matmul
+from .library.nn import (
+    mx_linear2d,
+    mx_linear3d,
+    mx_matmul,
+    mx_linear2d_q,
+    mx_linear2d_wq,
+    mx_matmul_q,
+    mx_matmul_wq,
+    _mx_wblocks_rows,
+    _mx_wblocks_cols,
+    _mx_xblocks_rows,
+    _mx_xquant_rows,
+    _mx_wquant_rows,
+    _mx_wquant_cols,
+    _mx_dot_df,
+    mx_linear2d_ff,
+    mx_matmul_ff,
+    mx_pick_tile_units,
+    mx_auto_tn,
+    mx_auto_p,
+    schedule_mx_dataflow,
+)
+from .ir import types as _mx_types
 from .library.mxint8 import (
     mx_quantize_block_f32,
     mx_block_dot,
@@ -1320,6 +1342,9 @@ class Schedule:
             "ihls",
             "catapult",
         }:
+            if not getattr(self, "_mx_dataflow_applied", False):
+                schedule_mx_dataflow(self)
+                self._mx_dataflow_applied = True
             match target:
                 case "vitis_hls":
                     platform = "vitis_hls"
@@ -1375,6 +1400,28 @@ def customize(
         global_vars = get_global_vars(fn)
     global_vars.setdefault("__allo_mx_linear2d__", mx_linear2d)
     global_vars.setdefault("__allo_mx_linear3d__", mx_linear3d)
+    global_vars.setdefault("__allo_mx_linear2d_q__", mx_linear2d_q)
+    global_vars.setdefault("__allo_mx_linear2d_wq__", mx_linear2d_wq)
+    global_vars.setdefault("__allo_mx_matmul_q__", mx_matmul_q)
+    global_vars.setdefault("__allo_mx_matmul_wq__", mx_matmul_wq)
+    global_vars.setdefault("_mx_wblocks_rows", _mx_wblocks_rows)
+    global_vars.setdefault("_mx_wblocks_cols", _mx_wblocks_cols)
+    global_vars.setdefault("_mx_xblocks_rows", _mx_xblocks_rows)
+    global_vars.setdefault("_mx_xquant_rows", _mx_xquant_rows)
+    global_vars.setdefault("_mx_dot_df", _mx_dot_df)
+    global_vars.setdefault("_mx_wquant_rows", _mx_wquant_rows)
+    global_vars.setdefault("_mx_wquant_cols", _mx_wquant_cols)
+    global_vars.setdefault("__allo_mx_linear2d_ff__", mx_linear2d_ff)
+    global_vars.setdefault("__allo_mx_matmul_ff__", mx_matmul_ff)
+    global_vars.setdefault("__allo_mx_pick_tile_units__", mx_pick_tile_units)
+    global_vars.setdefault("mx_linear2d", mx_linear2d)
+    global_vars.setdefault("mx_linear2d_ff", mx_linear2d_ff)
+    global_vars.setdefault("mx_auto_tn", mx_auto_tn)
+    global_vars.setdefault("mx_auto_p", mx_auto_p)
+    global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
+    for _name, _obj in vars(_mx_types).items():
+        if isinstance(_obj, _mx_types.MXScaledType):
+            global_vars.setdefault(f"__allo_mx_type_{_obj.name}__", _obj)
     global_vars.setdefault("mx_matmul", mx_matmul)
     global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
     global_vars.setdefault("mx_block_dot", mx_block_dot)
@@ -1382,10 +1429,6 @@ def customize(
     global_vars.setdefault("_mx_get_scale", _mx_get_scale)
     global_vars.setdefault("_mx_pack_word", _mx_pack_word)
     global_vars.setdefault("_mx_acc_bits", _mx_acc_bits)
-    # Those same function bodies also reference these type names bare (e.g.
-    # `BS: ConstExpr[int32] = Ty.block_size`, `sign: UInt(1) = ...`) --
-    # same reasoning as above: present here regardless of whether the
-    # calling user's own module happens to import them under these names.
     global_vars.setdefault("Int", _mx_Int)
     global_vars.setdefault("UInt", _mx_UInt)
     global_vars.setdefault("int32", _mx_int32)
@@ -1393,6 +1436,8 @@ def customize(
     global_vars.setdefault("float32", _mx_float32)
     global_vars.setdefault("Stream", _mx_Stream)
     global_vars.setdefault("ConstExpr", _mx_ConstExpr)
+    global_vars.setdefault("int8", _mx_types.int8)
+    global_vars.setdefault("e8m0", _mx_types.e8m0)
     # Type construction
     ctx_type_inf = ASTContext(
         tree=tree,

@@ -11,12 +11,9 @@ from ..ir.types import Int, UInt, int32, uint8, float32, Stream, ConstExpr
 def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
     bits: int32 = v_f32.bitcast()
     sign: UInt(1) = bits[31:32]
-    exp_field: uint8 = bits[23:31]
-    mant: UInt(24) = bits[0:23]
-
-    deficit: uint8 = shared_field - exp_field
-    total_shift: uint8 = (23 - Ty.max_unbiased_exp) + deficit
-    full_mant: UInt(24) = (1 << 23) | mant
+    exp_field: Int(9) = bits[23:31]
+    full_mant: Int(25) = (1 << 23) | bits[0:23]
+    total_shift: Int(10) = (23 - Ty.max_unbiased_exp) + shared_field - exp_field
 
     mag: Int(Ty.elem_bits) = 0
     if total_shift < 24:
@@ -33,9 +30,6 @@ def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(
 
 
 def schedule_mx_quantize_block_f32(s):
-    # i0's max-exponent extraction/reduction is now meta_for (unrolled at
-    # trace time), only the per-element quantize loop (i1) remains a real
-    # loop that needs scheduling.
     s.unroll("mx_quantize_block_f32:i1")
 
 
@@ -70,6 +64,96 @@ def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
     return word
 
 
+def mx_pack_words(arr, bits):
+    """Packs an array's raw bytes (row-major) into a 1D array of bits-wide words.
+
+    This is the host-side layout of the dataflow kernels' UInt(bits) ports
+    (byte i of a word = bits [8i, 8i+8)), in the struct dtype Allo's
+    simulator and HLS host code take for integers wider than 64 bits.
+    E.g. a float32 [M, K] matrix -> mx_pack_words(x, 512): M * K // 16 words.
+    """
+    import numpy as np  # pylint: disable=import-outside-toplevel
+    from ..utils import get_np_struct_type  # pylint: disable=import-outside-toplevel
+
+    raw = np.ascontiguousarray(arr).view(np.uint8).reshape(-1)
+    assert raw.size % (bits // 8) == 0, f"{raw.size} bytes is not a whole number of {bits}-bit words"
+    return raw.view(get_np_struct_type(bits))
+
+
+def _mx_quantize_np(Ty, x):
+    """numpy MX quantization of a [R, K] float32 array, bit-exact with
+    mx_quantize_block_f32 / _mx_quantize_elem_int_f32. Returns row-major
+    (elems uint8[R, K // block_size, block_size], scales uint8[R, K // block_size]):
+    two's-complement element bit patterns and E8M0 shared exponents."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    assert not Ty.is_float and Ty.elem_bits == 8, f"unsupported MX type {Ty}"
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    R, K = x.shape
+    BS = Ty.block_size
+    assert K % BS == 0, f"K={K} must be a multiple of block_size={BS}"
+
+    bits = x.view(np.uint32).astype(np.int64).reshape(R, K // BS, BS)
+    exp_field = (bits >> 23) & 0xFF
+    max_exp = exp_field.max(axis=2, keepdims=True)
+    full_mant = (bits & 0x7FFFFF) | (1 << 23)
+    total_shift = (23 - Ty.max_unbiased_exp) + max_exp - exp_field
+    mag = np.where(total_shift < 24, full_mant >> np.minimum(total_shift, 63), 0)
+    elems = np.clip(np.where(bits >> 31, -mag, mag), -127, 127)
+    scales = np.clip(max_exp[..., 0] - Ty.max_unbiased_exp, 0, 254)
+    return (elems & 0xFF).astype(np.uint8), scales.astype(np.uint8)
+
+
+def mx_quantize(Ty, x, axis=-1):
+    """Quantizes a 2D float32 array into an MX operand: separate element and
+    scale arrays (like CUTLASS's scaled operands and QLlama's weight/scale
+    buffers), so each can live in its own memory channel.
+
+    Returns (elems, scales): elems int8, same shape as x (two's-complement
+    elements); scales uint8 E8M0 shared exponents, one per 32-element block
+    along `axis` -- axis=-1 (default): x [R, K] -> scales [R, K // 32]
+    (allo.linear's X and W, allo.matmul's A); axis=0: x [K, N] -> scales
+    [K // 32, N] (allo.matmul's B). Annotate them "int8[...]" and
+    "e8m0[...]" in the kernel.
+    """
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    x = np.asarray(x, dtype=np.float32)
+    assert x.ndim == 2, "mx_quantize takes a 2D array"
+    if axis in (0, -2):
+        elems, scales = mx_quantize(Ty, x.T)
+        return np.ascontiguousarray(elems.T), np.ascontiguousarray(scales.T)
+    elems, scales = _mx_quantize_np(Ty, x)
+    return elems.reshape(x.shape).view(np.int8), scales
+
+
+def mx_quantize_weights(Ty, W, Tn=None):
+    """Offline (numpy) MX quantization of a [N, K] float32 weight matrix for
+    make_mx_linear2d_dataflow_prequant.
+
+    Bit-exact with mx_quantize_block_f32 / _mx_quantize_elem_int_f32, so a
+    kernel fed these values computes exactly what quantizing W on the FPGA
+    would. elems are the two's-complement element bit patterns, scales the
+    E8M0 shared exponents. Both come out in the order
+    make_mx_linear2d_dataflow_prequant streams them for tile size Tn (default
+    N, i.e. one tile): tile t of Tn rows, then block b, then row within the
+    tile -- elems uint8[N // Tn, NB, Tn, block_size], scales uint8[N // Tn,
+    NB, Tn] -- so the kernel reads both with sequential bursts.
+    """
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    elems, scales = _mx_quantize_np(Ty, W)
+    N, NB, BS = elems.shape
+    Tn = N if Tn is None else Tn
+    assert N % Tn == 0, f"N={N} must be a multiple of Tn={Tn}"
+    elems = elems.reshape(N // Tn, Tn, NB, BS)
+    scales = scales.reshape(N // Tn, Tn, NB)
+    return (
+        np.ascontiguousarray(elems.transpose(0, 2, 1, 3)),
+        np.ascontiguousarray(scales.transpose(0, 2, 1)),
+    )
+
+
 def _mx_scale_to_float32(scale: uint8) -> float32:
     bits: int32 = int(scale) << 23
     return bits.bitcast()
@@ -92,12 +176,6 @@ def _mx_acc_bits(Ty, K):
 
 
 def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
-    # scale/exp are widened to int32 in the same statement that produces
-    # them (rather than stored as uint8 locals and widened later) to dodge
-    # an HLS-backend codegen bug: `int(x)` on a *previously stored* uint8
-    # local mis-widens through the source's narrow width, silently
-    # corrupting values >= 128 (a very common range for biased exponents/
-    # scales) via sign-extension of a bogus negative reinterpretation.
     scale_a: int32 = int(_mx_get_scale[Ty](data_a))
     scale_b: int32 = int(_mx_get_scale[Ty](data_b))
 
@@ -115,7 +193,7 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
     total_bits: int32 = total.bitcast()
     sign: UInt(1) = total_bits[31:32]
     exp_t: int32 = int(total_bits[23:31])
-    mant_t: UInt(23) = total_bits[0:23]
+    mant_t: Int(24) = total_bits[0:23]
 
     new_exp: int32 = exp_t + scale_a + scale_b - 254
 
@@ -137,7 +215,6 @@ def schedule_mx_block_dot(s):
 
 
 def patch_extern_c_for_class_return_types(kernel_cpp_path):
-    # remove extern "C" block and add it back with the function signature
     # issue #603 (https://github.com/alloy-lang/allo/issues/603)
     with open(kernel_cpp_path, encoding="utf-8") as f:
         lines = f.readlines()
@@ -168,11 +245,6 @@ def patch_extern_c_for_class_return_types(kernel_cpp_path):
 
 
 def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
-    # Imported lazily (not at module level): allo.dataflow's own import chain
-    # pulls in allo.library.KERNEL2SCHEDULE, and this module is now imported
-    # (via mxint8_nn) from allo/library/__init__.py itself while that
-    # registry is still being built -- a module-level `import allo.dataflow`
-    # here would make `import allo` fail with a circular-import error.
     import allo.dataflow as df
 
     N = K * NB
@@ -246,9 +318,7 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
                 partials[p0] = 0.0
 
             for i in range(NB // P):
-            #pragma pipeline II=P(4)
                 for j in range(P):
-                #pragma unroll
                     bundle_a: uint8[K + 1] = pipe_a_q.get()
                     bundle_b: uint8[K + 1] = pipe_b_q.get()
                     scale_a: uint8 = bundle_a[0]

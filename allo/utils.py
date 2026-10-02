@@ -133,6 +133,25 @@ def is_anywidth_int_type_and_not_np(dtype):
     )
 
 
+def get_llvm_wide_int_struct_type(bitwidth):
+    """numpy dtype of one element of an LLVM-lowered memref of iN, N > 64.
+
+    On x86-64 LLVM stores such integers in ceil(N/8) bytes rounded up to a
+    multiple of 16 (i72 -> 16, i264 -> 48, i256 -> 32), not in ceil(N/8)
+    bytes nor in the next power of two; array arguments and results must use
+    this stride or element i is read from/written to the wrong offset.
+    """
+    n_bytes = -(-(-(-bitwidth // 8)) // 16) * 16
+    return np.dtype(
+        {
+            "names": [f"f{i}" for i in range(n_bytes)],
+            "formats": ["u1"] * n_bytes,
+            "offsets": list(range(n_bytes)),
+            "itemsize": n_bytes,
+        }
+    )
+
+
 def get_clostest_pow2(n):
     # .bit_length() is a Python method
     return 1 << (n - 1).bit_length()

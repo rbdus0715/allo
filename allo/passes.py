@@ -317,9 +317,13 @@ def generate_input_output_buffers(module, top_func_name, flatten=False, mappings
                     ip=ip_return,
                 )
 
-                results["outputs"].append(
-                    MockBuffer(top_func_name, arg.owner.attributes["name"].value)
+                owner_attrs = arg.owner.attributes
+                out_name = (
+                    owner_attrs["name"].value
+                    if "name" in owner_attrs
+                    else f"res{idx + len(top_func.arguments)}"
                 )
+                results["outputs"].append(MockBuffer(top_func_name, out_name))
 
         else:
             # argument as output

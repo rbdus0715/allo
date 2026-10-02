@@ -167,6 +167,20 @@ class UInt(AlloType):
         return isinstance(other, UInt) or (isinstance(other, int) and other >= 0)
 
 
+class E8M0(UInt):
+    """
+    OCP MX shared scale (E8M0): an 8-bit biased power-of-two exponent.
+
+    Stored and lowered exactly like a uint8 (same name, so every backend
+    treats it as one); it only marks an array as the scale operand of an MX
+    tensor, so ops such as allo.linear / allo.matmul can pick their MX
+    implementation from operand types, like CUTLASS's E8M0 scale tensors.
+    """
+
+    def __init__(self):
+        super().__init__(8)
+
+
 class Float(AlloType):
     """
     A floating point decimal number.
@@ -276,8 +290,6 @@ class MXScaledType(AlloType):
         super().__init__(total_bits, 0, name)
 
     def build(self):
-        # Same trick as UInt: no dedicated MLIR type, just a wide signless
-        # integer. Element/scale extraction is done with bit-slice ops.
         return IntegerType.get_signless(self.bits)
 
 
@@ -294,8 +306,6 @@ class MXFP(MXScaledType):
         final_accum_bits  = block_accum_bits + ceil(log2(block_size))
     """
 
-    # compile-time marker so generic Allo kernels can `meta_if(Ty.is_float)`
-    # to branch between the MXFP and MXInt quantize/dot code paths
     is_float = True
 
     def __init__(
@@ -351,10 +361,6 @@ class MXInt(MXScaledType):
 
     @property
     def max_unbiased_exp(self):
-        # Algorithm 1 (arXiv:2310.10537) needs emax_elem = floor(log2(largest
-        # normal number in the element format)); for an N-bit two's
-        # complement integer the largest magnitude is 2**(N-1) - 1, whose
-        # floor(log2(.)) is N-2.
         return self.elem_bits - 2
 
     @property
@@ -503,6 +509,7 @@ int15 = Int(15)
 # unsigned integer types
 uint1 = UInt(1)
 uint8 = UInt(8)
+e8m0 = E8M0()
 uint16 = UInt(16)
 uint32 = UInt(32)
 uint64 = UInt(64)
@@ -530,7 +537,6 @@ float32 = Float(32, 23, "f32")
 float64 = Float(64, 52, "f64")
 # brain floating point
 bfloat16 = Float(16, 7, "bf16")
-# OCP Microscaling (MX) formats, block_size=32 per spec default
 mxfp8_e4m3 = MXFP(4, 3, 32, "mxfp8_e4m3")
 mxfp8_e5m2 = MXFP(5, 2, 32, "mxfp8_e5m2")
 mxfp6_e2m3 = MXFP(2, 3, 32, "mxfp6_e2m3")
