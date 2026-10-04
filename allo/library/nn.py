@@ -108,8 +108,6 @@ def mx_linear2d_ref[
     return Z
 
 
-
-
 def _mx_wblocks_rows[
     Ty, N, K, NB, Tn
 ](Q: "int8[N, K]", S: "e8m0[N, NB]", e: "UInt(256)[N * NB]", s: "uint8[N * NB]"):
@@ -480,8 +478,6 @@ def schedule_mx_linear3d(s):
     s.pipeline("mx_linear3d:k")
     s.pipeline("mx_linear3d:j")
     return s
-
-
 
 
 def make_mx_matmul_dataflow(Ty, M, N, K, P, depth=4):

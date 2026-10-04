@@ -720,8 +720,6 @@ def test_type_comparison():
                 assert list_of_types[i] != list_of_types[j]
 
 
-
-
 def test_mxfp_bitwidth_formulas():
     assert T.mxfp8_e4m3.elem_bits == 8
     assert T.mxfp8_e4m3.bits == 264

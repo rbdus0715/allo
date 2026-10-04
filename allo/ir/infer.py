@@ -1312,16 +1312,7 @@ class TypeInferer(ASTVisitor):
     def try_dispatch_mx_operand_linear(
         ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
     ):
-        """allo.linear / allo.matmul with MX operands lower to the MX library
-        implementation chosen by the operand types, like any typed op. An MX
-        operand is a pair of arrays, int8 elements followed by their E8M0
-        scales (one per 32-element block along K; see mxint8.mx_quantize):
-
-            allo.linear(X, Wq, Ws, bias)        -> nn.mx_linear2d_wq  (X float32)
-            allo.linear(Xq, Xs, Wq, Ws, bias)   -> nn.mx_linear2d_q
-            allo.matmul(A, Bq, Bs)              -> nn.mx_matmul_wq    (A float32)
-            allo.matmul(Aq, As, Bq, Bs)         -> nn.mx_matmul_q
-        """
+        """Rewrites allo.linear/allo.matmul on (int8, e8m0) operands to the MX dataflow implementation."""
         is_scale = [isinstance(getattr(a, "dtype", None), E8M0) for a in new_args]
         if not any(is_scale):
             return None
@@ -1379,11 +1370,7 @@ class TypeInferer(ASTVisitor):
     def try_dispatch_mx_linear(
         ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
     ):
-        """allo.linear[Ty](X, W, bias) / allo.matmul[Ty](A, B) on float32
-        operands: both are quantized on chip into the MX format Ty (which the
-        float operands cannot carry themselves) and fused with the block dot
-        into one dataflow region (nn.mx_linear2d_ff / nn.mx_matmul_ff).
-        3D linear inputs keep the sequential nn.mx_linear3d."""
+        """Rewrites allo.linear[Ty]/allo.matmul[Ty] on float32 operands to the MX dataflow implementation."""
         if not (
             ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType)
         ):

@@ -5,10 +5,6 @@
 #   pytest tests/test_mx_matmul.py                       -> LLVM backend only
 #   python tests/test_mx_matmul.py --mode csyn           -> + Vitis HLS csynth
 #   python tests/test_mx_matmul.py --mode hw_emu --device u55c   (or u250)
-#
-# An MX operand is an (int8 elems, e8m0 scales) pair from mx_quantize; each
-# array is its own kernel port, so elements and scales can sit in different
-# memory channels (like QLlama's weight/scale buffers).
 
 import glob
 import os
@@ -44,19 +40,16 @@ DEVICES = {  # --device -> (platform .xpfm, memory kind)
 def matmul_mx(
     Aq: "int8[M, K]", As: "e8m0[M, NB]", Bq: "int8[K, N]", Bs: "e8m0[NB, N]"
 ) -> "float32[M, N]":
-    # both operands MX: A blocked along rows, B along columns (axis=0)
     return allo.matmul(Aq, As, Bq, Bs)
 
 
 def matmul_mx_b(
     A: "float32[M, K]", Bq: "int8[K, N]", Bs: "e8m0[NB, N]"
 ) -> "float32[M, N]":
-    # MX B, float32 A (quantized inside the kernel)
     return allo.matmul(A, Bq, Bs)
 
 
 def matmul_mx_ff(A: "float32[M, K]", B: "float32[K, N]") -> "float32[M, N]":
-    # float32 A and B, both quantized inside the kernel (one dataflow region)
     return allo.matmul[Ty](A, B)
 
 
@@ -69,8 +62,6 @@ def _inputs(seed):
 
 
 def _memory_mapping(arg_names):
-    # Element arrays (the bulk data) get a channel each; scales and the returned
-    # Z share one more.
     mem = os.environ.get("ALLO_MEMORY", "HBM")
     bulk = [a for a in arg_names if a in ("A", "Aq", "B", "Bq")]
     shared = f"{mem}[{len(bulk)}]"
@@ -115,8 +106,6 @@ def _run_hls(kernel, args, Z_llvm):
     try:
         hls_mod(*args, Z)
     except RuntimeError:
-        # XRT 2024.2 hosts built with Vitis 2023.2 can segfault at teardown
-        # after the results were written; use them if this run produced them.
         outs = [
             f
             for f in glob.glob(f"{project}/output*.data")
@@ -141,8 +130,6 @@ def test_allo_matmul_mx(kernel):
         args = (A, B)
     Z = allo.customize(kernel).build(target="llvm")(*args)
 
-    # Same MX math as the float-input library function (which takes B as
-    # [N, K], i.e. transposed), bit for bit.
     ref = allo.customize(mx_matmul, instantiate=[Ty, M, N, K]).build(target="llvm")(
         A, np.ascontiguousarray(B.T)
     )

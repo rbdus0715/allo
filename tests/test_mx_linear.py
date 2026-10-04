@@ -5,10 +5,6 @@
 #   pytest tests/test_mx_linear.py                       -> LLVM backend only
 #   python tests/test_mx_linear.py --mode csyn           -> + Vitis HLS csynth
 #   python tests/test_mx_linear.py --mode hw_emu --device u55c   (or u250)
-#
-# An MX operand is an (int8 elems, e8m0 scales) pair from mx_quantize; each
-# array is its own kernel port, so elements and scales can sit in different
-# memory channels (like QLlama's weight/scale buffers).
 
 import glob
 import os
@@ -48,14 +44,12 @@ def linear_mx(
     Ws: "e8m0[N, NB]",
     bias: "float32[N]",
 ) -> "float32[M, N]":
-    # both operands MX (quantized on the host)
     return allo.linear(Xq, Xs, Wq, Ws, bias)
 
 
 def linear_mx_weight(
     X: "float32[M, K]", Wq: "int8[N, K]", Ws: "e8m0[N, NB]", bias: "float32[N]"
 ) -> "float32[M, N]":
-    # MX weight, float32 activations (quantized inside the kernel)
     return allo.linear(X, Wq, Ws, bias)
 
 
@@ -68,8 +62,6 @@ def _inputs(seed):
 
 
 def _memory_mapping(arg_names):
-    # Element arrays (the bulk data) get a channel each; scales, bias and the
-    # returned Z share one more.
     mem = os.environ.get("ALLO_MEMORY", "HBM")
     bulk = [a for a in arg_names if a in ("X", "Xq", "Wq")]
     shared = f"{mem}[{len(bulk)}]"
@@ -114,8 +106,6 @@ def _run_hls(kernel, args, Z_llvm):
     try:
         hls_mod(*args, Z)
     except RuntimeError:
-        # XRT 2024.2 hosts built with Vitis 2023.2 can segfault at teardown
-        # after the results were written; use them if this run produced them.
         outs = [
             f
             for f in glob.glob(f"{project}/output*.data")
@@ -138,7 +128,6 @@ def test_allo_linear_mx(kernel):
         args = (X, Wq, Ws, bias)
     Z = allo.customize(kernel).build(target="llvm")(*args)
 
-    # Same MX math as the float-input library function, bit for bit.
     ref = allo.customize(mx_linear2d_ref, instantiate=[Ty, M, N, K]).build(
         target="llvm"
     )(X, W, bias)

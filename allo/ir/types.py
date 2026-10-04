@@ -168,14 +168,7 @@ class UInt(AlloType):
 
 
 class E8M0(UInt):
-    """
-    OCP MX shared scale (E8M0): an 8-bit biased power-of-two exponent.
-
-    Stored and lowered exactly like a uint8 (same name, so every backend
-    treats it as one); it only marks an array as the scale operand of an MX
-    tensor, so ops such as allo.linear / allo.matmul can pick their MX
-    implementation from operand types, like CUTLASS's E8M0 scale tensors.
-    """
+    """OCP MX E8M0 scale; lowered as uint8, marks an MX scale operand."""
 
     def __init__(self):
         super().__init__(8)
@@ -270,15 +263,7 @@ class UFixed(AlloType):
 
 
 class MXScaledType(AlloType):
-    """
-    Base class for OCP Microscaling (MX) formats: a block of `block_size`
-    narrow elements sharing one 8-bit power-of-two scale (E8M0).
-
-    A block is represented as a single packed signless integer word (the
-    same "no new MLIR type" trick used by UInt), laid out MSB to LSB as:
-
-        scale (8 bits) | elem_{block_size-1} | ... | elem_1 | elem_0
-    """
+    """Base class for OCP MX formats: block_size elements + one E8M0 scale, packed as scale | elems."""
 
     SCALE_BITS = 8
 
@@ -294,17 +279,7 @@ class MXScaledType(AlloType):
 
 
 class MXFP(MXScaledType):
-    """
-    An OCP Microscaling floating-point format (MXFP): a block of
-    `block_size` narrow (1 + exp_bits + mantissa_bits)-bit floating-point
-    elements sharing one 8-bit power-of-two (E8M0) scale.
-
-    Bit-width sizing (paper Table III) for a no-dequantize Kulisch
-    accumulator dot product:
-        elem_bits         = 1 + exp_bits + mantissa_bits
-        block_accum_bits  = 2 * (1 + 2**exp_bits + (mantissa_bits - 1))
-        final_accum_bits  = block_accum_bits + ceil(log2(block_size))
-    """
+    """OCP MX floating-point format (MXFP)."""
 
     is_float = True
 
@@ -341,16 +316,7 @@ class MXFP(MXScaledType):
 
 
 class MXInt(MXScaledType):
-    """
-    An OCP Microscaling integer format (MXINT): a block of `block_size`
-    two's-complement integer elements sharing one 8-bit power-of-two
-    (E8M0) scale.
-
-    Bit-width sizing (standard integer dot-product accumulator, not given
-    by the paper's table since it only covers MXFP): a product of two
-    elem_bits-wide signed elements needs 2*elem_bits bits, and summing
-    block_size of them needs ceil(log2(block_size)) additional guard bits.
-    """
+    """OCP MX integer format (MXINT)."""
 
     is_float = False
 

@@ -8,7 +8,9 @@ import allo
 from ..ir.types import Int, UInt, int32, uint8, float32, Stream, ConstExpr
 
 
-def _mx_quantize_elem_int_f32[Ty](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
+def _mx_quantize_elem_int_f32[
+    Ty
+](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
     bits: int32 = v_f32.bitcast()
     sign: UInt(1) = bits[31:32]
     exp_field: Int(9) = bits[23:31]
@@ -34,7 +36,7 @@ def schedule_mx_quantize_block_f32(s):
 
 
 def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
-  
+
     exp_fields: uint8[K]
     with allo.meta_for(K) as i0:
         bits_i: int32 = x[i0].bitcast()
@@ -58,33 +60,28 @@ def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
     word[Ty.bits - 8 : Ty.bits] = scale_field
 
     for i1 in range(K):
-        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](x[i1], max_exp_field_u8)
+        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](
+            x[i1], max_exp_field_u8
+        )
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return word
 
 
 def mx_pack_words(arr, bits):
-    """Packs an array's raw bytes (row-major) into a 1D array of bits-wide words.
-
-    This is the host-side layout of the dataflow kernels' UInt(bits) ports
-    (byte i of a word = bits [8i, 8i+8)), in the struct dtype Allo's
-    simulator and HLS host code take for integers wider than 64 bits.
-    E.g. a float32 [M, K] matrix -> mx_pack_words(x, 512): M * K // 16 words.
-    """
+    """Packs an array's raw bytes into a 1D array of bits-wide words."""
     import numpy as np  # pylint: disable=import-outside-toplevel
     from ..utils import get_np_struct_type  # pylint: disable=import-outside-toplevel
 
     raw = np.ascontiguousarray(arr).view(np.uint8).reshape(-1)
-    assert raw.size % (bits // 8) == 0, f"{raw.size} bytes is not a whole number of {bits}-bit words"
+    assert (
+        raw.size % (bits // 8) == 0
+    ), f"{raw.size} bytes is not a whole number of {bits}-bit words"
     return raw.view(get_np_struct_type(bits))
 
 
 def _mx_quantize_np(Ty, x):
-    """numpy MX quantization of a [R, K] float32 array, bit-exact with
-    mx_quantize_block_f32 / _mx_quantize_elem_int_f32. Returns row-major
-    (elems uint8[R, K // block_size, block_size], scales uint8[R, K // block_size]):
-    two's-complement element bit patterns and E8M0 shared exponents."""
+    """numpy MX quantization of a [R, K] array, bit-exact with the hardware quantizer."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     assert not Ty.is_float and Ty.elem_bits == 8, f"unsupported MX type {Ty}"
@@ -105,17 +102,7 @@ def _mx_quantize_np(Ty, x):
 
 
 def mx_quantize(Ty, x, axis=-1):
-    """Quantizes a 2D float32 array into an MX operand: separate element and
-    scale arrays (like CUTLASS's scaled operands and QLlama's weight/scale
-    buffers), so each can live in its own memory channel.
-
-    Returns (elems, scales): elems int8, same shape as x (two's-complement
-    elements); scales uint8 E8M0 shared exponents, one per 32-element block
-    along `axis` -- axis=-1 (default): x [R, K] -> scales [R, K // 32]
-    (allo.linear's X and W, allo.matmul's A); axis=0: x [K, N] -> scales
-    [K // 32, N] (allo.matmul's B). Annotate them "int8[...]" and
-    "e8m0[...]" in the kernel.
-    """
+    """Quantizes a 2D array into an MX operand (int8 elements, e8m0 scales)."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     x = np.asarray(x, dtype=np.float32)
@@ -128,18 +115,7 @@ def mx_quantize(Ty, x, axis=-1):
 
 
 def mx_quantize_weights(Ty, W, Tn=None):
-    """Offline (numpy) MX quantization of a [N, K] float32 weight matrix for
-    make_mx_linear2d_dataflow_prequant.
-
-    Bit-exact with mx_quantize_block_f32 / _mx_quantize_elem_int_f32, so a
-    kernel fed these values computes exactly what quantizing W on the FPGA
-    would. elems are the two's-complement element bit patterns, scales the
-    E8M0 shared exponents. Both come out in the order
-    make_mx_linear2d_dataflow_prequant streams them for tile size Tn (default
-    N, i.e. one tile): tile t of Tn rows, then block b, then row within the
-    tile -- elems uint8[N // Tn, NB, Tn, block_size], scales uint8[N // Tn,
-    NB, Tn] -- so the kernel reads both with sequential bursts.
-    """
+    """Quantizes a [N, K] weight into tile-ordered MX words and scales."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     elems, scales = _mx_quantize_np(Ty, W)
@@ -355,4 +331,3 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     s.unroll("dot_product_stage_0:r")
     s.partition("dot_product_stage_0:partials", dim=0)
     return s
-
