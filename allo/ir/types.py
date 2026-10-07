@@ -262,6 +262,30 @@ class UFixed(AlloType):
         return allo_d.UFixedType.get(self.bits, self.fracs)
 
 
+# Type attributes kernels may read as compile-time constants (e.g. Ty.elem_bits)
+TYPE_CONST_ATTRS = frozenset(
+    {
+        "bits",
+        "fracs",
+        "exp_bits",
+        "mantissa_bits",
+        "elem_bits",
+        "block_size",
+        "scale_bits",
+        "payload_bits",
+        "bias",
+        "is_float",
+        "max_unbiased_exp",
+        "max_int",
+        "max_exp_code",
+        "max_code",
+        "dot_exp_offset",
+        "block_accum_bits",
+        "final_accum_bits",
+    }
+)
+
+
 class MXScaledType(AlloType):
     """Base class for OCP MX formats: block_size elements + one E8M0 scale, packed as scale | elems."""
 
@@ -289,6 +313,7 @@ class MXFP(MXScaledType):
         mantissa_bits,
         block_size=32,
         name=None,
+        specials=None,
     ):
         self.exp_bits = exp_bits
         self.mantissa_bits = mantissa_bits
@@ -296,11 +321,32 @@ class MXFP(MXScaledType):
         elem_bits = 1 + exp_bits + mantissa_bits
         if name is None:
             name = f"mxfp_e{exp_bits}m{mantissa_bits}_k{block_size}"
+        # Encodings reserved in the all-ones exponent (OCP MX v1.0 sec. 5.3):
+        # "ieee" = Inf/NaN (E5M2), "nan" = only S.1..1.1..1 (E4M3), None = all finite
+        if specials is None:
+            specials = "ieee" if exp_bits >= 5 else ("nan" if elem_bits == 8 else None)
+        self.specials = specials
         super().__init__(elem_bits, block_size, name)
 
     @property
+    def max_exp_code(self):
+        return 2**self.exp_bits - (2 if self.specials == "ieee" else 1)
+
+    @property
+    def max_code(self):
+        """Largest finite magnitude, as the exponent | mantissa bit pattern."""
+        max_mant = 2**self.mantissa_bits - (2 if self.specials == "nan" else 1)
+        return (self.max_exp_code << self.mantissa_bits) | max_mant
+
+    @property
     def max_unbiased_exp(self):
-        return 2 ** (self.exp_bits - 1)
+        """emax of the element format: exponent of its largest normal."""
+        return self.max_exp_code - self.bias
+
+    @property
+    def dot_exp_offset(self):
+        """Exponent of one unit of the fixed-point element product (see mx_block_dot)."""
+        return 2 * (1 - self.bias) - 2 * self.mantissa_bits
 
     @property
     def block_accum_bits(self):
@@ -332,6 +378,10 @@ class MXInt(MXScaledType):
     @property
     def max_int(self):
         return 2 ** (self.elem_bits - 1) - 1  # symmetric clip: [-max_int, max_int]
+
+    @property
+    def dot_exp_offset(self):
+        return 0  # element products are plain integers
 
     @property
     def block_accum_bits(self):

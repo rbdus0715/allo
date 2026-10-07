@@ -94,6 +94,8 @@ from .library.mxint8 import (
     mx_quantize_block_f32,
     mx_block_dot,
     _mx_quantize_elem_int_f32,
+    _mx_quantize_elem_fp_f32,
+    _mx_fp_mul,
     _mx_get_scale,
     _mx_pack_word,
     _mx_acc_bits,
@@ -1416,6 +1418,8 @@ def customize(
     global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
     global_vars.setdefault("mx_block_dot", mx_block_dot)
     global_vars.setdefault("_mx_quantize_elem_int_f32", _mx_quantize_elem_int_f32)
+    global_vars.setdefault("_mx_quantize_elem_fp_f32", _mx_quantize_elem_fp_f32)
+    global_vars.setdefault("_mx_fp_mul", _mx_fp_mul)
     global_vars.setdefault("_mx_get_scale", _mx_get_scale)
     global_vars.setdefault("_mx_pack_word", _mx_pack_word)
     global_vars.setdefault("_mx_acc_bits", _mx_acc_bits)

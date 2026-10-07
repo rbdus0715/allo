@@ -418,3 +418,95 @@ if __name__ == "__main__":
     import pytest
 
     pytest.main([__file__])
+
+
+MXFP_FORMATS = [
+    T.mxfp8_e4m3,
+    T.mxfp8_e5m2,
+    T.mxfp6_e2m3,
+    T.mxfp6_e3m2,
+    T.mxfp4_e2m1,
+    T.MXFP(4, 3, 16),  # non-default block size
+]
+_ML_DTYPES = {
+    (4, 3): "float8_e4m3fn",
+    (5, 2): "float8_e5m2",
+    (2, 3): "float6_e2m3fn",
+    (3, 2): "float6_e3m2fn",
+    (2, 1): "float4_e2m1fn",
+}
+
+
+def _mxfp_decode(Ty, elems, scales):
+    """Dequantizes MXFP (bit-pattern elements, e8m0 scales) to float64."""
+    m, eb = Ty.mantissa_bits, Ty.elem_bits
+    codes = np.asarray(elems, dtype=np.int64) & ((1 << eb) - 1)
+    exp = (codes >> m) & ((1 << Ty.exp_bits) - 1)
+    mant = codes & ((1 << m) - 1)
+    mag = np.where(
+        exp == 0,
+        mant * 2.0 ** (1 - Ty.bias - m),
+        (1 + mant / 2.0**m) * 2.0 ** (exp - Ty.bias),
+    )
+    vals = np.where(codes >> (eb - 1), -mag, mag)
+    scale = 2.0 ** (np.repeat(scales.astype(np.int64), Ty.block_size, axis=1) - 127)
+    return vals * scale
+
+
+@pytest.mark.parametrize("Tf", MXFP_FORMATS, ids=lambda t: t.name)
+def test_mxfp_quantize_matches_ocp(Tf):
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    dt = getattr(ml_dtypes, _ML_DTYPES[(Tf.exp_bits, Tf.mantissa_bits)], None)
+    if dt is None:
+        pytest.skip("ml_dtypes has no matching element type")
+    R, BS = 4, Tf.block_size
+    K = 4 * BS
+    X = _rand((R, K), np.random.default_rng(9))
+    elems, scales = mx_quantize(Tf, X)
+
+    # OCP MX v1.0: shared exponent = floor(log2(amax)) - emax; elements are
+    # x / 2^shared rounded to nearest even, saturated to the largest finite value
+    blocks = X.reshape(R, K // BS, BS).astype(np.float64)
+    shared = np.frexp(np.abs(blocks).max(axis=2))[1] - 1 - Tf.max_unbiased_exp
+    np.testing.assert_array_equal(scales, shared + 127)
+    scale = 2.0 ** shared[..., None]
+    max_val = _mxfp_decode(Tf, np.full((1, BS), Tf.max_code), np.full((1, 1), 127))
+    ref = np.clip(blocks / scale, -max_val[0, 0], max_val[0, 0]).astype(dt)
+    ref = (ref.astype(np.float64) * scale).reshape(R, K)
+    np.testing.assert_array_equal(_mxfp_decode(Tf, elems, scales), ref)
+
+
+@pytest.mark.parametrize("Tf", MXFP_FORMATS, ids=lambda t: t.name)
+def test_mxfp_linear(Tf):
+    from allo.ir.types import float32, Int, e8m0
+
+    M, N, K = 3, 8, 2 * Tf.block_size
+    NB, EB = K // Tf.block_size, Tf.elem_bits
+    rng = np.random.default_rng(10)
+    X = _rand((M, K), rng)
+    W = _rand((N, K), rng)
+    bias = _rand((N,), rng)
+
+    def lin_ff(
+        X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
+    ) -> "float32[M, N]":
+        return allo.linear[Tf](X, W, bias)
+
+    def lin_q(
+        Xq: "Int(EB)[M, K]",
+        Xs: "e8m0[M, NB]",
+        Wq: "Int(EB)[N, K]",
+        Ws: "e8m0[N, NB]",
+        bias: "float32[N]",
+    ) -> "float32[M, N]":
+        return allo.linear[Tf](Xq, Xs, Wq, Ws, bias)
+
+    build = lambda f: allo.customize(f).build(target="llvm")
+    Z = build(lin_ff)(X, W, bias)
+    Xq, Xs = mx_quantize(Tf, X)
+    Wq, Ws = mx_quantize(Tf, W)
+    np.testing.assert_array_equal(build(lin_q)(Xq, Xs, Wq, Ws, bias), Z)
+
+    # block dots are exact; only the float32 sums across blocks round
+    ref = _mxfp_decode(Tf, Xq, Xs) @ _mxfp_decode(Tf, Wq, Ws).T + bias
+    assert np.linalg.norm(Z - ref) / np.linalg.norm(ref) < 1e-5

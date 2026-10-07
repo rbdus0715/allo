@@ -31,6 +31,39 @@ def _mx_quantize_elem_int_f32[
     return rounded
 
 
+def _mx_quantize_elem_fp_f32[
+    Ty
+](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
+    # OCP MX: v / 2^(shared exponent - emax), round-to-nearest-even, saturating
+    bits: int32 = v_f32.bitcast()
+    sign: int32 = int(bits[31:32])
+    exp_field: int32 = int(bits[23:31])
+    full_mant: int32 = (1 << 23) | int(bits[0:23])
+    code: int32 = exp_field - int(shared_field) + Ty.max_unbiased_exp + Ty.bias
+    shift: int32 = 23 - Ty.mantissa_bits
+    base: int32 = 0
+    if code >= 1:  # normal: q in [2^m, 2^(m+1)] sits on exponent code - 1
+        base = (code - 1) << Ty.mantissa_bits
+    else:  # subnormal: q in [0, 2^m]; q == 2^m carries into exponent code 1
+        shift = shift + 1 - code
+
+    mag: int32 = 0
+    if exp_field != 0 and shift <= 25:  # larger shifts round to zero
+        q: int32 = full_mant >> shift
+        rem: int32 = full_mant & ((1 << shift) - 1)
+        half: int32 = 1 << (shift - 1)
+        round_up: int32 = 0
+        if rem > half:
+            round_up = 1
+        if rem == half:
+            round_up = q & 1
+        mag = base + q + round_up
+    if mag > Ty.max_code:
+        mag = Ty.max_code
+    result: UInt(Ty.elem_bits) = (sign << (Ty.elem_bits - 1)) | mag
+    return result
+
+
 def schedule_mx_quantize_block_f32(s):
     s.unroll("mx_quantize_block_f32:i1")
 
@@ -60,9 +93,11 @@ def mx_quantize_block_f32[Ty, K](x: "float32[K]") -> "Ty":
     word[Ty.bits - 8 : Ty.bits] = scale_field
 
     for i1 in range(K):
-        elem: UInt(Ty.elem_bits) = _mx_quantize_elem_int_f32[Ty](
-            x[i1], max_exp_field_u8
-        )
+        elem: UInt(Ty.elem_bits) = 0
+        with allo.meta_if(Ty.is_float):
+            elem = _mx_quantize_elem_fp_f32[Ty](x[i1], max_exp_field_u8)
+        with allo.meta_else():
+            elem = _mx_quantize_elem_int_f32[Ty](x[i1], max_exp_field_u8)
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return word
@@ -84,7 +119,6 @@ def _mx_quantize_np(Ty, x):
     """numpy MX quantization of a [R, K] array, bit-exact with the hardware quantizer."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
-    assert not Ty.is_float, f"unsupported MX type {Ty}"
     x = np.ascontiguousarray(x, dtype=np.float32)
     R, K = x.shape
     BS = Ty.block_size
@@ -94,16 +128,34 @@ def _mx_quantize_np(Ty, x):
     exp_field = (bits >> 23) & 0xFF
     max_exp = exp_field.max(axis=2, keepdims=True)
     full_mant = (bits & 0x7FFFFF) | (1 << 23)
-    total_shift = (23 - Ty.max_unbiased_exp) + max_exp - exp_field
-    mag = np.where(total_shift < 24, full_mant >> np.minimum(total_shift, 63), 0)
-    elems = np.clip(np.where(bits >> 31, -mag, mag), -Ty.max_int, Ty.max_int)
+    if Ty.is_float:  # mirrors _mx_quantize_elem_fp_f32
+        m, eb = Ty.mantissa_bits, Ty.elem_bits
+        code = exp_field - max_exp + Ty.max_unbiased_exp + Ty.bias
+        shift = 23 - m + np.maximum(0, 1 - code)
+        s = np.minimum(shift, 40)
+        q = full_mant >> s
+        rem, half = full_mant & ((1 << s) - 1), 1 << (s - 1)
+        q = q + ((rem > half) | ((rem == half) & ((q & 1) == 1)))
+        mag = (np.maximum(code - 1, 0) << m) + q
+        mag = np.where((exp_field != 0) & (shift <= 25), mag, 0)
+        mag = np.minimum(mag, Ty.max_code)
+        codes = ((bits >> 31) << (eb - 1)) | mag
+        elems = codes - ((codes >> (eb - 1)) << eb)  # same bits, as a signed int
+    else:  # mirrors _mx_quantize_elem_int_f32
+        total_shift = (23 - Ty.max_unbiased_exp) + max_exp - exp_field
+        mag = np.where(total_shift < 24, full_mant >> np.minimum(total_shift, 63), 0)
+        elems = np.clip(np.where(bits >> 31, -mag, mag), -Ty.max_int, Ty.max_int)
     scales = np.clip(max_exp[..., 0] - Ty.max_unbiased_exp, 0, 254)
     elem_dtype = np.dtype(f"int{max(8, 1 << (Ty.elem_bits - 1).bit_length())}")
     return elems.astype(elem_dtype), scales.astype(np.uint8)
 
 
 def mx_quantize(Ty, x, axis=-1):
-    """Quantizes a 2D array into an MX operand (signed elements, e8m0 scales)."""
+    """Quantizes a 2D array into an MX operand: (elements, e8m0 scales).
+
+    MXINT elements are the integers themselves; MXFP elements are their bit
+    patterns, stored as same-width signed integers (e.g. Int(8) for mxfp8).
+    """
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     x = np.asarray(x, dtype=np.float32)
@@ -167,7 +219,43 @@ def _mx_get_scale[Ty](word: "Ty") -> uint8:
 
 
 def _mx_acc_bits(Ty, K):
-    return 2 * Ty.elem_bits + (K - 1).bit_length()
+    # FP: fixed-point product width (see _mx_fp_mul); INT: plain product width
+    product_bits = Ty.block_accum_bits if Ty.is_float else 2 * Ty.elem_bits
+    return product_bits + (K - 1).bit_length()
+
+
+def _mx_fp_mul[
+    Ty, K
+](a_i: "UInt(Ty.elem_bits)", b_i: "UInt(Ty.elem_bits)") -> "Int(_mx_acc_bits(Ty, K))":
+    """Exact product of two MXFP elements, in units of 2^Ty.dot_exp_offset."""
+    a: int32 = int(a_i)
+    b: int32 = int(b_i)
+    exp_mask: int32 = (1 << Ty.exp_bits) - 1
+    mant_mask: int32 = (1 << Ty.mantissa_bits) - 1
+    a_exp_field: int32 = (a >> Ty.mantissa_bits) & exp_mask
+    b_exp_field: int32 = (b >> Ty.mantissa_bits) & exp_mask
+
+    # normal: implicit leading 1, exponent field - bias
+    # subnormal (field 0): no leading 1, exponent pinned to 1 - bias
+    a_exp: int32 = 1 - Ty.bias
+    a_mant: int32 = a & mant_mask
+    if a_exp_field != 0:
+        a_exp = a_exp_field - Ty.bias
+        a_mant = (1 << Ty.mantissa_bits) | (a & mant_mask)
+    b_exp: int32 = 1 - Ty.bias
+    b_mant: int32 = b & mant_mask
+    if b_exp_field != 0:
+        b_exp = b_exp_field - Ty.bias
+        b_mant = (1 << Ty.mantissa_bits) | (b & mant_mask)
+
+    # >= 0: both exponents bottom out at 1 - bias (the accumulator's radix point)
+    shift_amt: int32 = (a_exp + b_exp) - 2 * (1 - Ty.bias)
+    magnitude: "Int(_mx_acc_bits(Ty, K))" = a_mant * b_mant
+    magnitude = magnitude << shift_amt
+    term: "Int(_mx_acc_bits(Ty, K))" = magnitude
+    if ((a ^ b) >> (Ty.elem_bits - 1)) & 1 == 1:
+        term = -magnitude
+    return term
 
 
 def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
@@ -176,9 +264,18 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
 
     mul_i: "Int(_mx_acc_bits(Ty, K))[K]"
     for j0 in range(K):
-        a_i: Int(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
-        b_i: Int(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
-        mul_i[j0] = a_i * b_i
+        with allo.meta_if(Ty.is_float):
+            a_f: UInt(Ty.elem_bits) = data_a[
+                j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits
+            ]
+            b_f: UInt(Ty.elem_bits) = data_b[
+                j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits
+            ]
+            mul_i[j0] = _mx_fp_mul[Ty, K](a_f, b_f)
+        with allo.meta_else():
+            a_i: Int(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+            b_i: Int(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
+            mul_i[j0] = a_i * b_i
 
     acc_i: "Int(_mx_acc_bits(Ty, K))" = 0
     for j1 in range(K):
@@ -190,7 +287,8 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
     exp_t: int32 = int(total_bits[23:31])
     mant_t: Int(24) = total_bits[0:23]
 
-    new_exp: int32 = exp_t + scale_a + scale_b - 254
+    # -254: the two E8M0 biases; dot_exp_offset: the products' radix point (FP)
+    new_exp: int32 = exp_t + scale_a + scale_b - 254 + Ty.dot_exp_offset
 
     result_bits: int32 = 0
     if exp_t == 0 or scale_a == 0 or scale_b == 0:

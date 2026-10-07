@@ -77,6 +77,7 @@ from .types import (
     float32,
     Stream,
     MXScaledType,
+    TYPE_CONST_ATTRS,
     allo_type_from_mlir_type,
 )
 from ..memory import Memory
@@ -316,20 +317,7 @@ class ASTTransformer(ASTBuilder):
                 ctx, node=node, attr="copy", new_args=[value]
             )
 
-        if node.attr in {
-            "bits",
-            "fracs",
-            "exp_bits",
-            "mantissa_bits",
-            "elem_bits",
-            "block_size",
-            "scale_bits",
-            "bias",
-            "is_float",
-            "max_unbiased_exp",
-            "block_accum_bits",
-            "final_accum_bits",
-        }:
+        if node.attr in TYPE_CONST_ATTRS:
             return MockConstant(getattr(value.val, node.attr), ctx, dtype=Index())
         raise RuntimeError("Unsupported Attribute")
 

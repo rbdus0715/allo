@@ -19,6 +19,7 @@ from .types import (
     UFixed,
     Index,
     MXScaledType,
+    TYPE_CONST_ATTRS,
     MXInt,
     E8M0,
     uint1,
@@ -233,20 +234,7 @@ class TypeInferer(ASTVisitor):
             node.dtype = res.dtype
             node.shape = res.shape
             return node
-        if node.attr in {
-            "bits",
-            "fracs",
-            "exp_bits",
-            "mantissa_bits",
-            "elem_bits",
-            "block_size",
-            "scale_bits",
-            "bias",
-            "is_float",
-            "max_unbiased_exp",
-            "block_accum_bits",
-            "final_accum_bits",
-        } and isinstance(res, ast.Name):
+        if node.attr in TYPE_CONST_ATTRS and isinstance(res, ast.Name):
             node.dtype = res.dtype
             node.shape = res.shape
             return node
@@ -499,20 +487,7 @@ class TypeInferer(ASTVisitor):
         if isinstance(node, ast.Attribute):
             assert isinstance(node.value, ast.Name)
             var = ctx.global_vars[node.value.id]
-            if node.attr in {
-                "bits",
-                "fracs",
-                "exp_bits",
-                "mantissa_bits",
-                "elem_bits",
-                "block_size",
-                "scale_bits",
-                "bias",
-                "is_float",
-                "max_unbiased_exp",
-                "block_accum_bits",
-                "final_accum_bits",
-            }:
+            if node.attr in TYPE_CONST_ATTRS:
                 return sympy.Integer(getattr(var, node.attr))
         if isinstance(node, ast.BinOp):
             lhs = TypeInferer.visit_symbol(ctx, node.left)
@@ -1336,8 +1311,13 @@ class TypeInferer(ASTVisitor):
         m = new_args[0].shape[0]
         assert k % nb == 0, f"K={k} is not a whole number of {nb} blocks"
         block = k // nb
-        # the MX format follows from the operands: element width and block size
-        mx_type = MXInt(wq.dtype.bits, block)
+        if ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType):
+            mx_type = ctx.inst[0]  # explicit, e.g. allo.linear[mxfp8_e4m3](...)
+            assert (mx_type.elem_bits, mx_type.block_size) == (wq.dtype.bits, block), (
+                f"{mx_type} does not match {wq.dtype.bits}-bit elements, block {block}"
+            )
+        else:  # MXINT, with the format read off the operands
+            mx_type = MXInt(wq.dtype.bits, block)
         type_name = f"__allo_mx_type_{mx_type.name}__"
         ctx.global_vars.setdefault(type_name, mx_type)
         suffix = "q" if x_quantized else "wq"

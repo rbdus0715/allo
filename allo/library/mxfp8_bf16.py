@@ -4,8 +4,8 @@
 
 import allo
 import allo.dataflow as df
-from ..ir.types import Int, UInt, int32, uint8, uint16, float32, Stream, ConstExpr
-from .mxint8 import _mx_pack_word, _mx_get_scale
+from ..ir.types import UInt, int32, uint8, uint16, float32, Stream, ConstExpr
+from .mxint8 import _mx_pack_word, mx_block_dot, schedule_mx_block_dot
 
 
 def _mx_quantize_elem_fp_bf16[Ty](v_bf16: uint16, shared_field: uint8) -> "UInt(Ty.elem_bits)":
@@ -15,7 +15,6 @@ def _mx_quantize_elem_fp_bf16[Ty](v_bf16: uint16, shared_field: uint8) -> "UInt(
     local_exp: int32 = (
         int(v_bf16[7:15]) - int(shared_field) + Ty.bias + Ty.max_unbiased_exp
     )
-    max_exp_code: int32 = (1 << Ty.exp_bits) - 1
     mant_shift: int32 = 7 - Ty.mantissa_bits
 
     out_exp: int32 = 0
@@ -27,14 +26,10 @@ def _mx_quantize_elem_fp_bf16[Ty](v_bf16: uint16, shared_field: uint8) -> "UInt(
         if out_mant == (1 << Ty.mantissa_bits):
             out_mant = 0
             out_exp = out_exp + 1
-        if out_exp > max_exp_code:
-            out_exp = max_exp_code
-            out_mant = (1 << Ty.mantissa_bits) - 1
-    result_bits: int32 = (
-        (int(sign) << (Ty.exp_bits + Ty.mantissa_bits))
-        | (out_exp << Ty.mantissa_bits)
-        | out_mant
-    )
+    mag: int32 = (out_exp << Ty.mantissa_bits) | out_mant
+    if mag > Ty.max_code:  # saturate to the largest finite value, not Inf/NaN
+        mag = Ty.max_code
+    result_bits: int32 = (int(sign) << (Ty.exp_bits + Ty.mantissa_bits)) | mag
     result: UInt(Ty.elem_bits) = result_bits
     return result
 
@@ -71,88 +66,6 @@ def mx_quantize_block_fp_bf16[Ty, K](x: "uint16[K]") -> "Ty":
         word[i1 * Ty.elem_bits : (i1 + 1) * Ty.elem_bits] = elem
 
     return word
-
-
-def _mx_fp_mul_bf16[Ty](
-    a_i: "UInt(Ty.elem_bits)", b_i: "UInt(Ty.elem_bits)"
-) -> "Int(Ty.final_accum_bits)":
-    a_exp_field: uint8 = a_i[Ty.mantissa_bits : Ty.elem_bits - 1]
-    b_exp_field: uint8 = b_i[Ty.mantissa_bits : Ty.elem_bits - 1]
-    a_sign: UInt(1) = a_i[Ty.elem_bits - 1 : Ty.elem_bits]
-    b_sign: UInt(1) = b_i[Ty.elem_bits - 1 : Ty.elem_bits]
-
-    # normal element: implicit leading 1, exponent = field - bias.
-    # subnormal (exp field == 0): no leading 1, exponent pinned to 1 - bias.
-    a_exp: int32 = 1 - Ty.bias
-    a_mant: int32 = int(a_i[0 : Ty.mantissa_bits])
-    if a_exp_field != 0:
-        a_exp = int(a_i[Ty.mantissa_bits : Ty.elem_bits - 1]) - Ty.bias
-        a_mant = (1 << Ty.mantissa_bits) | int(a_i[0 : Ty.mantissa_bits])
-
-    b_exp: int32 = 1 - Ty.bias
-    b_mant: int32 = int(b_i[0 : Ty.mantissa_bits])
-    if b_exp_field != 0:
-        b_exp = int(b_i[Ty.mantissa_bits : Ty.elem_bits - 1]) - Ty.bias
-        b_mant = (1 << Ty.mantissa_bits) | int(b_i[0 : Ty.mantissa_bits])
-
-    prod_mant: int32 = a_mant * b_mant
-    # shift_amt is always >= 0: a_exp/b_exp bottom out at 1-Ty.bias
-    # (subnormal*subnormal), which is exactly the accumulator's reference
-    # point (shift_amt == 0 there).
-    shift_amt: int32 = (a_exp + b_exp) - 2 * (1 - Ty.bias)
-
-    magnitude: "Int(Ty.final_accum_bits)" = prod_mant
-    magnitude = magnitude << shift_amt
-
-    term: "Int(Ty.final_accum_bits)" = magnitude
-    if (a_sign ^ b_sign) == 1:
-        term = -magnitude
-    return term
-
-
-def mx_block_dot_fp[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
-    scale_a: int32 = int(_mx_get_scale[Ty](data_a))
-    scale_b: int32 = int(_mx_get_scale[Ty](data_b))
-
-    mul_i: "Int(Ty.final_accum_bits)[K]"
-    for j0 in range(K):
-        a_i: UInt(Ty.elem_bits) = data_a[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
-        b_i: UInt(Ty.elem_bits) = data_b[j0 * Ty.elem_bits : (j0 + 1) * Ty.elem_bits]
-        mul_i[j0] = _mx_fp_mul_bf16[Ty](a_i, b_i)
-
-    acc_i: "Int(Ty.final_accum_bits)" = 0
-    for j1 in range(K):
-        acc_i = acc_i + mul_i[j1]
-    total: float32 = float(acc_i)
-
-    total_bits: int32 = total.bitcast()
-    sign: UInt(1) = total_bits[31:32]
-    exp_t: int32 = int(total_bits[23:31])
-    mant_t: UInt(23) = total_bits[0:23]
-
-    # mul_i's fixed radix point sits at 2**(2*(1-Ty.bias) - 2*Ty.mantissa_bits)
-    # (see _mx_fp_mul_bf16) -- a compile-time constant, folded in here
-    # alongside the same -254 (= -127 - 127) double-bias correction
-    # mx_block_dot (mxint8.py) uses for its own two scale fields.
-    new_exp: int32 = (
-        exp_t + scale_a + scale_b - 254 + (2 * (1 - Ty.bias) - 2 * Ty.mantissa_bits)
-    )
-
-    result_bits: int32 = 0
-    if exp_t == 0 or scale_a == 0 or scale_b == 0:
-        result_bits = 0
-    elif new_exp <= 0:
-        result_bits = int(sign) << 31
-    elif new_exp >= 255:
-        result_bits = (int(sign) << 31) | (255 << 23)
-    else:
-        result_bits = (int(sign) << 31) | (new_exp << 23) | mant_t
-    return result_bits.bitcast()
-
-
-def schedule_mx_block_dot_fp(s):
-    s.unroll("mx_block_dot_fp:j0")
-    s.unroll("mx_block_dot_fp:j1")
 
 
 def make_mxfp8_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
@@ -232,7 +145,7 @@ def make_mxfp8_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
                         block_b[k] = bundle_b[k + 1]
                     word_a: Ty = _mx_pack_word[Ty, K](scale_a, block_a)
                     word_b: Ty = _mx_pack_word[Ty, K](scale_b, block_b)
-                    partials[j] = partials[j] + mx_block_dot_fp[Ty, K](word_a, word_b)
+                    partials[j] = partials[j] + mx_block_dot[Ty, K](word_a, word_b)
 
             total: float32 = 0.0
             for r in range(P):
@@ -249,7 +162,7 @@ def make_mxfp8_dot_general_dataflow_bf16(Ty, K, NB, P, depth=4):
             local_out[0] = rounded[16:32]
 
     s = df.customize(top, opt_default=False)
-    schedule_mx_block_dot_fp(s)
+    schedule_mx_block_dot(s)
     schedule_mx_quantize_block_fp_bf16(s)
     s.pipeline("read_a_0:j")
     s.pipeline("read_b_0:j")
