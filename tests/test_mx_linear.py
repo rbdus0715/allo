@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# allo.linear on MX (mxint8) operands, in the style of test_mxfp.py:
+# nn.mx_gemm_* on MX (mxint8) operands, in the style of test_mxfp.py:
 #   pytest tests/test_mx_linear.py                       -> LLVM backend only
 #   python tests/test_mx_linear.py --mode csyn           -> + Vitis HLS csynth
 #   python tests/test_mx_linear.py --mode hw_emu --device u55c   (or u250)
@@ -17,6 +17,7 @@ import allo
 import allo.backend.hls as hls
 import allo.ir.types as T
 from allo.ir.types import float32, int8, e8m0
+import allo.library.nn as nn
 from allo.library.nn import mx_linear2d_ref
 from allo.library.mxint8 import mx_quantize, patch_extern_c_for_class_return_types
 
@@ -44,13 +45,13 @@ def linear_mx(
     Ws: "e8m0[N, NB]",
     bias: "float32[N]",
 ) -> "float32[M, N]":
-    return allo.linear(Xq, Xs, Wq, Ws, bias)
+    return nn.mx_gemm_q[Ty, M, N, K, NB, 0](Xq, Xs, Wq, Ws, bias)
 
 
 def linear_mx_weight(
     X: "float32[M, K]", Wq: "int8[N, K]", Ws: "e8m0[N, NB]", bias: "float32[N]"
 ) -> "float32[M, N]":
-    return allo.linear(X, Wq, Ws, bias)
+    return nn.mx_gemm_wq[Ty, M, N, K, NB, 0](X, Wq, Ws, bias)
 
 
 def _inputs(seed):
@@ -119,7 +120,7 @@ def _run_hls(kernel, args, Z_llvm):
 
 
 @pytest.mark.parametrize("kernel", [linear_mx, linear_mx_weight])
-def test_allo_linear_mx(kernel):
+def test_mx_linear(kernel):
     X, W, bias = _inputs(0)
     Wq, Ws = mx_quantize(Ty, W)
     if kernel is linear_mx:

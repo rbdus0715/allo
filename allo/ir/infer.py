@@ -20,8 +20,6 @@ from .types import (
     Index,
     MXScaledType,
     TYPE_CONST_ATTRS,
-    MXInt,
-    E8M0,
     uint1,
     int4,
     int8,
@@ -1245,16 +1243,6 @@ class TypeInferer(ASTVisitor):
                 node.shape = tuple()
                 node.dtype = new_args[0].dtype
                 return node
-            if fn_name in {"linear", "matmul"}:
-                mx_dispatch = TypeInferer.try_dispatch_mx_operand_linear(
-                    ctx, node, new_args, fn_name
-                )
-                if mx_dispatch is None:
-                    mx_dispatch = TypeInferer.try_dispatch_mx_linear(
-                        ctx, node, new_args, fn_name
-                    )
-                if mx_dispatch is not None:
-                    return mx_dispatch
             # return node
             return TypeInferer.visit_library_op(
                 ctx, node=node, op_name=fn_name, new_args=new_args
@@ -1283,115 +1271,6 @@ class TypeInferer(ASTVisitor):
             node.shape = stmts[-1].shape
         ctx.func_id = original_func_id
         return node
-
-    @staticmethod
-    def try_dispatch_mx_operand_linear(
-        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
-    ):
-        """Rewrites allo.linear/allo.matmul on (int8, e8m0) operands to the MX dataflow implementation."""
-        is_scale = [isinstance(getattr(a, "dtype", None), E8M0) for a in new_args]
-        if not any(is_scale):
-            return None
-        n_out = 1 if fn_name == "linear" else 0  # trailing bias
-        n_ops = len(new_args) - n_out
-        if n_ops == 3 and is_scale == [False, False, True] + [False] * n_out:
-            x_quantized = False
-        elif n_ops == 4 and is_scale == [False, True, False, True] + [False] * n_out:
-            x_quantized = True
-        else:
-            raise RuntimeError(
-                f"MX allo.{fn_name} takes each MX operand as an (int8 elems, e8m0 "
-                f"scales) pair, e.g. allo.{fn_name}(X, Wq, Ws{', bias' if n_out else ''})"
-            )
-        wq, ws = new_args[n_ops - 2], new_args[n_ops - 1]
-        if fn_name == "linear":
-            (n, k), nb = wq.shape, ws.shape[1]
-        else:
-            (k, n), nb = wq.shape, ws.shape[0]
-        m = new_args[0].shape[0]
-        assert k % nb == 0, f"K={k} is not a whole number of {nb} blocks"
-        block = k // nb
-        if ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType):
-            mx_type = ctx.inst[0]  # explicit, e.g. allo.linear[mxfp8_e4m3](...)
-            assert (mx_type.elem_bits, mx_type.block_size) == (wq.dtype.bits, block), (
-                f"{mx_type} does not match {wq.dtype.bits}-bit elements, block {block}"
-            )
-        else:  # MXINT, with the format read off the operands
-            mx_type = MXInt(wq.dtype.bits, block)
-        type_name = f"__allo_mx_type_{mx_type.name}__"
-        ctx.global_vars.setdefault(type_name, mx_type)
-        suffix = "q" if x_quantized else "wq"
-        tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](mx_type, n, nb)
-        dims = [m, n, k, nb, units, tile]
-        if fn_name == "linear":  # shared GEMM with W as [N, K] (TRANS=0)
-            target_name, dims = f"__allo_mx_gemm_{suffix}__", dims + [0]
-        else:
-            target_name = f"__allo_mx_matmul_{suffix}__"
-        new_func = ast.Subscript(
-            value=ast.Name(id=target_name, ctx=ast.Load()),
-            slice=ast.Tuple(
-                elts=[ast.Name(id=type_name, ctx=ast.Load())]
-                + [ast.Constant(value=d) for d in dims],
-                ctx=ast.Load(),
-            ),
-            ctx=ast.Load(),
-        )
-        ast.copy_location(new_func, node)
-        ast.fix_missing_locations(new_func)
-        node.func = new_func
-        return TypeInferer.visit_Call(ctx, node)
-
-    @staticmethod
-    def try_dispatch_mx_linear(
-        ctx: ASTContext, node: ast.Call, new_args: list[ast.AST], fn_name="linear"
-    ):
-        """Rewrites allo.linear[Ty]/allo.matmul[Ty] on float32 operands to the MX dataflow implementation."""
-        if not (
-            ctx.inst and len(ctx.inst) == 1 and isinstance(ctx.inst[0], MXScaledType)
-        ):
-            return None
-        mx_type = ctx.inst[0]
-        mx_type_node = node.func.slice
-        argAshape = new_args[0].shape
-        argBshape = new_args[1].shape
-        assert len(argBshape) == 2, f"MX allo.{fn_name}'s second operand must be 2D"
-        if fn_name == "linear":
-            assert (
-                len(node.args) >= 3
-            ), "mx_type linear requires an explicit bias argument"
-        if fn_name == "linear" and len(argAshape) == 3:
-            b, l, d = argAshape
-            m = argBshape[0]
-            target_name, dims = "__allo_mx_linear3d__", [b, l, d, m]
-        elif len(argAshape) == 2:
-            m, k = argAshape
-            n = argBshape[0] if fn_name == "linear" else argBshape[1]
-            nb = k // mx_type.block_size
-            tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](
-                mx_type, n, nb
-            )
-            dims = [m, n, k, nb, units, tile]
-            if fn_name == "linear":  # shared GEMM with W as [N, K] (TRANS=0)
-                target_name, dims = "__allo_mx_gemm_ff__", dims + [0]
-            else:
-                target_name = "__allo_mx_matmul_ff__"
-        else:
-            raise NotImplementedError(
-                f"MX allo.{fn_name} supports 2D inputs (linear also 3D), got {argAshape}"
-            )
-        new_func = ast.Subscript(
-            value=ast.Name(id=target_name, ctx=ast.Load()),
-            slice=ast.Tuple(
-                elts=[mx_type_node] + [ast.Constant(value=d) for d in dims],
-                ctx=ast.Load(),
-            ),
-            ctx=ast.Load(),
-        )
-        ast.copy_location(new_func, node)
-        ast.fix_missing_locations(new_func)
-        node.func = new_func
-        node.args = node.args[:3] if fn_name == "linear" else node.args[:2]
-        return TypeInferer.visit_Call(ctx, node)
 
     @staticmethod
     def visit_library_op(

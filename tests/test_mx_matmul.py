@@ -1,7 +1,7 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# allo.matmul on MX (mxint8) operands, in the style of test_mxfp.py:
+# nn.mx_matmul_* on MX (mxint8) operands, in the style of test_mxfp.py:
 #   pytest tests/test_mx_matmul.py                       -> LLVM backend only
 #   python tests/test_mx_matmul.py --mode csyn           -> + Vitis HLS csynth
 #   python tests/test_mx_matmul.py --mode hw_emu --device u55c   (or u250)
@@ -17,6 +17,7 @@ import allo
 import allo.backend.hls as hls
 import allo.ir.types as T
 from allo.ir.types import float32, int8, e8m0
+import allo.library.nn as nn
 from allo.library.nn import mx_matmul
 from allo.library.mxint8 import mx_quantize, patch_extern_c_for_class_return_types
 
@@ -40,17 +41,17 @@ DEVICES = {  # --device -> (platform .xpfm, memory kind)
 def matmul_mx(
     Aq: "int8[M, K]", As: "e8m0[M, NB]", Bq: "int8[K, N]", Bs: "e8m0[NB, N]"
 ) -> "float32[M, N]":
-    return allo.matmul(Aq, As, Bq, Bs)
+    return nn.mx_matmul_q[Ty, M, N, K, NB](Aq, As, Bq, Bs)
 
 
 def matmul_mx_b(
     A: "float32[M, K]", Bq: "int8[K, N]", Bs: "e8m0[NB, N]"
 ) -> "float32[M, N]":
-    return allo.matmul(A, Bq, Bs)
+    return nn.mx_matmul_wq[Ty, M, N, K, NB](A, Bq, Bs)
 
 
 def matmul_mx_ff(A: "float32[M, K]", B: "float32[K, N]") -> "float32[M, N]":
-    return allo.matmul[Ty](A, B)
+    return nn.mx_matmul_ff[Ty, M, N, K, NB](A, B)
 
 
 def _inputs(seed):
@@ -119,7 +120,7 @@ def _run_hls(kernel, args, Z_llvm):
 
 
 @pytest.mark.parametrize("kernel", [matmul_mx, matmul_mx_b, matmul_mx_ff])
-def test_allo_matmul_mx(kernel):
+def test_mx_matmul(kernel):
     A, B = _inputs(0)
     Bq, Bs = mx_quantize(Ty, B, axis=0)  # blocks along K = B's rows
     if kernel is matmul_mx:

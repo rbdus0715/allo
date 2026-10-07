@@ -109,151 +109,155 @@ def mx_linear2d_ref[
     return Z
 
 
-def _mx_wblocks[
-    Ty, N, K, NB, Tn, TRANS
+def _mx_quantize_rows[
+    Ty, R, K, NB, TRANS
+](X: "float32[K if TRANS else R, R if TRANS else K]", Q: "Ty[R, NB]"):
+    # X is [R, K], or [K, R] when TRANS; blocks run along K either way
+    BS: ConstExpr[int32] = Ty.block_size
+    for r, b in allo.grid(R, NB):
+        blk: float32[BS]
+        for e in range(BS):
+            with allo.meta_if(TRANS):
+                blk[e] = X[b * BS + e, r]
+            with allo.meta_else():
+                blk[e] = X[r, b * BS + e]
+        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
+
+
+def _mx_pack_rows[
+    Ty, R, K, NB, TRANS
 ](
-    Q: "Int(Ty.elem_bits)[K if TRANS else N, N if TRANS else K]",
-    S: "e8m0[NB if TRANS else N, N if TRANS else NB]",
-    e: "UInt(Ty.payload_bits)[N * NB]",
-    s: "uint8[N * NB]",
+    E: "Int(Ty.elem_bits)[K if TRANS else R, R if TRANS else K]",
+    S: "e8m0[NB if TRANS else R, R if TRANS else NB]",
+    Q: "Ty[R, NB]",
 ):
-    # W is [N, K], or [K, N] when TRANS
+    # pre-quantized (elements, scales) -> packed scale | elems words
     BS: ConstExpr[int32] = Ty.block_size
     EB: ConstExpr[int32] = Ty.elem_bits
-    for tw in range(N // Tn):
-        for bw in range(NB):
-            for jw in range(Tn):
-                w: UInt(Ty.payload_bits) = 0
-                for kw in range(BS):
-                    with allo.meta_if(TRANS):
-                        w[kw * EB : (kw + 1) * EB] = Q[bw * BS + kw, tw * Tn + jw]
-                    with allo.meta_else():
-                        w[kw * EB : (kw + 1) * EB] = Q[tw * Tn + jw, bw * BS + kw]
-                e[(tw * NB + bw) * Tn + jw] = w
-                with allo.meta_if(TRANS):
-                    s[(tw * NB + bw) * Tn + jw] = S[bw, tw * Tn + jw]
-                with allo.meta_else():
-                    s[(tw * NB + bw) * Tn + jw] = S[tw * Tn + jw, bw]
+    for r, b in allo.grid(R, NB):
+        w: Ty = 0
+        for e in range(BS):
+            with allo.meta_if(TRANS):
+                w[e * EB : (e + 1) * EB] = E[b * BS + e, r]
+            with allo.meta_else():
+                w[e * EB : (e + 1) * EB] = E[r, b * BS + e]
+        with allo.meta_if(TRANS):
+            w[Ty.bits - 8 : Ty.bits] = S[b, r]
+        with allo.meta_else():
+            w[Ty.bits - 8 : Ty.bits] = S[r, b]
+        Q[r, b] = w
 
 
-def _mx_xblocks_rows[
-    Ty, M, K, NB, NT
+def _mx_dot_rows[
+    Ty, M, N, NB
+](qx: "Ty[M, NB]", qw: "Ty[N, NB]", bias: "float32[N]", Z: "float32[M, N]"):
+    # each X block is read once, in order, so qx can be a FIFO; W stays resident
+    BS: ConstExpr[int32] = Ty.block_size
+    acc: float32[N]
+    for i in range(M):
+        for j_init in range(N):
+            acc[j_init] = 0.0
+        for b in range(NB):
+            xb: Ty = qx[i, b]
+            for j in range(N):
+                acc[j] += mx_block_dot[Ty, BS](xb, qw[j, b])
+        for j_back in range(N):
+            Z[i, j_back] = acc[j_back] + bias[j_back]
+
+
+# ---- MX matrix API: Ty[R, NB] is an R x K matrix in MX blocks along K ----
+
+
+def mx_quantize[Ty, R, K](X: "float32[R, K]") -> "Ty[R, K // Ty.block_size]":
+    # float32 [R, K] -> MX matrix: one packed scale | elems word per block along K
+    Q: "Ty[R, K // Ty.block_size]"
+    _mx_quantize_rows[Ty, R, K, K // Ty.block_size, 0](X, Q)
+    return Q
+
+
+def mx_pack[
+    Ty, R, K
 ](
-    Q: "Int(Ty.elem_bits)[M, K]",
-    S: "e8m0[M, NB]",
-    e: "UInt(Ty.payload_bits)[NT * M * NB]",
-    s: "uint8[NT * M * NB]",
-):
+    E: "Int(Ty.elem_bits)[R, K]", S: "e8m0[R, K // Ty.block_size]"
+) -> "Ty[R, K // Ty.block_size]":
+    # host-quantized (elements, scales), e.g. from mxint8.mx_quantize -> MX matrix
+    Q: "Ty[R, K // Ty.block_size]"
+    _mx_pack_rows[Ty, R, K, K // Ty.block_size, 0](E, S, Q)
+    return Q
+
+
+def mx_dot[Ty, NB](x: "Ty[NB]", w: "Ty[NB]") -> float32:
+    # dot product of two MX rows: exact within each block, float32 across blocks
+    BS: ConstExpr[int32] = Ty.block_size
+    acc: float32 = 0.0
+    for b in range(NB):
+        acc += mx_block_dot[Ty, BS](x[b], w[b])
+    return acc
+
+
+def _mx_dequantize_elem[Ty](e: "UInt(Ty.elem_bits)", scale: int32) -> float32:
+    # value = mag * 2^sh, built by adjusting the exponent field of float(mag)
+    v: int32 = int(e)
+    neg: int32 = (v >> (Ty.elem_bits - 1)) & 1
+    mag: int32 = 0
+    sh: int32 = scale - 127
+    with allo.meta_if(Ty.is_float):
+        exp_field: int32 = (v >> Ty.mantissa_bits) & ((1 << Ty.exp_bits) - 1)
+        mag = v & ((1 << Ty.mantissa_bits) - 1)
+        sh = sh + 1 - Ty.bias - Ty.mantissa_bits  # subnormal: 0.m * 2^(1 - bias)
+        if exp_field != 0:  # normal: 1.m * 2^(exp_field - bias)
+            mag = mag | (1 << Ty.mantissa_bits)
+            sh = sh + exp_field - 1
+    with allo.meta_else():
+        mag = v
+        if neg == 1:  # two's complement
+            mag = (1 << Ty.elem_bits) - v
+    f: float32 = float(mag)
+    bits: int32 = f.bitcast()
+    new_exp: int32 = int(bits[23:31]) + sh
+    result_bits: int32 = 0
+    if mag != 0 and new_exp >= 255:
+        result_bits = (neg << 31) | (255 << 23)
+    elif mag != 0 and new_exp > 0:
+        result_bits = (neg << 31) | (new_exp << 23) | (bits & 0x7FFFFF)
+    return result_bits.bitcast()
+
+
+def mx_dequantize[
+    Ty, R, K
+](Q: "Ty[R, K // Ty.block_size]") -> "float32[R, K]":
+    # MX matrix -> float32 [R, K] (debugging, mixing with other precisions)
     BS: ConstExpr[int32] = Ty.block_size
     EB: ConstExpr[int32] = Ty.elem_bits
-    for tx in range(NT):
-        for ix in range(M):
-            for bx in range(NB):
-                w: UInt(Ty.payload_bits) = 0
-                for kx in range(BS):
-                    w[kx * EB : (kx + 1) * EB] = Q[ix, bx * BS + kx]
-                e[(tx * M + ix) * NB + bx] = w
-                s[(tx * M + ix) * NB + bx] = S[ix, bx]
+    X: float32[R, K]
+    for r, b in allo.grid(R, K // BS):
+        w: Ty = Q[r, b]
+        scale: int32 = int(w[Ty.bits - 8 : Ty.bits])
+        for e in range(BS):
+            el: UInt(Ty.elem_bits) = w[e * EB : (e + 1) * EB]
+            X[r, b * BS + e] = _mx_dequantize_elem[Ty](el, scale)
+    return X
 
 
-def _mx_xquant_rows[
-    Ty, M, K, NB, NT
-](X: "float32[M, K]", e: "UInt(Ty.payload_bits)[NT * M * NB]", s: "uint8[NT * M * NB]"):
-    BS: ConstExpr[int32] = Ty.block_size
-    TB: ConstExpr[int32] = Ty.bits
-    for tq in range(NT):
-        for iq in range(M):
-            for bq in range(NB):
-                blk: float32[BS]
-                for eq in range(BS):
-                    blk[eq] = X[iq, bq * BS + eq]
-                q: Ty = mx_quantize_block_f32[Ty, BS](blk)
-                e[(tq * M + iq) * NB + bq] = q[0 : Ty.payload_bits]
-                s[(tq * M + iq) * NB + bq] = q[TB - 8 : TB]
+def schedule_mx(s, id=None):
+    """Unrolls the block-level loops inside the MX primitives a kernel uses.
 
-
-def _mx_wquant[
-    Ty, N, K, NB, Tn, TRANS
-](
-    W: "float32[K if TRANS else N, N if TRANS else K]",
-    e: "UInt(Ty.payload_bits)[N * NB]",
-    s: "uint8[N * NB]",
-):
-    # W is [N, K], or [K, N] when TRANS
-    BS: ConstExpr[int32] = Ty.block_size
-    TB: ConstExpr[int32] = Ty.bits
-    for tv in range(N // Tn):
-        for bv in range(NB):
-            for jv in range(Tn):
-                blk: float32[BS]
-                for ev in range(BS):
-                    with allo.meta_if(TRANS):
-                        blk[ev] = W[bv * BS + ev, tv * Tn + jv]
-                    with allo.meta_else():
-                        blk[ev] = W[tv * Tn + jv, bv * BS + ev]
-                q: Ty = mx_quantize_block_f32[Ty, BS](blk)
-                e[(tv * NB + bv) * Tn + jv] = q[0 : Ty.payload_bits]
-                s[(tv * NB + bv) * Tn + jv] = q[TB - 8 : TB]
-
-
-def _mx_dot_df[
-    Ty, M, N, NB, P, Tn
-](
-    xe: "UInt(Ty.payload_bits)[(N // Tn) * M * NB]",
-    xs: "uint8[(N // Tn) * M * NB]",
-    we: "UInt(Ty.payload_bits)[N * NB]",
-    ws: "uint8[N * NB]",
-    bias: "float32[N]",
-    Z: "float32[M, N]",
-):
-    BS: ConstExpr[int32] = Ty.block_size
-    TB: ConstExpr[int32] = Ty.bits
-    wbe: UInt(Ty.payload_bits)[Tn, NB]
-    wbs: uint8[Tn, NB]
-    for t in range(N // Tn):
-        acc0: float32[Tn]
-        for j0 in range(Tn):
-            acc0[j0] = 0.0
-        a0: Ty = 0
-        for b0 in range(NB):
-            for jl0 in range(Tn):
-                if jl0 == 0:
-                    a0[0 : Ty.payload_bits] = xe[t * M * NB + b0]
-                    a0[TB - 8 : TB] = xs[t * M * NB + b0]
-                ew: UInt(Ty.payload_bits) = we[(t * NB + b0) * Tn + jl0]
-                sw: uint8 = ws[(t * NB + b0) * Tn + jl0]
-                with allo.meta_if(M > 1):
-                    wbe[jl0, b0] = ew
-                    wbs[jl0, b0] = sw
-                w0: Ty = 0
-                w0[0 : Ty.payload_bits] = ew
-                w0[TB - 8 : TB] = sw
-                acc0[jl0] += mx_block_dot[Ty, BS](a0, w0)
-        for jz0 in range(Tn):
-            Z[0, t * Tn + jz0] = acc0[jz0] + bias[t * Tn + jz0]
-
-        with allo.meta_if(M > 1):
-            for i in range(1, M):
-                acc: float32[Tn]
-                for ji in range(Tn):
-                    acc[ji] = 0.0
-                a: Ty = 0
-                for b in range(NB):
-                    for jj in range(Tn // P):
-                        if jj == 0:
-                            a[0 : Ty.payload_bits] = xe[(t * M + i) * NB + b]
-                            a[TB - 8 : TB] = xs[(t * M + i) * NB + b]
-                        for p in range(P):
-                            w: Ty = 0
-                            w[0 : Ty.payload_bits] = wbe[jj * P + p, b]
-                            w[TB - 8 : TB] = wbs[jj * P + p, b]
-                            acc[jj * P + p] += mx_block_dot[Ty, BS](a, w)
-                for jz in range(Tn):
-                    Z[i, t * Tn + jz] = acc[jz] + bias[t * Tn + jz]
+    Like tests/dataflow/test_mlp.py's schedule_linear: `id` names the n-th
+    instantiation (suffix "_<id>"), as in compose(..., id=...).
+    """
+    sfx = "" if id is None else f"_{id}"
+    for fn, loops in (
+        ("mx_block_dot", ("j0", "j1")),
+        ("mx_quantize_block_f32", ("i1",)),
+    ):
+        if s._find_function(fn + sfx, error=False) is not None:
+            for loop in loops:
+                s.unroll(f"{fn}{sfx}:{loop}")
+    return s
 
 
 def mx_gemm_q[
-    Ty, M, N, K, NB, P, Tn, TRANS
+    Ty, M, N, K, NB, TRANS
 ](
     Xq: "Int(Ty.elem_bits)[M, K]",
     Xs: "e8m0[M, NB]",
@@ -262,56 +266,50 @@ def mx_gemm_q[
     bias: "float32[N]",
 ) -> "float32[M, N]":
     # Z = X @ W.T + bias (W is [N, K]), or X @ W + bias when TRANS (W is [K, N])
-    we: UInt(Ty.payload_bits)[N * NB]
-    ws: uint8[N * NB]
-    xe: UInt(Ty.payload_bits)[(N // Tn) * M * NB]
-    xs: uint8[(N // Tn) * M * NB]
-    _mx_wblocks[Ty, N, K, NB, Tn, TRANS](Wq, Ws, we, ws)
-    _mx_xblocks_rows[Ty, M, K, NB, N // Tn](Xq, Xs, xe, xs)
+    qx: Ty[M, NB]
+    qw: Ty[N, NB]
+    _mx_pack_rows[Ty, M, K, NB, 0](Xq, Xs, qx)
+    _mx_pack_rows[Ty, N, K, NB, TRANS](Wq, Ws, qw)
     Z: float32[M, N]
-    _mx_dot_df[Ty, M, N, NB, P, Tn](xe, xs, we, ws, bias, Z)
+    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
     return Z
 
 
 def mx_gemm_wq[
-    Ty, M, N, K, NB, P, Tn, TRANS
+    Ty, M, N, K, NB, TRANS
 ](
     X: "float32[M, K]",
     Wq: "Int(Ty.elem_bits)[K if TRANS else N, N if TRANS else K]",
     Ws: "e8m0[NB if TRANS else N, N if TRANS else NB]",
     bias: "float32[N]",
 ) -> "float32[M, N]":
-    we: UInt(Ty.payload_bits)[N * NB]
-    ws: uint8[N * NB]
-    xe: UInt(Ty.payload_bits)[(N // Tn) * M * NB]
-    xs: uint8[(N // Tn) * M * NB]
-    _mx_wblocks[Ty, N, K, NB, Tn, TRANS](Wq, Ws, we, ws)
-    _mx_xquant_rows[Ty, M, K, NB, N // Tn](X, xe, xs)
+    qx: Ty[M, NB]
+    qw: Ty[N, NB]
+    _mx_quantize_rows[Ty, M, K, NB, 0](X, qx)
+    _mx_pack_rows[Ty, N, K, NB, TRANS](Wq, Ws, qw)
     Z: float32[M, N]
-    _mx_dot_df[Ty, M, N, NB, P, Tn](xe, xs, we, ws, bias, Z)
+    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
     return Z
 
 
 def mx_gemm_ff[
-    Ty, M, N, K, NB, P, Tn, TRANS
+    Ty, M, N, K, NB, TRANS
 ](
     X: "float32[M, K]",
     W: "float32[K if TRANS else N, N if TRANS else K]",
     bias: "float32[N]",
 ) -> "float32[M, N]":
-    we: UInt(Ty.payload_bits)[N * NB]
-    ws: uint8[N * NB]
-    xe: UInt(Ty.payload_bits)[(N // Tn) * M * NB]
-    xs: uint8[(N // Tn) * M * NB]
-    _mx_wquant[Ty, N, K, NB, Tn, TRANS](W, we, ws)
-    _mx_xquant_rows[Ty, M, K, NB, N // Tn](X, xe, xs)
+    qx: Ty[M, NB]
+    qw: Ty[N, NB]
+    _mx_quantize_rows[Ty, M, K, NB, 0](X, qx)
+    _mx_quantize_rows[Ty, N, K, NB, TRANS](W, qw)
     Z: float32[M, N]
-    _mx_dot_df[Ty, M, N, NB, P, Tn](xe, xs, we, ws, bias, Z)
+    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
     return Z
 
 
 def mx_matmul_q[
-    Ty, M, N, K, NB, P, Tn
+    Ty, M, N, K, NB
 ](
     Aq: "Int(Ty.elem_bits)[M, K]",
     As: "e8m0[M, NB]",
@@ -319,67 +317,36 @@ def mx_matmul_q[
     Bs: "e8m0[NB, N]",
 ) -> "float32[M, N]":
     zero: float32[N] = 0.0
-    return mx_gemm_q[Ty, M, N, K, NB, P, Tn, 1](Aq, As, Bq, Bs, zero)
+    return mx_gemm_q[Ty, M, N, K, NB, 1](Aq, As, Bq, Bs, zero)
 
 
 def mx_matmul_wq[
-    Ty, M, N, K, NB, P, Tn
+    Ty, M, N, K, NB
 ](
     A: "float32[M, K]", Bq: "Int(Ty.elem_bits)[K, N]", Bs: "e8m0[NB, N]"
 ) -> "float32[M, N]":
     zero: float32[N] = 0.0
-    return mx_gemm_wq[Ty, M, N, K, NB, P, Tn, 1](A, Bq, Bs, zero)
+    return mx_gemm_wq[Ty, M, N, K, NB, 1](A, Bq, Bs, zero)
 
 
 def mx_matmul_ff[
-    Ty, M, N, K, NB, P, Tn
+    Ty, M, N, K, NB
 ](A: "float32[M, K]", B: "float32[K, N]") -> "float32[M, N]":
     zero: float32[N] = 0.0
-    return mx_gemm_ff[Ty, M, N, K, NB, P, Tn, 1](A, B, zero)
-
-
-_MX_GEMM_PRODUCERS = {  # mode -> (producer, loop to pipeline, loop to unroll)
-    "q": (("_mx_wblocks", "jw", "kw"), ("_mx_xblocks_rows", "bx", "kx")),
-    "wq": (("_mx_wblocks", "jw", "kw"), ("_mx_xquant_rows", "bq", "eq")),
-    "ff": (("_mx_wquant", "jv", "ev"), ("_mx_xquant_rows", "bq", "eq")),
-}
+    return mx_gemm_ff[Ty, M, N, K, NB, 1](A, B, zero)
 
 
 def schedule_mx_gemm(s, depth=16):
-    """Streams the MX GEMM producers into the block-dot stage (HLS dataflow)."""
-    mode = s.top_func_name.rsplit("_", 1)[1]
+    """Streams the quantized X blocks into the block dot (HLS dataflow)."""
+    mode = s.top_func_name.rsplit("_", 1)[1]  # q / wq / ff
     gemm = f"mx_gemm_{mode}"  # also the callee of mx_matmul_{mode}
-    for buf in ("we", "ws", "xe", "xs"):
-        s.to(MockBuffer(gemm, buf), "_mx_dot_df", depth=depth)
+    schedule_mx_block_dot(s)
+    if mode != "q":  # mx_gemm_q takes pre-quantized operands
+        schedule_mx_quantize_block_f32(s)
+    s.pipeline("_mx_dot_rows:j")
+    s.to(MockBuffer(gemm, "qx"), "_mx_dot_rows", depth=depth)
     s.dataflow(gemm)
-    for producer, pipe, unroll in _MX_GEMM_PRODUCERS[mode]:
-        s.pipeline(f"{producer}:{pipe}")
-        s.unroll(f"{producer}:{unroll}")
-    s.pipeline("_mx_dot_df:jl0")
-    if s.inst_list[1] > 1:  # rows 1..M-1 exist only when M > 1
-        s.pipeline("_mx_dot_df:jj")
-        s.unroll("_mx_dot_df:p")
     return s
-
-
-def mx_pick_tile_units(Ty, N, NB, budget_bytes=4 * 2**20):
-    """Weight tile Tn and block-dot unit count P for the MX dataflow."""
-    block_bytes = (Ty.bits + 7) // 8  # one packed scale | elems word
-    tn = max(
-        t
-        for t in range(1, N + 1)
-        if N % t == 0 and t * NB * block_bytes <= budget_bytes
-    )
-    units = next((p for p in (8, 4, 2) if tn % p == 0 and tn // p >= 8), 1)
-    return tn, units
-
-
-def mx_auto_tn(Ty, N, NB):
-    return mx_pick_tile_units(Ty, N, NB)[0]
-
-
-def mx_auto_p(Ty, N, NB):
-    return mx_pick_tile_units(Ty, N, NB)[1]
 
 
 def mx_linear2d[
@@ -387,9 +354,7 @@ def mx_linear2d[
 ](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
     # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
     _mx_nb: ConstExpr[int32] = K // Ty.block_size
-    _mx_tn: ConstExpr[int32] = mx_auto_tn(Ty, N, K // Ty.block_size)
-    _mx_p: ConstExpr[int32] = mx_auto_p(Ty, N, K // Ty.block_size)
-    return mx_gemm_ff[Ty, M, N, K, _mx_nb, _mx_p, _mx_tn, 0](X, W, bias)
+    return mx_gemm_ff[Ty, M, N, K, _mx_nb, 0](X, W, bias)
 
 
 def schedule_mx_linear2d(s):
@@ -417,6 +382,44 @@ def schedule_mx_linear3d(s):
     schedule_mx_linear2d(s)
     s.pipeline("mx_linear3d:k")
     s.pipeline("mx_linear3d:j")
+    return s
+
+
+def mx_conv2d[
+    Ty, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
+](
+    inp: "float32[B, Cin, H, W]",
+    kernel: "float32[Cout, Cin, Kh, Kw]",
+    bias: "float32[Cout]",
+) -> "float32[B, Cout, Oh, Ow]":
+    # nn.conv2d with MX arithmetic: each im2col patch dotted with the flat kernel;
+    # Cin * Kh * Kw is zero-padded up to a whole number of blocks
+    NBc: ConstExpr[int32] = (Cin * Kh * Kw + Ty.block_size - 1) // Ty.block_size
+    CKK: ConstExpr[int32] = NBc * Ty.block_size
+    kflat: float32[Cout, CKK] = 0.0
+    for fo, fc, fh, fw in allo.grid(Cout, Cin, Kh, Kw):
+        kflat[fo, (fc * Kh + fh) * Kw + fw] = kernel[fo, fc, fh, fw]
+    qw: Ty[Cout, NBc]
+    _mx_quantize_rows[Ty, Cout, CKK, NBc, 0](kflat, qw)
+
+    Z: float32[B, Cout, Oh, Ow]
+    for batch, oh, ow in allo.grid(B, Oh, Ow):
+        patch: float32[1, CKK] = 0.0
+        for cin, kh, kw in allo.grid(Cin, Kh, Kw):
+            h_pos: int32 = oh * Sh + kh - Pd0
+            w_pos: int32 = ow * Sw + kw - Pd1
+            if h_pos >= 0 and h_pos < H and w_pos >= 0 and w_pos < W:
+                patch[0, (cin * Kh + kh) * Kw + kw] = inp[batch, cin, h_pos, w_pos]
+        qp: Ty[1, NBc]
+        _mx_quantize_rows[Ty, 1, CKK, NBc, 0](patch, qp)
+        for cout in range(Cout):
+            Z[batch, cout, oh, ow] = mx_dot[Ty, NBc](qp[0], qw[cout]) + bias[cout]
+    return Z
+
+
+def schedule_mx_conv2d(s):
+    schedule_mx(s)
+    s.pipeline("mx_conv2d:cout")
     return s
 
 
@@ -626,149 +629,6 @@ def make_mx_linear2d_dataflow(Ty, M, N, K, P, depth=4):
     s.unroll("dot_product_stage_0:ka")
     s.unroll("dot_product_stage_0:p")
     s.pipeline("dot_product_stage_0:jj")
-    return s
-
-
-def mx_pick_tile(Ty, N, K, P, budget_bytes=4 * 2**20):
-    """Largest weight tile Tn that fits the on-chip budget."""
-    lane_bytes = (max(Ty.elem_bits, Ty.scale_bits) + 7) // 8  # b_buf lane
-    blk_bytes = (K // Ty.block_size) * (Ty.block_size + 1) * lane_bytes
-    fits = [
-        t for t in range(P, N + 1, P) if N % t == 0 and t * blk_bytes <= budget_bytes
-    ]
-    assert fits, f"no tile of N={N} (multiple of P={P}) fits {budget_bytes} bytes"
-    return max(fits)
-
-
-def make_mx_linear2d_dataflow_prequant(Ty, M, N, K, P, Tn=None, depth=4):
-    """make_mx_linear2d_dataflow with W pre-quantized and tiled."""
-    import allo.dataflow as df
-
-    BS = Ty.block_size
-    NB = K // BS
-    LB, FPW, WPB = _mx_df_widths(Ty)
-    Tn = N if Tn is None else Tn
-    assert K % BS == 0, f"K={K} must be a multiple of block_size={BS}"
-    assert N % Tn == 0, f"N={N} must be a multiple of Tn={Tn}"
-    assert Tn % P == 0, f"Tn={Tn} must be a multiple of P={P}"
-    NT = N // Tn  # weight tiles
-    NJT = Tn // P  # P-wide column groups per tile
-    FW = WPB * NB  # 512-bit words per float32 row
-
-    @df.region()
-    def top(
-        X: "UInt(512)[M * FW]",
-        W_q: "UInt(Ty.payload_bits)[N * NB]",
-        W_s: "uint8[N * NB]",
-        bias: "float32[N]",
-        Z: "float32[M * N]",
-    ):
-        pipe_a_q: Stream["UInt(LB)[BS + 1]", depth]
-        pipe_b_q: Stream["UInt(LB)[BS + 1]", depth]
-
-        @df.kernel(mapping=[1], args=[X])
-        def quantize_a(local_X: "UInt(512)[M * FW]"):
-            for tq in range(NT):  # X is re-streamed once per weight tile
-                for ta in range(M * NB):  # every block of every X row
-                    blk: float32[BS]
-                    for ha in range(WPB):
-                        fword: UInt(512) = local_X[ta * WPB + ha]
-                        for ea in range(FPW):
-                            bits: int32 = fword[ea * 32 : (ea + 1) * 32]
-                            blk[ha * FPW + ea] = bits.bitcast()
-                    word: Ty = mx_quantize_block_f32[Ty, BS](blk)
-                    bundle: UInt(LB)[BS + 1]
-                    bundle[0] = word[Ty.bits - 8 : Ty.bits]
-                    for ka in range(BS):
-                        bundle[ka + 1] = word[
-                            ka * Ty.elem_bits : (ka + 1) * Ty.elem_bits
-                        ]
-                    pipe_a_q.put(bundle)
-
-        @df.kernel(mapping=[1], args=[W_q, W_s])
-        def load_w(
-            local_Wq: "UInt(Ty.payload_bits)[N * NB]", local_Ws: "uint8[N * NB]"
-        ):
-            for tw in range(N * NB):
-                qword: UInt(Ty.payload_bits) = local_Wq[tw]
-                bundle: UInt(LB)[BS + 1]
-                bundle[0] = local_Ws[tw]
-                for kw in range(BS):
-                    bundle[kw + 1] = qword[kw * Ty.elem_bits : (kw + 1) * Ty.elem_bits]
-                pipe_b_q.put(bundle)
-
-        @df.kernel(mapping=[1], args=[bias, Z])
-        def dot_product_stage(local_bias: "float32[N]", local_Z: "float32[M * N]"):
-            b_buf: UInt(LB)[Tn, NB, BS + 1]
-            for t in range(NT):  # weight tile t: output columns t*Tn .. t*Tn+Tn-1
-                acc0: float32[Tn]
-                for j0 in range(Tn):
-                    acc0[j0] = 0.0
-                word_a0: Ty = 0
-                for b0 in range(NB):  # K-direction block b0
-                    for jl0 in range(Tn):  # tile column jl0 (II=1)
-                        if jl0 == 0:
-                            a_blk0: UInt(LB)[BS + 1] = pipe_a_q.get()
-                            block_a0: UInt(Ty.elem_bits)[BS]
-                            for ka0 in range(BS):
-                                block_a0[ka0] = a_blk0[ka0 + 1]
-                            word_a0 = _mx_pack_word[Ty, BS](a_blk0[0], block_a0)
-                        b_blk: UInt(LB)[BS + 1] = pipe_b_q.get()
-                        with allo.meta_if(M > 1):
-                            for kd in range(BS + 1):
-                                b_buf[jl0, b0, kd] = b_blk[kd]
-                        block_b0: UInt(Ty.elem_bits)[BS]
-                        for k0 in range(BS):
-                            block_b0[k0] = b_blk[k0 + 1]
-                        word_b0: Ty = _mx_pack_word[Ty, BS](b_blk[0], block_b0)
-                        acc0[jl0] += mx_block_dot[Ty, BS](word_a0, word_b0)
-                for jz0 in range(Tn):  # tile column jz0 of output row 0
-                    local_Z[t * Tn + jz0] = acc0[jz0] + local_bias[t * Tn + jz0]
-
-                with allo.meta_if(M > 1):
-                    for i in range(1, M):  # X row i
-                        acc: float32[Tn]
-                        for ji in range(Tn):
-                            acc[ji] = 0.0
-                        word_a: Ty = 0
-                        for b in range(NB):  # K-direction block b
-                            for jj in range(NJT):  # P-wide column group jj
-                                if jj == 0:
-                                    a_blk: UInt(LB)[BS + 1] = pipe_a_q.get()
-                                    block_a: UInt(Ty.elem_bits)[BS]
-                                    for ka in range(BS):
-                                        block_a[ka] = a_blk[ka + 1]
-                                    word_a = _mx_pack_word[Ty, BS](a_blk[0], block_a)
-                                for p in range(P):  # unit p -> column jj*P+p
-                                    j: int32 = jj * P + p
-                                    scale_b: uint8 = b_buf[j, b, 0]
-                                    block_b: UInt(Ty.elem_bits)[BS]
-                                    for k in range(BS):
-                                        block_b[k] = b_buf[j, b, k + 1]
-                                    word_b: Ty = _mx_pack_word[Ty, BS](scale_b, block_b)
-                                    acc[j] += mx_block_dot[Ty, BS](word_a, word_b)
-                        for jz in range(Tn):  # tile column jz of output row i
-                            local_Z[i * N + t * Tn + jz] = (
-                                acc[jz] + local_bias[t * Tn + jz]
-                            )
-
-    s = df.customize(top, opt_default=False)
-    schedule_mx_quantize_block_f32(s)
-    schedule_mx_block_dot(s)
-    s.pipeline("quantize_a_0:ta")
-    s.unroll("quantize_a_0:ha")
-    s.unroll("quantize_a_0:ea")
-    s.unroll("quantize_a_0:ka")
-    s.pipeline("load_w_0:tw")
-    s.unroll("load_w_0:kw")
-    s.unroll("dot_product_stage_0:k0")
-    s.unroll("dot_product_stage_0:ka0")
-    s.pipeline("dot_product_stage_0:jl0")
-    if M > 1:  # these loops only exist then (meta_if above)
-        s.unroll("dot_product_stage_0:k")
-        s.unroll("dot_product_stage_0:ka")
-        s.unroll("dot_product_stage_0:p")
-        s.pipeline("dot_product_stage_0:jj")
     return s
 
 

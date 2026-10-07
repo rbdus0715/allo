@@ -72,22 +72,15 @@ from .library import KERNEL2SCHEDULE
 from .library.systolic import check_systolic, prepare_systolic
 from .library.nn import (
     mx_linear2d,
-    mx_linear3d,
     mx_matmul,
     mx_gemm_q,
     mx_gemm_wq,
     mx_gemm_ff,
-    mx_matmul_q,
-    mx_matmul_wq,
-    mx_matmul_ff,
-    _mx_wblocks,
-    _mx_xblocks_rows,
-    _mx_xquant_rows,
-    _mx_wquant,
-    _mx_dot_df,
-    mx_pick_tile_units,
-    mx_auto_tn,
-    mx_auto_p,
+    _mx_quantize_rows,
+    _mx_pack_rows,
+    _mx_dot_rows,
+    _mx_dequantize_elem,
+    mx_dot,
 )
 from .ir import types as _mx_types
 from .library.mxint8 import (
@@ -1297,6 +1290,11 @@ class Schedule:
                         kwargs["target"] = get_name(kwargs["target"])
                     else:
                         args[0] = get_name(args[0])
+                # `to`'s destination may name a function, renamed like the target
+                if primitive[0] == "to" and len(args) > 1 and isinstance(args[1], str):
+                    dst = get_name(f"{args[1]}:").split(":")[0]
+                    if self._find_function(dst, error=False) is not None:
+                        args[1] = dst
                 with self.module.context, Location.unknown():
                     primitive_func = getattr(self, primitive[0])
                     # directly apply primitives to new functions
@@ -1396,23 +1394,15 @@ def customize(
         instantiate = []
     if global_vars is None:
         global_vars = get_global_vars(fn)
-    global_vars.setdefault("__allo_mx_linear2d__", mx_linear2d)
-    global_vars.setdefault("__allo_mx_linear3d__", mx_linear3d)
-    for _suffix, _fn in (("q", mx_gemm_q), ("wq", mx_gemm_wq), ("ff", mx_gemm_ff)):
-        global_vars.setdefault(f"__allo_mx_gemm_{_suffix}__", _fn)
-        global_vars.setdefault(_fn.__name__, _fn)  # called from mx_matmul_*
-    global_vars.setdefault("__allo_mx_matmul_q__", mx_matmul_q)
-    global_vars.setdefault("__allo_mx_matmul_wq__", mx_matmul_wq)
-    global_vars.setdefault("__allo_mx_matmul_ff__", mx_matmul_ff)
-    global_vars.setdefault("_mx_wblocks", _mx_wblocks)
-    global_vars.setdefault("_mx_xblocks_rows", _mx_xblocks_rows)
-    global_vars.setdefault("_mx_xquant_rows", _mx_xquant_rows)
-    global_vars.setdefault("_mx_dot_df", _mx_dot_df)
-    global_vars.setdefault("_mx_wquant", _mx_wquant)
-    global_vars.setdefault("__allo_mx_pick_tile_units__", mx_pick_tile_units)
+    # MX library internals, visible to nn.mx_* bodies called from user kernels
+    for _fn in (mx_gemm_q, mx_gemm_wq, mx_gemm_ff):
+        global_vars.setdefault(_fn.__name__, _fn)
+    global_vars.setdefault("_mx_quantize_rows", _mx_quantize_rows)
+    global_vars.setdefault("_mx_pack_rows", _mx_pack_rows)
+    global_vars.setdefault("_mx_dot_rows", _mx_dot_rows)
+    global_vars.setdefault("_mx_dequantize_elem", _mx_dequantize_elem)
+    global_vars.setdefault("mx_dot", mx_dot)  # called from mx_conv2d
     global_vars.setdefault("mx_linear2d", mx_linear2d)
-    global_vars.setdefault("mx_auto_tn", mx_auto_tn)
-    global_vars.setdefault("mx_auto_p", mx_auto_p)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
     global_vars.setdefault("mx_matmul", mx_matmul)
     global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)

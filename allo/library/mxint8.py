@@ -167,40 +167,6 @@ def mx_quantize(Ty, x, axis=-1):
     return elems.reshape(x.shape), scales
 
 
-def mx_pack_elems(Ty, elems):
-    """Bit-packs [..., block_size] MX elements into payload_bits-wide words."""
-    import numpy as np  # pylint: disable=import-outside-toplevel
-
-    from ..utils import get_np_struct_type  # pylint: disable=import-outside-toplevel
-
-    PB = Ty.payload_bits
-    word_bits = max(8, 1 << (PB - 1).bit_length())  # LLVM pads iN to a power of 2
-    elems = np.asarray(elems, dtype=np.int64)
-    lanes = (elems[..., None] >> np.arange(Ty.elem_bits)) & 1  # two's complement bits
-    lanes = lanes.reshape(-1, PB).astype(np.uint8)
-    lanes = np.pad(lanes, ((0, 0), (0, word_bits - PB)))
-    raw = np.packbits(lanes, axis=-1, bitorder="little")
-    if word_bits <= 64:
-        return raw.view(np.dtype(f"uint{word_bits}")).reshape(-1)
-    return raw.view(get_np_struct_type(word_bits)).reshape(-1)
-
-
-def mx_quantize_weights(Ty, W, Tn=None):
-    """Quantizes a [N, K] weight into tile-ordered MX elements and scales."""
-    import numpy as np  # pylint: disable=import-outside-toplevel
-
-    elems, scales = _mx_quantize_np(Ty, W)
-    N, NB, BS = elems.shape
-    Tn = N if Tn is None else Tn
-    assert N % Tn == 0, f"N={N} must be a multiple of Tn={Tn}"
-    elems = elems.reshape(N // Tn, Tn, NB, BS)
-    scales = scales.reshape(N // Tn, Tn, NB)
-    return (
-        np.ascontiguousarray(elems.transpose(0, 2, 1, 3)),
-        np.ascontiguousarray(scales.transpose(0, 2, 1)),
-    )
-
-
 def _mx_scale_to_float32(scale: uint8) -> float32:
     bits: int32 = int(scale) << 23
     return bits.bitcast()
