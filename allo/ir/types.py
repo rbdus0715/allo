@@ -271,8 +271,8 @@ class MXScaledType(AlloType):
         self.elem_bits = elem_bits
         self.block_size = block_size
         self.scale_bits = self.SCALE_BITS
-        total_bits = self.scale_bits + block_size * elem_bits
-        super().__init__(total_bits, 0, name)
+        self.payload_bits = block_size * elem_bits  # elements only, below the scale
+        super().__init__(self.scale_bits + self.payload_bits, 0, name)
 
     def build(self):
         return IntegerType.get_signless(self.bits)
@@ -328,6 +328,10 @@ class MXInt(MXScaledType):
     @property
     def max_unbiased_exp(self):
         return self.elem_bits - 2
+
+    @property
+    def max_int(self):
+        return 2 ** (self.elem_bits - 1) - 1  # symmetric clip: [-max_int, max_int]
 
     @property
     def block_accum_bits(self):

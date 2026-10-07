@@ -24,10 +24,10 @@ def _mx_quantize_elem_int_f32[
     rounded: Int(Ty.elem_bits) = mag
     if sign == 1:
         rounded = -mag
-    if rounded > 127:
-        rounded = 127
-    if rounded < -127:
-        rounded = -127
+    if rounded > Ty.max_int:
+        rounded = Ty.max_int
+    if rounded < -Ty.max_int:
+        rounded = -Ty.max_int
     return rounded
 
 
@@ -84,7 +84,7 @@ def _mx_quantize_np(Ty, x):
     """numpy MX quantization of a [R, K] array, bit-exact with the hardware quantizer."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
-    assert not Ty.is_float and Ty.elem_bits == 8, f"unsupported MX type {Ty}"
+    assert not Ty.is_float, f"unsupported MX type {Ty}"
     x = np.ascontiguousarray(x, dtype=np.float32)
     R, K = x.shape
     BS = Ty.block_size
@@ -96,13 +96,14 @@ def _mx_quantize_np(Ty, x):
     full_mant = (bits & 0x7FFFFF) | (1 << 23)
     total_shift = (23 - Ty.max_unbiased_exp) + max_exp - exp_field
     mag = np.where(total_shift < 24, full_mant >> np.minimum(total_shift, 63), 0)
-    elems = np.clip(np.where(bits >> 31, -mag, mag), -127, 127)
+    elems = np.clip(np.where(bits >> 31, -mag, mag), -Ty.max_int, Ty.max_int)
     scales = np.clip(max_exp[..., 0] - Ty.max_unbiased_exp, 0, 254)
-    return (elems & 0xFF).astype(np.uint8), scales.astype(np.uint8)
+    elem_dtype = np.dtype(f"int{max(8, 1 << (Ty.elem_bits - 1).bit_length())}")
+    return elems.astype(elem_dtype), scales.astype(np.uint8)
 
 
 def mx_quantize(Ty, x, axis=-1):
-    """Quantizes a 2D array into an MX operand (int8 elements, e8m0 scales)."""
+    """Quantizes a 2D array into an MX operand (signed elements, e8m0 scales)."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     x = np.asarray(x, dtype=np.float32)
@@ -111,11 +112,29 @@ def mx_quantize(Ty, x, axis=-1):
         elems, scales = mx_quantize(Ty, x.T)
         return np.ascontiguousarray(elems.T), np.ascontiguousarray(scales.T)
     elems, scales = _mx_quantize_np(Ty, x)
-    return elems.reshape(x.shape).view(np.int8), scales
+    return elems.reshape(x.shape), scales
+
+
+def mx_pack_elems(Ty, elems):
+    """Bit-packs [..., block_size] MX elements into payload_bits-wide words."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    from ..utils import get_np_struct_type  # pylint: disable=import-outside-toplevel
+
+    PB = Ty.payload_bits
+    word_bits = max(8, 1 << (PB - 1).bit_length())  # LLVM pads iN to a power of 2
+    elems = np.asarray(elems, dtype=np.int64)
+    lanes = (elems[..., None] >> np.arange(Ty.elem_bits)) & 1  # two's complement bits
+    lanes = lanes.reshape(-1, PB).astype(np.uint8)
+    lanes = np.pad(lanes, ((0, 0), (0, word_bits - PB)))
+    raw = np.packbits(lanes, axis=-1, bitorder="little")
+    if word_bits <= 64:
+        return raw.view(np.dtype(f"uint{word_bits}")).reshape(-1)
+    return raw.view(get_np_struct_type(word_bits)).reshape(-1)
 
 
 def mx_quantize_weights(Ty, W, Tn=None):
-    """Quantizes a [N, K] weight into tile-ordered MX words and scales."""
+    """Quantizes a [N, K] weight into tile-ordered MX elements and scales."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     elems, scales = _mx_quantize_np(Ty, W)
@@ -135,7 +154,7 @@ def _mx_scale_to_float32(scale: uint8) -> float32:
     return bits.bitcast()
 
 
-def _mx_pack_word[Ty, K](scale: uint8, elems: "uint8[K]") -> "Ty":
+def _mx_pack_word[Ty, K](scale: uint8, elems: "UInt(Ty.elem_bits)[K]") -> "Ty":
     word: Ty = 0
     word[Ty.bits - 8 : Ty.bits] = scale
     for i in range(K):
@@ -226,6 +245,8 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     N = K * NB
     WORD_BITS = 512
     HALF = WORD_BITS // 32  # float32 elements per 512b half
+    assert K == 2 * HALF, f"block_size={K}: A0/A1 hold exactly {HALF} floats each"
+    LB = max(Ty.elem_bits, Ty.scale_bits)  # bundle lane: one element or the scale
 
     @df.region()
     def top(
@@ -237,8 +258,8 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
     ):
         pipe_a_raw: Stream[float32[K], depth]
         pipe_b_raw: Stream[float32[K], depth]
-        pipe_a_q: Stream["uint8[K + 1]", depth]
-        pipe_b_q: Stream["uint8[K + 1]", depth]
+        pipe_a_q: Stream["UInt(LB)[K + 1]", depth]
+        pipe_b_q: Stream["UInt(LB)[K + 1]", depth]
 
         @df.kernel(mapping=[1], args=[A0, A1])
         def read_a(local_A0: "UInt(WORD_BITS)[NB]", local_A1: "UInt(WORD_BITS)[NB]"):
@@ -273,7 +294,7 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
             for b in range(NB):
                 blk_a: float32[K] = pipe_a_raw.get()
                 word_a: Ty = mx_quantize_block_f32[Ty, K](blk_a)
-                bundle_a: uint8[K + 1]
+                bundle_a: UInt(LB)[K + 1]
                 bundle_a[0] = word_a[Ty.bits - 8 : Ty.bits]
                 for k in range(K):
                     bundle_a[k + 1] = word_a[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
@@ -281,7 +302,7 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
 
                 blk_b: float32[K] = pipe_b_raw.get()
                 word_b: Ty = mx_quantize_block_f32[Ty, K](blk_b)
-                bundle_b: uint8[K + 1]
+                bundle_b: UInt(LB)[K + 1]
                 bundle_b[0] = word_b[Ty.bits - 8 : Ty.bits]
                 for k in range(K):
                     bundle_b[k + 1] = word_b[k * Ty.elem_bits : (k + 1) * Ty.elem_bits]
@@ -295,12 +316,12 @@ def make_mx_dot_general_dataflow(Ty, K, NB, P, depth=4):
 
             for i in range(NB // P):
                 for j in range(P):
-                    bundle_a: uint8[K + 1] = pipe_a_q.get()
-                    bundle_b: uint8[K + 1] = pipe_b_q.get()
+                    bundle_a: UInt(LB)[K + 1] = pipe_a_q.get()
+                    bundle_b: UInt(LB)[K + 1] = pipe_b_q.get()
                     scale_a: uint8 = bundle_a[0]
                     scale_b: uint8 = bundle_b[0]
-                    block_a: uint8[K]
-                    block_b: uint8[K]
+                    block_a: UInt(Ty.elem_bits)[K]
+                    block_b: UInt(Ty.elem_bits)[K]
                     for k in range(K):
                         block_a[k] = bundle_a[k + 1]
                         block_b[k] = bundle_b[k + 1]

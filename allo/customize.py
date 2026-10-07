@@ -74,23 +74,20 @@ from .library.nn import (
     mx_linear2d,
     mx_linear3d,
     mx_matmul,
-    mx_linear2d_q,
-    mx_linear2d_wq,
+    mx_gemm_q,
+    mx_gemm_wq,
+    mx_gemm_ff,
     mx_matmul_q,
     mx_matmul_wq,
-    _mx_wblocks_rows,
-    _mx_wblocks_cols,
+    mx_matmul_ff,
+    _mx_wblocks,
     _mx_xblocks_rows,
     _mx_xquant_rows,
-    _mx_wquant_rows,
-    _mx_wquant_cols,
+    _mx_wquant,
     _mx_dot_df,
-    mx_linear2d_ff,
-    mx_matmul_ff,
     mx_pick_tile_units,
     mx_auto_tn,
     mx_auto_p,
-    schedule_mx_dataflow,
 )
 from .ir import types as _mx_types
 from .library.mxint8 import (
@@ -1263,6 +1260,8 @@ class Schedule:
                 # Update axes
                 if primitive[0] in {"reorder", "fuse"}:
                     args = [get_name(arg) for arg in args]
+                elif primitive[0] == "dataflow" and isinstance(args[0], str):
+                    args[0] = get_name(f"{args[0]}:").split(":")[0]
                 elif primitive[0] in {
                     "split",
                     "unroll",
@@ -1342,9 +1341,6 @@ class Schedule:
             "ihls",
             "catapult",
         }:
-            if not getattr(self, "_mx_dataflow_applied", False):
-                schedule_mx_dataflow(self)
-                self._mx_dataflow_applied = True
             match target:
                 case "vitis_hls":
                     platform = "vitis_hls"
@@ -1400,28 +1396,22 @@ def customize(
         global_vars = get_global_vars(fn)
     global_vars.setdefault("__allo_mx_linear2d__", mx_linear2d)
     global_vars.setdefault("__allo_mx_linear3d__", mx_linear3d)
-    global_vars.setdefault("__allo_mx_linear2d_q__", mx_linear2d_q)
-    global_vars.setdefault("__allo_mx_linear2d_wq__", mx_linear2d_wq)
+    for _suffix, _fn in (("q", mx_gemm_q), ("wq", mx_gemm_wq), ("ff", mx_gemm_ff)):
+        global_vars.setdefault(f"__allo_mx_gemm_{_suffix}__", _fn)
+        global_vars.setdefault(_fn.__name__, _fn)  # called from mx_matmul_*
     global_vars.setdefault("__allo_mx_matmul_q__", mx_matmul_q)
     global_vars.setdefault("__allo_mx_matmul_wq__", mx_matmul_wq)
-    global_vars.setdefault("_mx_wblocks_rows", _mx_wblocks_rows)
-    global_vars.setdefault("_mx_wblocks_cols", _mx_wblocks_cols)
+    global_vars.setdefault("__allo_mx_matmul_ff__", mx_matmul_ff)
+    global_vars.setdefault("_mx_wblocks", _mx_wblocks)
     global_vars.setdefault("_mx_xblocks_rows", _mx_xblocks_rows)
     global_vars.setdefault("_mx_xquant_rows", _mx_xquant_rows)
     global_vars.setdefault("_mx_dot_df", _mx_dot_df)
-    global_vars.setdefault("_mx_wquant_rows", _mx_wquant_rows)
-    global_vars.setdefault("_mx_wquant_cols", _mx_wquant_cols)
-    global_vars.setdefault("__allo_mx_linear2d_ff__", mx_linear2d_ff)
-    global_vars.setdefault("__allo_mx_matmul_ff__", mx_matmul_ff)
+    global_vars.setdefault("_mx_wquant", _mx_wquant)
     global_vars.setdefault("__allo_mx_pick_tile_units__", mx_pick_tile_units)
     global_vars.setdefault("mx_linear2d", mx_linear2d)
-    global_vars.setdefault("mx_linear2d_ff", mx_linear2d_ff)
     global_vars.setdefault("mx_auto_tn", mx_auto_tn)
     global_vars.setdefault("mx_auto_p", mx_auto_p)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
-    for _name, _obj in vars(_mx_types).items():
-        if isinstance(_obj, _mx_types.MXScaledType):
-            global_vars.setdefault(f"__allo_mx_type_{_obj.name}__", _obj)
     global_vars.setdefault("mx_matmul", mx_matmul)
     global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
     global_vars.setdefault("mx_block_dot", mx_block_dot)

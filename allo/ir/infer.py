@@ -19,6 +19,7 @@ from .types import (
     UFixed,
     Index,
     MXScaledType,
+    MXInt,
     E8M0,
     uint1,
     int4,
@@ -1335,28 +1336,22 @@ class TypeInferer(ASTVisitor):
         m = new_args[0].shape[0]
         assert k % nb == 0, f"K={k} is not a whole number of {nb} blocks"
         block = k // nb
-        type_name = next(
-            (
-                name
-                for name, t in ctx.global_vars.items()
-                if name.startswith("__allo_mx_type_")
-                and not t.is_float
-                and t.elem_bits == wq.dtype.bits
-                and t.block_size == block
-            ),
-            None,
-        )
-        assert type_name, f"no MX type with {wq.dtype.bits}-bit elements, block {block}"
+        # the MX format follows from the operands: element width and block size
+        mx_type = MXInt(wq.dtype.bits, block)
+        type_name = f"__allo_mx_type_{mx_type.name}__"
+        ctx.global_vars.setdefault(type_name, mx_type)
         suffix = "q" if x_quantized else "wq"
-        impl = "linear2d" if fn_name == "linear" else "matmul"
-        tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](
-            n, nb, block_bytes=block + 1
-        )
+        tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](mx_type, n, nb)
+        dims = [m, n, k, nb, units, tile]
+        if fn_name == "linear":  # shared GEMM with W as [N, K] (TRANS=0)
+            target_name, dims = f"__allo_mx_gemm_{suffix}__", dims + [0]
+        else:
+            target_name = f"__allo_mx_matmul_{suffix}__"
         new_func = ast.Subscript(
-            value=ast.Name(id=f"__allo_mx_{impl}_{suffix}__", ctx=ast.Load()),
+            value=ast.Name(id=target_name, ctx=ast.Load()),
             slice=ast.Tuple(
                 elts=[ast.Name(id=type_name, ctx=ast.Load())]
-                + [ast.Constant(value=d) for d in (m, n, k, nb, units, tile)],
+                + [ast.Constant(value=d) for d in dims],
                 ctx=ast.Load(),
             ),
             ctx=ast.Load(),
@@ -1393,14 +1388,13 @@ class TypeInferer(ASTVisitor):
             n = argBshape[0] if fn_name == "linear" else argBshape[1]
             nb = k // mx_type.block_size
             tile, units = ctx.global_vars["__allo_mx_pick_tile_units__"](
-                n, nb, block_bytes=mx_type.block_size + 1
-            )
-            target_name = (
-                "__allo_mx_linear2d_ff__"
-                if fn_name == "linear"
-                else "__allo_mx_matmul_ff__"
+                mx_type, n, nb
             )
             dims = [m, n, k, nb, units, tile]
+            if fn_name == "linear":  # shared GEMM with W as [N, K] (TRANS=0)
+                target_name, dims = "__allo_mx_gemm_ff__", dims + [0]
+            else:
+                target_name = "__allo_mx_matmul_ff__"
         else:
             raise NotImplementedError(
                 f"MX allo.{fn_name} supports 2D inputs (linear also 3D), got {argAshape}"

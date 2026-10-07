@@ -22,6 +22,13 @@ from .nn import (
     schedule_linear3d,
     mx_matmul,
     schedule_mx_matmul,
+    mx_gemm_q,
+    mx_gemm_wq,
+    mx_gemm_ff,
+    mx_matmul_q,
+    mx_matmul_wq,
+    mx_matmul_ff,
+    schedule_mx_gemm,
     mx_linear2d,
     schedule_mx_linear2d,
     mx_linear3d,
@@ -89,6 +96,13 @@ KERNEL2SCHEDULE.update(
         batchnorm1d_3d: schedule_batchnorm1d_3d,
         log_softmax: schedule_log_softmax,
         concat: schedule_concat,
+        mx_matmul: schedule_mx_matmul,
+        mx_gemm_q: schedule_mx_gemm,
+        mx_gemm_wq: schedule_mx_gemm,
+        mx_gemm_ff: schedule_mx_gemm,
+        mx_matmul_q: schedule_mx_gemm,
+        mx_matmul_wq: schedule_mx_gemm,
+        mx_matmul_ff: schedule_mx_gemm,
     }
 )
 
