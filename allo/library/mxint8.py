@@ -115,6 +115,32 @@ def mx_pack_words(arr, bits):
     return raw.view(get_np_struct_type(bits))
 
 
+def mx_pack_f32_blocks(x):
+    """Splits a float32 [R, C] array (C % 32 == 0) into the two 512b-word
+    arrays nn.mx_unpack_f32 reads: A0 holds floats 0-15 of every 32-float
+    block, A1 floats 16-31, so one block arrives per cycle over two ports."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    R, C = x.shape
+    assert C % 32 == 0, f"C={C} must be a multiple of 32"
+    halves = x.reshape(R, C // 32, 2, 16)
+    return tuple(
+        mx_pack_words(np.ascontiguousarray(halves[:, :, h]), 512).reshape(R, C // 32)
+        for h in range(2)
+    )
+
+
+def mx_pack_nhwc_blocks(x):
+    """Packs a float32 NCHW feature map for nn.mx_unpack_nhwc: reordered to
+    NHWC rows (W * C % 32 == 0), then split like mx_pack_f32_blocks."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    x = np.asarray(x, dtype=np.float32)
+    B, C, H, W = x.shape
+    return mx_pack_f32_blocks(x.transpose(0, 2, 3, 1).reshape(B * H, W * C))
+
+
 def _mx_quantize_np(Ty, x):
     """numpy MX quantization of a [R, K] array, bit-exact with the hardware quantizer."""
     import numpy as np  # pylint: disable=import-outside-toplevel

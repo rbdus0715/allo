@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-# pylint: disable=used-before-assignment, unsubscriptable-object, unsupported-assignment-operation, chained-comparison
+# pylint: disable=used-before-assignment, unsubscriptable-object, unsupported-assignment-operation, chained-comparison, no-value-for-parameter
 
 import allo
 from .. import dsl
@@ -349,15 +349,177 @@ def schedule_mx_gemm(s, depth=16):
     return s
 
 
+def partition_block_lanes(s, buf, length, BS, dim=2):
+    """Partitions `buf` along `dim` (of `length` elements) into one bank per
+    block lane, so the BS elements of a block are read or written in one cycle."""
+    if length <= BS:
+        s.partition(buf, dim=dim)
+    else:
+        s.partition(buf, partition_type=2, dim=dim, factor=BS)
+
+
+def mx_unpack_f32[
+    R, C
+](A0: "UInt(512)[R, C // 32]", A1: "UInt(512)[R, C // 32]", X: "float32[R, C]"):
+    # DRAM -> chip at one 32-float block per cycle: each block arrives as two
+    # 512b words, one per port (A0: floats 0-15, A1: 16-31). C % 32 == 0;
+    # mxint8.mx_pack_f32_blocks builds A0/A1 on the host. X is an output
+    # argument, so the consumer's banking of it reaches this function too.
+    for r, i in allo.grid(R, C // 32):
+        lo: UInt(512) = A0[r, i]
+        hi: UInt(512) = A1[r, i]
+        with allo.meta_for(16) as e:
+            lb: int32 = lo[e * 32 : (e + 1) * 32]
+            hb: int32 = hi[e * 32 : (e + 1) * 32]
+            X[r, i * 32 + e] = lb.bitcast()
+            X[r, i * 32 + 16 + e] = hb.bitcast()
+
+
+def schedule_mx_unpack_f32(s):
+    # X's block-lane banks come from the consuming layer's schedule (its
+    # partition of the same buffer propagates here); a second one would clash
+    s.pipeline(f"{s.top_func_name}:i")
+    return s
+
+
+def mx_unpack_nhwc[
+    B, C, H, W
+](
+    A0: "UInt(512)[B * H, W * C // 32]",
+    A1: "UInt(512)[B * H, W * C // 32]",
+    X: "float32[B, C, H, W]",
+):
+    # DRAM -> chip feature map at one 32-float block per cycle: the host sends
+    # it NHWC-ordered (mxint8.mx_pack_nhwc_blocks), so a block is the same BS
+    # (pixel, channel) run mx_conv2d's row-block stage reads; its banking of
+    # this buffer propagates here (X is an output argument). W * C % 32 == 0.
+    for n, h, i in allo.grid(B, H, W * C // 32):
+        lo: UInt(512) = A0[n * H + h, i]
+        hi: UInt(512) = A1[n * H + h, i]
+        with allo.meta_for(16) as e:
+            lb: int32 = lo[e * 32 : (e + 1) * 32]
+            hb: int32 = hi[e * 32 : (e + 1) * 32]
+            X[n, (i * 32 + e) % C, h, (i * 32 + e) // C] = lb.bitcast()
+            X[n, (i * 32 + 16 + e) % C, h, (i * 32 + 16 + e) // C] = hb.bitcast()
+
+
+def schedule_mx_unpack_nhwc(s):
+    # banked by the consuming conv (see schedule_mx_unpack_f32)
+    s.pipeline(f"{s.top_func_name}:i")
+    return s
+
+
+def _mx_lin_wquant[
+    Ty, N, K, NB
+](W: "float32[N, K]", WS: "uint8[N, NB]", WE: "UInt(Ty.payload_bits)[N, NB]"):
+    # one weight block per iteration (zero past K), quantized once: weights
+    # stay put. W is partitioned by block lane, so a block is one read per bank.
+    BS: ConstExpr[int32] = Ty.block_size
+    for wn, b in allo.grid(N, NB):
+        blk: float32[BS]
+        with allo.meta_for(BS) as e:
+            fw: float32 = 0.0
+            if b * BS + e < K:
+                fw = W[wn, b * BS + e]
+            blk[e] = fw
+        w: Ty = mx_quantize_block_f32[Ty, BS](blk)
+        WS[wn, b] = w[Ty.bits - 8 : Ty.bits]
+        WE[wn, b] = w[0 : Ty.payload_bits]
+
+
+def _mx_lin_xpack[M, K, BS, NB](X: "float32[M, K]", P: "UInt(32 * BS)[M, NB]"):
+    # one token per row block: BS float32 bit patterns in one word. X is
+    # partitioned by block lane, so a block is one read per bank.
+    for m, b in allo.grid(M, NB):
+        word: UInt(32 * BS) = 0
+        with allo.meta_for(BS) as e:
+            # not `v`: v<N> names collide with HLS emitter value names
+            fx: float32 = 0.0
+            if b * BS + e < K:
+                fx = X[m, b * BS + e]
+            word[e * 32 : (e + 1) * 32] = fx.bitcast()
+        P[m, b] = word
+
+
+def _mx_lin_dot[
+    Ty, M, N, NB
+](
+    XS: "uint8[M, NB]",
+    XE: "UInt(Ty.payload_bits)[M, NB]",
+    WS: "uint8[N, NB]",
+    WE: "UInt(Ty.payload_bits)[N, NB]",
+    bias: "float32[N]",
+    Z: "float32[M, N]",
+):
+    # same loop order as _mx_conv_dot: one block dot per iteration, each X block
+    # read once (n == 0) and reused for every output column
+    BS: ConstExpr[int32] = Ty.block_size
+    acc: float32[N] = 0.0
+    xw: Ty = 0
+    for m in range(M):
+        for b, n in allo.grid(NB, N):
+            if n == 0:
+                xw[0 : Ty.payload_bits] = XE[m, b]
+                xw[Ty.bits - 8 : Ty.bits] = XS[m, b]
+            ww: Ty = 0
+            ww[0 : Ty.payload_bits] = WE[n, b]
+            ww[Ty.bits - 8 : Ty.bits] = WS[n, b]
+            d: float32 = mx_block_dot[Ty, BS](xw, ww)
+            prev: float32 = 0.0
+            if b > 0:
+                prev = acc[n]
+            total: float32 = prev + d
+            acc[n] = total
+            if b == NB - 1:
+                Z[m, n] = total + bias[n]
+
+
 def mx_linear2d[
     Ty, M, N, K
 ](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
-    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
-    _mx_nb: ConstExpr[int32] = K // Ty.block_size
-    return mx_gemm_ff[Ty, M, N, K, _mx_nb, 0](X, W, bias)
+    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html, with MX
+    # arithmetic; K is zero-padded up to whole blocks. Stages pass one MX block
+    # per element of P / XS / XE, which schedule_mx_linear2d streams.
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    PB: ConstExpr[int32] = Ty.payload_bits
+    PW: ConstExpr[int32] = 32 * BS
+    WS: uint8[N, NB]
+    WE: UInt(PB)[N, NB]
+    _mx_lin_wquant[Ty, N, K, NB](W, WS, WE)
+    P: UInt(PW)[M, NB]
+    _mx_lin_xpack[M, K, BS, NB](X, P)
+    XS: uint8[M, NB]
+    XE: UInt(PB)[M, NB]
+    _mx_quant_blocks[Ty, M, NB](P, XS, XE)
+    Z: float32[M, N]
+    _mx_lin_dot[Ty, M, N, NB](XS, XE, WS, WE, bias, Z)
+    return Z
 
 
-def schedule_mx_linear2d(s):
+def schedule_mx_linear2d(s, depth=4):
+    """X row pack -> block quantize -> block dot as an HLS dataflow, one MX
+    block per stream token and one block dot per cycle. Registered in
+    KERNEL2SCHEDULE, so s.compose(mx_linear2d, instantiate=..., id=...) applies it.
+    """
+    Ty, _, _, K = s.inst_list[:4]
+    NB = (K + Ty.block_size - 1) // Ty.block_size
+    top = s.top_func_name
+    schedule_mx(s)
+    # one bank per block lane: X and W blocks are read whole, one per cycle
+    for arr in ("X", "W"):
+        partition_block_lanes(s, MockBuffer(top, arr), K, Ty.block_size)
+    s.pipeline("_mx_lin_wquant:b")
+    s.pipeline("_mx_lin_xpack:b")
+    s.pipeline("_mx_quant_blocks:b")
+    s.pipeline("_mx_lin_dot:n")
+    for buf, consumer in (
+        ("P", "_mx_quant_blocks"),
+        ("XS", "_mx_lin_dot"),
+        ("XE", "_mx_lin_dot"),
+    ):
+        s.to(MockBuffer(top, buf), consumer, depth=max(depth, NB))
+    s.dataflow(top)
     return s
 
 
@@ -379,10 +541,164 @@ def mx_linear3d[
 
 
 def schedule_mx_linear3d(s):
-    schedule_mx_linear2d(s)
+    # mx_linear2d's dataflow schedule needs its own top; compose it for that
+    schedule_mx(s)
     s.pipeline("mx_linear3d:k")
     s.pipeline("mx_linear3d:j")
     return s
+
+
+def _mx_conv_wquant[
+    Ty, Cout, Cin, Kh, Kw, CKK, NBc
+](
+    kernel: "float32[Cout, Cin, Kh, Kw]",
+    WS: "uint8[Cout, NBc]",
+    WE: "UInt(Ty.payload_bits)[Cout, NBc]",
+):
+    # flatten to [Cout, CKK] (zero-padded) and quantize once: weights stay put
+    BS: ConstExpr[int32] = Ty.block_size
+    # flatten and zero-pad in one pass (no separate zero-fill of kflat)
+    kflat: float32[Cout, CKK]
+    for fo, j in allo.grid(Cout, CKK):
+        fk: float32 = 0.0
+        if j < Cin * Kh * Kw:
+            fk = kernel[fo, j // (Kh * Kw), (j // Kw) % Kh, j % Kw]
+        kflat[fo, j] = fk
+    for fo1, b in allo.grid(Cout, NBc):
+        blk: float32[BS]
+        with allo.meta_for(BS) as e:
+            blk[e] = kflat[fo1, b * BS + e]
+        w: Ty = mx_quantize_block_f32[Ty, BS](blk)
+        WS[fo1, b] = w[Ty.bits - 8 : Ty.bits]
+        WE[fo1, b] = w[0 : Ty.payload_bits]
+
+
+def _mx_conv_rowblocks[
+    B, Cin, H, W, BS, WB
+](inp: "float32[B, Cin, H, W]", Q: "UInt(32 * BS)[B * H, WB]"):
+    # input rows as tokens of BS consecutive NHWC values (pixel-major, channel-
+    # minor), one block per iteration. inp is banked by channel and by pixel
+    # mod BS // Cin, so a block's BS reads hit BS different banks.
+    for n, h, wb in allo.grid(B, H, WB):
+        word: UInt(32 * BS) = 0
+        with allo.meta_for(BS) as e:
+            fr: float32 = 0.0
+            if wb * BS + e < W * Cin:
+                fr = inp[n, (wb * BS + e) % Cin, h, (wb * BS + e) // Cin]
+            word[e * 32 : (e + 1) * 32] = fr.bitcast()
+        Q[n * H + h, wb] = word
+
+
+def _mx_conv_lb_im2col[
+    B, Cin, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1, BS, NBc, WB
+](Q: "UInt(32 * BS)[B * H, WB]", P: "UInt(32 * BS)[B * Oh * Ow, NBc]"):
+    # line buffer: input rows arrive one block per iteration into a Kh-row
+    # ring; once the last row an output row needs is in, a Kh x Kw x Cin window
+    # slides along it one input column at a time and emits each patch as NBc
+    # block tokens, in (cin, kh, kw) order like the flattened kernel.
+    LB: float32[Kh, W, Cin]
+    win: float32[Kh, Kw, Cin]
+    for n in range(B):
+        for r in range(H + Pd0):
+            if r < H:
+                for wb in range(WB):
+                    word: UInt(32 * BS) = Q[n * H + r, wb]
+                    with allo.meta_for(BS) as e:
+                        if wb * BS + e < W * Cin:
+                            bits: int32 = word[e * 32 : (e + 1) * 32]
+                            LB[r % Kh, (wb * BS + e) // Cin, (wb * BS + e) % Cin] = (
+                                bits.bitcast()
+                            )
+            t: int32 = r - (Kh - 1 - Pd0)
+            if t >= 0 and t % Sh == 0 and t // Sh < Oh:
+                oh: int32 = t // Sh
+                with allo.meta_for(Kh) as kh0:
+                    with allo.meta_for(Kw) as kw0:
+                        with allo.meta_for(Cin) as ci0:
+                            win[kh0, kw0, ci0] = 0.0
+                for c in range(W + Pd1):
+                    # shift the window one column left, then load column c
+                    with allo.meta_for(Kh) as kh:
+                        with allo.meta_for(Kw - 1) as kw:
+                            with allo.meta_for(Cin) as ci:
+                                win[kh, kw, ci] = win[kh, kw + 1, ci]
+                        with allo.meta_for(Cin) as ci1:
+                            fc: float32 = 0.0
+                            if (
+                                c < W
+                                and oh * Sh + kh - Pd0 >= 0
+                                and oh * Sh + kh - Pd0 < H
+                            ):
+                                fc = LB[(oh * Sh + kh - Pd0) % Kh, c, ci1]
+                            win[kh, Kw - 1, ci1] = fc
+                    u: int32 = c - (Kw - 1 - Pd1)
+                    if u >= 0 and u % Sw == 0 and u // Sw < Ow:
+                        with allo.meta_for(NBc) as b:
+                            word1: UInt(32 * BS) = 0
+                            with allo.meta_for(BS) as e1:
+                                fp: float32 = 0.0
+                                with allo.meta_if(b * BS + e1 < Cin * Kh * Kw):
+                                    fp = win[
+                                        ((b * BS + e1) // Kw) % Kh,
+                                        (b * BS + e1) % Kw,
+                                        (b * BS + e1) // (Kh * Kw),
+                                    ]
+                                word1[e1 * 32 : (e1 + 1) * 32] = fp.bitcast()
+                            P[(n * Oh + oh) * Ow + u // Sw, b] = word1
+
+
+def _mx_quant_blocks[
+    Ty, R, NBc
+](
+    P: "UInt(32 * Ty.block_size)[R, NBc]",
+    XS: "uint8[R, NBc]",
+    XE: "UInt(Ty.payload_bits)[R, NBc]",
+):
+    # one patch block in, its (scale, elements) bundle out
+    BS: ConstExpr[int32] = Ty.block_size
+    for r, b in allo.grid(R, NBc):
+        word: UInt(32 * BS) = P[r, b]
+        blk: float32[BS]
+        with allo.meta_for(BS) as e:
+            bits: int32 = word[e * 32 : (e + 1) * 32]
+            blk[e] = bits.bitcast()
+        w: Ty = mx_quantize_block_f32[Ty, BS](blk)
+        XS[r, b] = w[Ty.bits - 8 : Ty.bits]
+        XE[r, b] = w[0 : Ty.payload_bits]
+
+
+def _mx_conv_dot[
+    Ty, B, Cout, Oh, Ow, NBc
+](
+    XS: "uint8[B * Oh * Ow, NBc]",
+    XE: "UInt(Ty.payload_bits)[B * Oh * Ow, NBc]",
+    WS: "uint8[Cout, NBc]",
+    WE: "UInt(Ty.payload_bits)[Cout, NBc]",
+    bias: "float32[Cout]",
+    Z: "float32[B, Cout, Oh, Ow]",
+):
+    # one block dot per iteration: each patch block is read once (cout == 0) and
+    # reused for every output channel; acc[cout] is revisited every Cout iterations.
+    # Slice bounds stay Ty attributes: a ConstExpr bound mis-slices here.
+    BS: ConstExpr[int32] = Ty.block_size
+    acc: float32[Cout] = 0.0
+    xw: Ty = 0
+    for n, oh, ow in allo.grid(B, Oh, Ow):
+        for b, cout in allo.grid(NBc, Cout):
+            if cout == 0:
+                xw[0 : Ty.payload_bits] = XE[(n * Oh + oh) * Ow + ow, b]
+                xw[Ty.bits - 8 : Ty.bits] = XS[(n * Oh + oh) * Ow + ow, b]
+            ww: Ty = 0
+            ww[0 : Ty.payload_bits] = WE[cout, b]
+            ww[Ty.bits - 8 : Ty.bits] = WS[cout, b]
+            d: float32 = mx_block_dot[Ty, BS](xw, ww)
+            prev: float32 = 0.0
+            if b > 0:
+                prev = acc[cout]
+            total: float32 = prev + d
+            acc[cout] = total
+            if b == NBc - 1:
+                Z[n, cout, oh, ow] = total + bias[cout]
 
 
 def mx_conv2d[
@@ -393,33 +709,75 @@ def mx_conv2d[
     bias: "float32[Cout]",
 ) -> "float32[B, Cout, Oh, Ow]":
     # nn.conv2d with MX arithmetic: each im2col patch dotted with the flat kernel;
-    # Cin * Kh * Kw is zero-padded up to a whole number of blocks
-    NBc: ConstExpr[int32] = (Cin * Kh * Kw + Ty.block_size - 1) // Ty.block_size
-    CKK: ConstExpr[int32] = NBc * Ty.block_size
-    kflat: float32[Cout, CKK] = 0.0
-    for fo, fc, fh, fw in allo.grid(Cout, Cin, Kh, Kw):
-        kflat[fo, (fc * Kh + fh) * Kw + fw] = kernel[fo, fc, fh, fw]
-    qw: Ty[Cout, NBc]
-    _mx_quantize_rows[Ty, Cout, CKK, NBc, 0](kflat, qw)
-
+    # Cin * Kh * Kw is zero-padded up to a whole number of blocks. The stages
+    # pass one MX block per element of P / XS / XE, which schedule_mx_conv2d
+    # turns into streams of an HLS dataflow.
+    BS: ConstExpr[int32] = Ty.block_size
+    NBc: ConstExpr[int32] = (Cin * Kh * Kw + BS - 1) // BS
+    CKK: ConstExpr[int32] = NBc * BS
+    R: ConstExpr[int32] = B * Oh * Ow
+    PB: ConstExpr[int32] = Ty.payload_bits
+    PW: ConstExpr[int32] = 32 * BS
+    WS: uint8[Cout, NBc]
+    WE: UInt(PB)[Cout, NBc]
+    _mx_conv_wquant[Ty, Cout, Cin, Kh, Kw, CKK, NBc](kernel, WS, WE)
+    WB: ConstExpr[int32] = (W * Cin + BS - 1) // BS
+    Q: UInt(PW)[B * H, WB]
+    _mx_conv_rowblocks[B, Cin, H, W, BS, WB](inp, Q)
+    P: UInt(PW)[R, NBc]
+    _mx_conv_lb_im2col[B, Cin, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1, BS, NBc, WB](
+        Q, P
+    )
+    XS: uint8[R, NBc]
+    XE: UInt(PB)[R, NBc]
+    _mx_quant_blocks[Ty, R, NBc](P, XS, XE)
     Z: float32[B, Cout, Oh, Ow]
-    for batch, oh, ow in allo.grid(B, Oh, Ow):
-        patch: float32[1, CKK] = 0.0
-        for cin, kh, kw in allo.grid(Cin, Kh, Kw):
-            h_pos: int32 = oh * Sh + kh - Pd0
-            w_pos: int32 = ow * Sw + kw - Pd1
-            if h_pos >= 0 and h_pos < H and w_pos >= 0 and w_pos < W:
-                patch[0, (cin * Kh + kh) * Kw + kw] = inp[batch, cin, h_pos, w_pos]
-        qp: Ty[1, NBc]
-        _mx_quantize_rows[Ty, 1, CKK, NBc, 0](patch, qp)
-        for cout in range(Cout):
-            Z[batch, cout, oh, ow] = mx_dot[Ty, NBc](qp[0], qw[cout]) + bias[cout]
+    _mx_conv_dot[Ty, B, Cout, Oh, Ow, NBc](XS, XE, WS, WE, bias, Z)
     return Z
 
 
-def schedule_mx_conv2d(s):
+def schedule_conv_lb_input(s, top, Cin, W, BS, depth):
+    """Banks and pipelines the row-block + line-buffer im2col input path
+    (_mx_conv_rowblocks -> Q stream -> _mx_conv_lb_im2col), shared by
+    mx_conv2d and its float32 counterpart: one input block per cycle."""
+    F = max(1, BS // Cin)  # pixels per block
+    for buf, (cdim, wdim) in ((MockBuffer(top, "inp"), (2, 4)), (MockBuffer("_mx_conv_lb_im2col", "LB"), (3, 2))):
+        partition_block_lanes(s, buf, Cin, BS, dim=cdim)
+        if F > 1:
+            s.partition(buf, partition_type=2, dim=wdim, factor=F)
+    s.partition(MockBuffer("_mx_conv_lb_im2col", "LB"), dim=1)
+    s.partition(MockBuffer("_mx_conv_lb_im2col", "win"))
+    s.pipeline("_mx_conv_rowblocks:wb")
+    s.pipeline("_mx_conv_lb_im2col:wb")
+    s.pipeline("_mx_conv_lb_im2col:c")
+    s.to(MockBuffer(top, "Q"), "_mx_conv_lb_im2col", depth=depth)
+
+
+def schedule_mx_conv2d(s, depth=4):
+    """row blocks -> line-buffer im2col -> patch quantize -> block dot as an
+    HLS dataflow, one MX block per stream token and one block dot per cycle. Registered in
+    KERNEL2SCHEDULE, so s.compose(mx_conv2d, instantiate=..., id=...) applies it.
+    """
+    Ty, _, Cin, _, _, W, Kh, Kw = s.inst_list[:8]
+    NBc = (Cin * Kh * Kw + Ty.block_size - 1) // Ty.block_size
+    top = s.top_func_name
     schedule_mx(s)
-    s.pipeline("mx_conv2d:cout")
+    # weights: flatten one per cycle, then quantize one block per cycle
+    partition_block_lanes(
+        s, MockBuffer("_mx_conv_wquant", "kflat"), NBc * Ty.block_size, Ty.block_size
+    )
+    s.pipeline("_mx_conv_wquant:j")
+    s.pipeline("_mx_conv_wquant:b")
+    schedule_conv_lb_input(s, top, Cin, W, Ty.block_size, max(depth, NBc))
+    s.pipeline("_mx_quant_blocks:b")
+    s.pipeline("_mx_conv_dot:cout")
+    for buf, consumer in (
+        ("P", "_mx_quant_blocks"),
+        ("XS", "_mx_conv_dot"),
+        ("XE", "_mx_conv_dot"),
+    ):
+        s.to(MockBuffer(top, buf), consumer, depth=max(depth, NBc))
+    s.dataflow(top)
     return s
 
 

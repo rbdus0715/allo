@@ -925,7 +925,7 @@ class ASTTransformer(ASTBuilder):
         value_result = ASTTransformer.get_mlir_op_result(ctx, value)
         if isinstance(node.op, ast.USub):
             # MLIR does not provide integer negation
-            if isinstance(node.dtype, (Int, UInt)):
+            if isinstance(node.dtype, (Int, UInt, Index)):
                 value = ASTTransformer.build_cast_op(
                     ctx, value, node.operand.dtype, node.dtype
                 )

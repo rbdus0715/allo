@@ -652,6 +652,33 @@ def test_partition_single_function_call():
     s.partition("kernel:partial_result")
 
 
+def test_partition_call_result_two_dims():
+    """Partitioning a call result on two dimensions keeps both in the callee's
+    return type and at the call site (the second must not drop the first)"""
+    M, N = 4, 8
+
+    def produce(data: float32[M, N]) -> float32[M, N]:
+        result: float32[M, N] = 0.0
+        for i, j in allo.grid(M, N):
+            result[i, j] = data[i, j] + 1.0
+        return result
+
+    def kernel(inp: float32[M, N]) -> float32[M, N]:
+        tmp = produce(inp)
+        out: float32[M, N] = 0.0
+        for i, j in allo.grid(M, N):
+            out[i, j] = tmp[i, j] * 2.0
+        return out
+
+    s = allo.customize(kernel)
+    s.partition("kernel:tmp", dim=1)
+    s.partition("kernel:tmp", partition_type=2, dim=2, factor=2)  # Cyclic
+    # used to fail verification on a call/return type mismatch
+    code = str(s.build(target="vhls"))
+    assert "complete dim=1" in code
+    assert "cyclic dim=2 factor=2" in code
+
+
 def test_partition_chained_function_calls():
     """Test partitioning with chained function calls where output of one function feeds into another"""
     N = 8

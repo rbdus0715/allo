@@ -141,6 +141,30 @@ def test_mx_linear(kernel):
     _run_hls(kernel, args, Z)
 
 
+@pytest.mark.parametrize("dims", [(M, N, K), (16, 64, 96)])
+def test_mx_linear2d(dims):
+    # float32 operands: the block-streamed dataflow equals mx_linear2d_ref
+    m, n, k = dims
+    rng = np.random.default_rng(1)
+    rand = lambda shape: (
+        rng.standard_normal(shape) * 2.0 ** rng.integers(-4, 4, shape)
+    ).astype(np.float32)
+    X, W, bias = rand((m, k)), rand((n, k)), rand((n,))
+    inst = [Ty, m, n, k]
+    Z = allo.customize(nn.mx_linear2d, instantiate=inst).build(target="llvm")(
+        X, W, bias
+    )
+    ref = allo.customize(mx_linear2d_ref, instantiate=inst).build(target="llvm")(
+        X, W, bias
+    )
+    np.testing.assert_array_equal(Z, ref)
+
+    s = allo.customize(nn.mx_linear2d, instantiate=inst)
+    code = str(nn.schedule_mx_linear2d(s).build(target="vhls"))
+    assert "#pragma HLS dataflow" in code
+    assert code.count("#pragma HLS stream") >= 3  # P, XS, XE
+
+
 if __name__ == "__main__":
     import argparse
 

@@ -80,6 +80,14 @@ from .library.nn import (
     _mx_pack_rows,
     _mx_dot_rows,
     _mx_dequantize_elem,
+    _mx_conv_wquant,
+    _mx_conv_rowblocks,
+    _mx_conv_lb_im2col,
+    _mx_quant_blocks,
+    _mx_lin_wquant,
+    _mx_lin_xpack,
+    _mx_lin_dot,
+    _mx_conv_dot,
     mx_dot,
 )
 from .ir import types as _mx_types
@@ -383,22 +391,22 @@ class Schedule:
                 ip=InsertionPoint.at_block_terminator(func.entry_block),
             )
 
+            # Types carry the layout of every partition of this buffer so far,
+            # not just this one (a second dimension must not drop the first)
+            partitions = self.partitioned_arrays[buf_key]
+
             # Update types for function calls
             if isinstance(mlir_target, func_d.CallOp):
-                self._update_call_types(mlir_target, partition_type_int, dim, factor)
+                self._update_call_types(mlir_target, partitions)
 
             # If this buffer is returned by a function, update the function's return type
             # and all call sites to that function
-            self._propagate_return_type_to_callers(
-                func, mlir_target, partition_type_int, dim, factor
-            )
+            self._propagate_return_type_to_callers(func, mlir_target, partitions)
 
         # Update global memory references
-        self._update_global_types(buffers_to_partition, partition_type_int, dim, factor)
+        self._update_global_types(buffers_to_partition)
 
-    def _propagate_return_type_to_callers(
-        self, func, mlir_target, partition_type, dim, factor
-    ):
+    def _propagate_return_type_to_callers(self, func, mlir_target, partitions):
         """If a partitioned buffer is returned, update function signature and all call sites."""
         if not isinstance(func, func_d.FuncOp):
             return
@@ -416,9 +424,7 @@ class Schedule:
 
                     # Compute new return type with partition layout
                     shape = mlir_target.result.type.shape
-                    layout_attr = self._compute_partition_layout(
-                        shape, partition_type, dim, factor
-                    )
+                    layout_attr = self._compute_partition_layout(shape, partitions)
 
                     old_type = func.type.results[0]
                     new_return_type = MemRefType.get(
@@ -582,13 +588,21 @@ class Schedule:
             return MockBuffer(func_name, name)
         return None
 
-    def _compute_partition_layout(self, shape, partition_type, dim, factor):
-        """Compute the affine map for partitioned memory layout."""
+    def _compute_partition_layout(self, shape, partitions):
+        """Compute the affine map for partitioned memory layout.
+
+        `partitions` lists every (partition_type, dim, factor) applied to the
+        buffer; each dimension takes the one that names it (dim 0 = all).
+        """
         partition_idx = []
         address_idx = []
 
         for i, size in enumerate(shape):
-            applies_to_dim = (dim == 0) or (i == dim - 1)
+            applies_to_dim = False
+            for partition_type, dim, factor in partitions:
+                if dim == 0 or i == dim - 1:
+                    applies_to_dim = True
+                    break
 
             if applies_to_dim:
                 if partition_type == Partition.Cyclic:
@@ -614,7 +628,7 @@ class Schedule:
         )
         return AffineMapAttr.get(affine_map)
 
-    def _update_call_types(self, call_op, partition_type, dim, factor):
+    def _update_call_types(self, call_op, partitions):
         """Update function signature types after partitioning a call result."""
         callee_name = FlatSymbolRefAttr(call_op.attributes["callee"]).value
         callee_func = self._find_function(callee_name, error=False)
@@ -622,7 +636,7 @@ class Schedule:
             return
 
         shape = call_op.result.type.shape
-        layout_attr = self._compute_partition_layout(shape, partition_type, dim, factor)
+        layout_attr = self._compute_partition_layout(shape, partitions)
 
         # Create new return type with partition layout
         old_type = callee_func.type.results[0]
@@ -690,16 +704,20 @@ class Schedule:
                 callee_func.attributes["function_type"] = TypeAttr.get(new_func_type)
                 break
 
-    def _update_global_types(self, buffers, partition_type, dim, factor):
+    def _update_global_types(self, buffers):
         """Update global memory reference types."""
-        buffer_names = {buf.name for buf in buffers}
+        buffer_partitions = {
+            buf.name: self.partitioned_arrays[f"{buf.func}:{buf.name}"]
+            for buf in buffers
+        }
 
         for op in self.module.body.operations:
             if isinstance(op, memref_d.GlobalOp):
-                if op.attributes["sym_name"].value in buffer_names:
+                name = op.attributes["sym_name"].value
+                if name in buffer_partitions:
                     old_type = op.attributes["type"].value
                     layout_attr = self._compute_partition_layout(
-                        old_type.shape, partition_type, dim, factor
+                        old_type.shape, buffer_partitions[name]
                     )
                     new_type = MemRefType.get(
                         old_type.shape,
@@ -1401,7 +1419,18 @@ def customize(
     global_vars.setdefault("_mx_pack_rows", _mx_pack_rows)
     global_vars.setdefault("_mx_dot_rows", _mx_dot_rows)
     global_vars.setdefault("_mx_dequantize_elem", _mx_dequantize_elem)
-    global_vars.setdefault("mx_dot", mx_dot)  # called from mx_conv2d
+    for _fn in (
+        _mx_conv_wquant,
+        _mx_conv_rowblocks,
+        _mx_conv_lb_im2col,
+        _mx_quant_blocks,
+        _mx_conv_dot,
+        _mx_lin_wquant,
+        _mx_lin_xpack,
+        _mx_lin_dot,
+    ):
+        global_vars.setdefault(_fn.__name__, _fn)  # mx_conv2d / mx_linear2d stages
+    global_vars.setdefault("mx_dot", mx_dot)
     global_vars.setdefault("mx_linear2d", mx_linear2d)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
     global_vars.setdefault("mx_matmul", mx_matmul)

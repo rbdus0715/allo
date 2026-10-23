@@ -406,6 +406,61 @@ Regions can call other regions for hierarchical decomposition:
                 inner[4, 4](local_A, local_B, local_C2)  # 4x4 grid
 
 
+Chaining Library Kernels
+========================
+
+A ``@df.region`` is a complete top-level design: only streams and kernels
+appear in its body, and streams do not cross region boundaries. To chain
+reusable layers that are themselves dataflows, write each layer as a plain
+Allo function and attach its dataflow through a schedule instead. The library
+kernels in ``allo.library`` register such schedules in ``KERNEL2SCHEDULE``;
+``s.compose(fn, instantiate=..., id=...)`` customizes ``fn`` for one call site,
+applies its registered schedule, and replaces that call in the caller.
+
+For example, ``nn.mx_conv2d`` (2D convolution with MX arithmetic) runs
+im2col, MX block quantization, and the block dot as HLS dataflow stages that
+pass one MX block per stream token, with one block dot per cycle. Two of them
+chain like ordinary function calls:
+
+.. code-block:: python
+
+    import allo
+    import allo.ir.types as T
+    import allo.library.nn as nn
+
+    Ty = T.mxint8
+    # [Ty, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, pad_h, pad_w]
+    CONV1 = [Ty, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
+    CONV2 = [Ty, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
+
+    def model(inp: "float32[1, 2, 6, 6]",
+              k1: "float32[3, 2, 3, 3]", b1: "float32[3]",
+              k2: "float32[2, 3, 3, 3]", b2: "float32[2]") -> "float32[1, 2, 6, 6]":
+        a = nn.mx_conv2d[Ty, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](inp, k1, b1)
+        return nn.mx_conv2d[Ty, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](a, k2, b2)
+
+    s = allo.customize(model)
+    s.compose(nn.mx_conv2d, instantiate=CONV1)            # first call
+    s.compose(nn.mx_conv2d, instantiate=CONV2, id="1")    # second call
+    s.dataflow("model")                                   # overlap the layers
+    mod = s.build(target="vitis_hls", mode="csyn", project="model.prj")
+
+The unscheduled ``allo.customize(model).build(target="llvm")`` computes the
+same results on the CPU. When a library function is called more than once,
+the ``n``-th call (and its helper functions) is suffixed ``_n`` for ``n > 0``,
+so the first ``compose`` takes no ``id`` and the second takes ``id="1"``.
+
+.. note::
+
+   Layers are connected through buffers here, so the next layer starts once
+   the previous one has produced its output. A layer-to-layer stream
+   (``s.to``) needs the producer's write order to match the consumer's read
+   order, which a convolution's overlapping windows do not without a line
+   buffer.
+
+See ``tests/dataflow/test_mx_conv2d_dataflow.py``.
+
+
 Building and Execution
 ======================
 
