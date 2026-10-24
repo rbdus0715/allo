@@ -106,13 +106,21 @@ def schedule_fp32_linear2d(s, depth=4):
     return s
 
 
+# MX formats to compare against float32; csyn takes one (--format)
+FORMATS = {
+    t.name: t
+    for t in (T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32))
+}
+
+
+def _mx_format():
+    return FORMATS[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
+
+
 # DRAM boundary: X and W arrive as 512b words over two ports (one 32-float
 # block per cycle), unpacked on chip by nn.mx_unpack_f32
-Ty = T.mxint8
-
-
 def mx_linear_top[
-    M, N, K
+    Ty, M, N, K
 ](
     X0: "UInt(512)[M, K // 32]",
     X1: "UInt(512)[M, K // 32]",
@@ -143,8 +151,8 @@ def fp32_linear_top[
     return fp32_linear2d[M, N, K](X, W, bias)
 
 
-def _top_schedule(top, layer, M, N, K):
-    s = allo.customize(top, instantiate=[M, N, K])
+def _top_schedule(top, layer, inst, M, N, K):
+    s = allo.customize(top, instantiate=inst)
     s.compose(nn.mx_unpack_f32, instantiate=[M, K])
     s.compose(nn.mx_unpack_f32, instantiate=[N, K], id="1")
     s.compose(layer)  # its X/W block-lane partitions reach the unpacks too
@@ -158,8 +166,9 @@ def _rand(shape, rng):
     )
 
 
+@pytest.mark.parametrize("Ty", FORMATS.values(), ids=list(FORMATS))
 @pytest.mark.parametrize("name", list(CONFIGS))
-def test_linear_numerics(name):
+def test_linear_numerics(name, Ty):
     M, N, K = CONFIGS[name]
     rng = np.random.default_rng(0)
     X, W, bias = _rand((M, K), rng), _rand((N, K), rng), _rand((N,), rng)
@@ -169,36 +178,38 @@ def test_linear_numerics(name):
     Z_fp = allo.customize(fp32_linear_top, instantiate=[M, N, K]).build(target="llvm")(
         *args
     )
-    Z_mx = allo.customize(mx_linear_top, instantiate=[M, N, K]).build(target="llvm")(
-        *args
-    )
+    Z_mx = allo.customize(mx_linear_top, instantiate=[Ty, M, N, K]).build(
+        target="llvm"
+    )(*args)
     # the packed interface changes nothing but how X and W reach the chip
     ref_mx = allo.customize(nn.mx_linear2d, instantiate=[Ty, M, N, K]).build(
         target="llvm"
     )(X, W, bias)
     np.testing.assert_array_equal(Z_mx, ref_mx)
     print(
-        f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, mxint8 {rel(Z_mx):.2e}"
+        f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, "
+        f"{Ty.name} {rel(Z_mx):.2e}"
     )
     assert rel(Z_fp) < 1e-5
-    assert rel(Z_mx) < 0.1
+    assert rel(Z_mx) < (0.1 if Ty.elem_bits >= 8 else 0.5)
 
 
-def _schedules(name):
+def _schedules(name, Ty):
     M, N, K = CONFIGS[name]
     s_mx = nn.schedule_mx_linear2d(
         allo.customize(nn.mx_linear2d, instantiate=[Ty, M, N, K])
     )
     s_fp = schedule_fp32_linear2d(allo.customize(fp32_linear2d, instantiate=[M, N, K]))
     return (
-        _top_schedule(mx_linear_top, s_mx, M, N, K),
-        _top_schedule(fp32_linear_top, s_fp, M, N, K),
+        _top_schedule(mx_linear_top, s_mx, [Ty, M, N, K], M, N, K),
+        _top_schedule(fp32_linear_top, s_fp, [M, N, K], M, N, K),
     )
 
 
 @pytest.mark.parametrize("name", list(CONFIGS))
 def test_linear_csyn(name):
-    s_mx, s_fp = _schedules(name)
+    Ty = _mx_format()
+    s_mx, s_fp = _schedules(name, Ty)
     for s in (s_mx, s_fp):
         assert "#pragma HLS dataflow" in str(s.build(target="vhls"))
     if os.environ.get("ALLO_HLSMODE", "csyn") != "csyn":
@@ -207,7 +218,7 @@ def test_linear_csyn(name):
         pytest.skip("vitis_hls not available")
     root = os.environ.get("ALLO_PROJECT", os.path.join(_TESTS_DIR, "comp_fp_mx_linear"))
     for tag, s, top in (
-        ("mxint8", s_mx, "mx_linear_top"),
+        (Ty.name, s_mx, "mx_linear_top"),
         ("fp32", s_fp, "fp32_linear_top"),
     ):
         project = f"{root}_{name}_{tag}.prj"
@@ -229,13 +240,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--project",
         default=os.path.join(_TESTS_DIR, "comp_fp_mx_linear"),
-        help="Project root; projects are <root>_<config>_{mxint8,fp32}.prj",
+        help="Project root; projects are <root>_<config>_{<format>,fp32}.prj",
     )
+    parser.add_argument("--format", choices=list(FORMATS), default="mxint8_k32")
     parser.add_argument("--clean", action="store_true", help="Clean the project dirs")
     args, pytest_args = parser.parse_known_args()
     os.environ["ALLO_PROJECT"] = args.project
+    os.environ["ALLO_MXFORMAT"] = args.format
     if args.clean:
         for name in CONFIGS:
-            for tag in ("mxint8", "fp32"):
+            for tag in (args.format, "fp32"):
                 shutil.rmtree(f"{args.project}_{name}_{tag}.prj", ignore_errors=True)
     pytest.main([__file__, "-s", *pytest_args])

@@ -130,13 +130,21 @@ def schedule_fp32_conv2d(s, depth=4):
     return s
 
 
+# MX formats to compare against float32; csyn takes one (--format)
+FORMATS = {
+    t.name: t
+    for t in (T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32))
+}
+
+
+def _mx_format():
+    return FORMATS[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
+
+
 # DRAM boundary: the feature map arrives NHWC-packed as 512b words over two
 # ports (one 32-float block per cycle), unpacked on chip by nn.mx_unpack_nhwc
-Ty = T.mxint8
-
-
 def mx_conv_top[
-    B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
+    Ty, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
 ](
     I0: "UInt(512)[B * H, W * Cin // 32]",
     I1: "UInt(512)[B * H, W * Cin // 32]",
@@ -167,7 +175,7 @@ def fp32_conv_top[
 
 def _top_schedule(top, layer, inst):
     s = allo.customize(top, instantiate=inst)
-    B, Cin, _, H, W = inst[:5]
+    B, Cin, _, H, W = inst[-13:-8]  # the 13 conv dims, after Ty if any
     s.compose(nn.mx_unpack_nhwc, instantiate=[B, Cin, H, W])
     s.compose(layer)  # its inp banking reaches the unpack too
     s.dataflow(top.__name__)
@@ -196,8 +204,9 @@ def _exact(inp, kernel, bias, K, S, P):
     return out + bias[None, :, None, None]
 
 
+@pytest.mark.parametrize("Ty", FORMATS.values(), ids=list(FORMATS))
 @pytest.mark.parametrize("name", list(CONFIGS))
-def test_conv_numerics(name):
+def test_conv_numerics(name, Ty):
     B, Cin, Cout, H, K, S, P = CONFIGS[name]
     rng = np.random.default_rng(0)
     inp = _rand((B, Cin, H, H), rng)
@@ -208,32 +217,36 @@ def test_conv_numerics(name):
     rel = lambda Z: np.linalg.norm(Z - exact) / np.linalg.norm(exact)
     args = (*mx_pack_nhwc_blocks(inp), kernel, bias)
     Z_fp = allo.customize(fp32_conv_top, instantiate=inst).build(target="llvm")(*args)
-    Z_mx = allo.customize(mx_conv_top, instantiate=inst).build(target="llvm")(*args)
+    Z_mx = allo.customize(mx_conv_top, instantiate=[Ty, *inst]).build(target="llvm")(
+        *args
+    )
     # the packed interface changes nothing but how the input reaches the chip
     ref_mx = allo.customize(nn.mx_conv2d, instantiate=[Ty, *inst]).build(target="llvm")(
         inp, kernel, bias
     )
     np.testing.assert_array_equal(Z_mx, ref_mx)
     print(
-        f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, mxint8 {rel(Z_mx):.2e}"
+        f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, "
+        f"{Ty.name} {rel(Z_mx):.2e}"
     )
     assert rel(Z_fp) < 1e-5
-    assert rel(Z_mx) < 0.1
+    assert rel(Z_mx) < (0.1 if Ty.elem_bits >= 8 else 0.5)
 
 
-def _schedules(name):
+def _schedules(name, Ty):
     inst = _inst(*CONFIGS[name])
     s_mx = nn.schedule_mx_conv2d(allo.customize(nn.mx_conv2d, instantiate=[Ty, *inst]))
     s_fp = schedule_fp32_conv2d(allo.customize(fp32_conv2d, instantiate=inst))
     return (
-        _top_schedule(mx_conv_top, s_mx, inst),
+        _top_schedule(mx_conv_top, s_mx, [Ty, *inst]),
         _top_schedule(fp32_conv_top, s_fp, inst),
     )
 
 
 @pytest.mark.parametrize("name", list(CONFIGS))
 def test_conv_csyn(name):
-    s_mx, s_fp = _schedules(name)
+    Ty = _mx_format()
+    s_mx, s_fp = _schedules(name, Ty)
     for s in (s_mx, s_fp):
         assert "#pragma HLS dataflow" in str(s.build(target="vhls"))
     if os.environ.get("ALLO_HLSMODE", "csyn") != "csyn":
@@ -242,7 +255,7 @@ def test_conv_csyn(name):
         pytest.skip("vitis_hls not available")
     root = os.environ.get("ALLO_PROJECT", os.path.join(_TESTS_DIR, "comp_fp_mx_conv"))
     for tag, s, top in (
-        ("mxint8", s_mx, "mx_conv_top"),
+        (Ty.name, s_mx, "mx_conv_top"),
         ("fp32", s_fp, "fp32_conv_top"),
     ):
         project = f"{root}_{name}_{tag}.prj"
@@ -264,13 +277,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--project",
         default=os.path.join(_TESTS_DIR, "comp_fp_mx_conv"),
-        help="Project root; projects are <root>_<config>_{mxint8,fp32}.prj",
+        help="Project root; projects are <root>_<config>_{<format>,fp32}.prj",
     )
+    parser.add_argument("--format", choices=list(FORMATS), default="mxint8_k32")
     parser.add_argument("--clean", action="store_true", help="Clean the project dirs")
     args, pytest_args = parser.parse_known_args()
     os.environ["ALLO_PROJECT"] = args.project
+    os.environ["ALLO_MXFORMAT"] = args.format
     if args.clean:
         for name in CONFIGS:
-            for tag in ("mxint8", "fp32"):
+            for tag in (args.format, "fp32"):
                 shutil.rmtree(f"{args.project}_{name}_{tag}.prj", ignore_errors=True)
     pytest.main([__file__, "-s", *pytest_args])

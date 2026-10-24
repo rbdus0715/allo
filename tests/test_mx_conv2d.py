@@ -10,9 +10,10 @@ import allo
 import allo.backend.hls as hls
 import allo.ir.types as T
 import allo.library.nn as nn
-from allo.library.mxint8 import mx_quantize, patch_extern_c_for_class_return_types
+from allo.library.mxint8 import patch_extern_c_for_class_return_types
 
-Ty = T.mxint8
+# MX element formats: integer and float elements, block sizes 32 and 16
+FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
 
 # (B, Cin, Cout, H, K, S, P): Cin*K*K = 32 (one block), 27 -> 32, 36 -> 64
 HLS_CONFIG = (1, 4, 8, 8, 3, 1, 1)
@@ -24,6 +25,11 @@ CONFIGS = [
     (1, 8, 4, 9, 3, 2, 0),
     (1, 3, 2, 5, 1, 1, 0),
     (1, 40, 2, 4, 3, 1, 1),
+]
+# every config in mxint8, plus the padded/strided and Cin > block cases in
+# the other formats
+CASES = [(FORMATS[0], c) for c in CONFIGS] + [
+    (Ty, c) for Ty in FORMATS[1:] for c in (CONFIGS[1], CONFIGS[-1])
 ]
 
 
@@ -53,54 +59,53 @@ def _im2col(inp, K, S, P, CKK):
     return patches, Oh
 
 
-def _mx_conv2d_ref(inp, kernel, bias, K, S, P):
-    """numpy model of mx_conv2d: MX blocks dotted exactly, float32 across blocks."""
+def _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P):
+    """mx_conv2d's numerics from host-side im2col patches through
+    nn.mx_linear2d (checked per format against mx_linear2d_ref in
+    test_mx_linear.py), plus the float64 conv."""
     B, Cout = inp.shape[0], kernel.shape[0]
     BS = Ty.block_size
     NBc = (kernel[0].size + BS - 1) // BS
     patches, Oh = _im2col(inp, K, S, P, NBc * BS)
     kflat = np.zeros((Cout, NBc * BS), np.float32)
     kflat[:, : kernel[0].size] = kernel.reshape(Cout, -1)
-    pe, ps = mx_quantize(Ty, patches)
-    ke, ks = mx_quantize(Ty, kflat)
-    pe = pe.astype(np.int64).reshape(-1, NBc, BS)
-    ke = ke.astype(np.int64).reshape(Cout, NBc, BS)
-    ps, ks = ps.astype(np.int64), ks.astype(np.int64)
-    out = np.zeros((patches.shape[0], Cout), np.float32)
-    for b in range(NBc):  # same block order as mx_dot
-        acc = (pe[:, None, b, :] * ke[None, :, b, :]).sum(-1).astype(np.float32)
-        sh = ps[:, None, b] + ks[None, :, b] - 254 + Ty.dot_exp_offset
-        blk = np.ldexp(acc, sh).astype(np.float32)
-        blk[(ps[:, None, b] == 0) | (ks[None, :, b] == 0)] = 0.0
-        out += blk
-    out += bias
+    lin = allo.customize(
+        nn.mx_linear2d, instantiate=[Ty, patches.shape[0], Cout, NBc * BS]
+    ).build(target="llvm")
+    out = lin(patches, kflat, bias)
     exact = patches.astype(np.float64) @ kflat.T.astype(np.float64) + bias
     to_nchw = lambda x: x.reshape(B, Oh, Oh, Cout).transpose(0, 3, 1, 2)
     return to_nchw(out), to_nchw(exact)
 
 
-def _inst(B, Cin, Cout, H, K, S, P):
+def _inst(Ty, B, Cin, Cout, H, K, S, P):
     Oh = (H + 2 * P - K) // S + 1
     return [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P], Oh
 
 
-@pytest.mark.parametrize("B, Cin, Cout, H, K, S, P", CONFIGS)
-def test_mx_conv2d_llvm(B, Cin, Cout, H, K, S, P):
+def _tol(Ty):
+    return 0.1 if Ty.elem_bits >= 8 else 0.5  # vs float64, loose for 4-bit
+
+
+@pytest.mark.parametrize("Ty, cfg", CASES, ids=lambda x: getattr(x, "name", str(x)))
+def test_mx_conv2d_llvm(Ty, cfg):
+    B, Cin, Cout, H, K, S, P = cfg
     inp, kernel, bias = _inputs(B, Cin, Cout, H, K)
-    inst, _ = _inst(B, Cin, Cout, H, K, S, P)
+    inst, _ = _inst(Ty, *cfg)
     Z = allo.customize(nn.mx_conv2d, instantiate=inst).build(target="llvm")(
         inp, kernel, bias
     )
-    ref, exact = _mx_conv2d_ref(inp, kernel, bias, K, S, P)
+    ref, exact = _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P)
     np.testing.assert_array_equal(Z, ref)
     rel_norm = np.linalg.norm(Z - exact) / np.linalg.norm(exact)
-    print(f"mx_conv2d vs float64: rel norm {rel_norm:.4f}")
-    assert rel_norm < 0.1
+    print(f"{Ty.name} mx_conv2d vs float64: rel norm {rel_norm:.4f}")
+    assert rel_norm < _tol(Ty)
 
 
-def test_mx_conv2d_hls():
+@pytest.mark.parametrize("Ty", FORMATS, ids=lambda t: t.name)
+def test_mx_conv2d_hls(Ty):
     B, Cin, Cout, H, K, S, P = HLS_CONFIG
-    inst, Oh = _inst(B, Cin, Cout, H, K, S, P)
+    inst, Oh = _inst(Ty, B, Cin, Cout, H, K, S, P)
     s = allo.customize(nn.mx_conv2d, instantiate=inst)
     nn.schedule_mx_conv2d(s)
     code = str(s.build(target="vhls"))
@@ -111,6 +116,8 @@ def test_mx_conv2d_hls():
     project = os.environ.get("ALLO_PROJECT")
     if mode is None or not hls.is_available("vitis_hls"):
         return
+    if os.environ.get("ALLO_MXFORMAT", "mxint8_k32") != Ty.name:
+        return  # one Vitis run per invocation
     if mode != "csyn" and "XDEVICE" not in os.environ:
         print(f"Skipping {mode} run: set XDEVICE to a platform .xpfm to run this mode")
         return
@@ -130,7 +137,7 @@ def test_mx_conv2d_hls():
     inp, kernel, bias = _inputs(B, Cin, Cout, H, K)
     Z = np.zeros((B, Cout, Oh, Oh), np.float32)
     hls_mod(inp, kernel, bias, Z)
-    ref, _ = _mx_conv2d_ref(inp, kernel, bias, K, S, P)
+    ref, _ = _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P)
     print(f"[{mode}] max abs diff vs ref: {np.abs(Z - ref).max()}")
     np.testing.assert_array_equal(Z, ref)
 
@@ -148,12 +155,16 @@ if __name__ == "__main__":
             os.path.dirname(os.path.abspath(__file__)), "mx_conv2d.prj"
         ),
     )
+    parser.add_argument(
+        "--format", choices=[t.name for t in FORMATS], default="mxint8_k32"
+    )
     parser.add_argument("--clean", action="store_true", help="Clean the project dir")
 
     args, pytest_args = parser.parse_known_args()
 
     os.environ["ALLO_HLSMODE"] = args.mode
     os.environ["ALLO_PROJECT"] = args.project
+    os.environ["ALLO_MXFORMAT"] = args.format
     if args.clean:
         shutil.rmtree(args.project, ignore_errors=True)
 

@@ -1467,5 +1467,28 @@ def test_constant_tensor_slice_2d():
     np.testing.assert_allclose(result, np_A[1], rtol=1e-5)
 
 
+def test_generic_instances_with_property_named_local():
+    # the second instance of mid[...] builds leaf again while the bare name
+    # already maps to the first instance's FuncOp; a local named `result`
+    # (a FuncOp property) must not be attached to it
+    def leaf(x: int32) -> int32:
+        result: int32 = x + 1
+        return result
+
+    def mid[T, N](x: "T[N]") -> "T[N]":
+        y: T[N]
+        for i in range(N):
+            y[i] = leaf(x[i])
+        return y
+
+    def top(a: int32[4], b: int32[8]) -> int32[8]:
+        c = mid[int32, 4](a)
+        return mid[int32, 8](b)
+
+    mod = allo.customize(top).build()
+    b = np.arange(8, dtype=np.int32)
+    np.testing.assert_array_equal(mod(np.arange(4, dtype=np.int32), b), b + 1)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

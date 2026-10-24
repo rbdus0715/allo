@@ -141,8 +141,16 @@ def test_mx_linear(kernel):
     _run_hls(kernel, args, Z)
 
 
-@pytest.mark.parametrize("dims", [(M, N, K), (16, 64, 96)])
-def test_mx_linear2d(dims):
+# MX element formats: integer and float elements, block sizes 32 and 16
+FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
+
+
+@pytest.mark.parametrize(
+    "Tf, dims",
+    [(FORMATS[0], (16, 64, 96))] + [(t, (M, N, K)) for t in FORMATS],
+    ids=lambda x: getattr(x, "name", str(x)),
+)
+def test_mx_linear2d(Tf, dims):
     # float32 operands: the block-streamed dataflow equals mx_linear2d_ref
     m, n, k = dims
     rng = np.random.default_rng(1)
@@ -150,7 +158,7 @@ def test_mx_linear2d(dims):
         rng.standard_normal(shape) * 2.0 ** rng.integers(-4, 4, shape)
     ).astype(np.float32)
     X, W, bias = rand((m, k)), rand((n, k)), rand((n,))
-    inst = [Ty, m, n, k]
+    inst = [Tf, m, n, k]
     Z = allo.customize(nn.mx_linear2d, instantiate=inst).build(target="llvm")(
         X, W, bias
     )

@@ -3255,7 +3255,12 @@ class ASTTransformer(ASTBuilder):
                     ctx.global_vars[key] = value
             # Attach buffers to function
             # FIXME: Should create subschedule
+            # Not to a FuncOp: a later instance of a function finds the first
+            # instance's FuncOp under the bare name, and its buffer names can
+            # clash with FuncOp properties (e.g. a local named `result`)
             for name, buffer in func_ctx.buffers.items():
+                if isinstance(func, func_d.FuncOp):
+                    break
                 if isinstance(buffer, (memref_d.AllocOp, MockArg)):
                     # Intermediate buffers and function arguments
                     setattr(func, name, MockBuffer(func_name, name))
