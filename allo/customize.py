@@ -1421,6 +1421,7 @@ def customize(
     global_vars.setdefault("mx_dot", mx_dot)
     global_vars.setdefault("mx_linear2d", mx_linear2d)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
+    global_vars.setdefault("dsl", sys.modules["allo.dsl"])  # dsl.grid in nn bodies
     global_vars.setdefault("mx_matmul", mx_matmul)
     global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
     global_vars.setdefault("mx_block_dot", mx_block_dot)

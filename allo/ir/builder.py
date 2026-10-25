@@ -2552,6 +2552,7 @@ class ASTTransformer(ASTBuilder):
     @staticmethod
     def build_Call(ctx: ASTContext, node: ast.Call, out_buffer: OpView = None):
         original_func_id = ctx.func_id
+        built = None  # a generic function's unsuffixed instance, once built
         if isinstance(node.func, ast.Name):
             obj = ASTResolver.resolve(node.func, ctx.global_vars)
             obj_name = node.func.id
@@ -2564,6 +2565,7 @@ class ASTTransformer(ASTBuilder):
             obj_name = (
                 node.func.value.id if isinstance(obj, func_d.FuncOp) else obj.__name__
             )
+            built = ctx.global_vars.get(obj_name)
             ctx.global_vars[obj_name] = obj
             ctx.inst = ASTResolver.resolve_param_types(node.func.slice, ctx.global_vars)
             if ctx.func_id is None:
@@ -2582,6 +2584,9 @@ class ASTTransformer(ASTBuilder):
                     func_dict = ctx.func_name2id.setdefault(obj_name, {})
                     func_dict[func_id] = tuple(ctx.inst)
                 ctx.func_id = func_id
+            if ctx.func_id is None and isinstance(built, func_d.FuncOp):
+                # the unsuffixed instance is already built: reuse it, not rebuild
+                ctx.global_vars[obj_name] = built
         else:
             raise RuntimeError("Unsupported function call")
 
@@ -3277,6 +3282,9 @@ class ASTTransformer(ASTBuilder):
             new_args,
             ip=ctx.get_ip(),
         )
+        if isinstance(built, func_d.FuncOp):
+            # building another instance replaced it under the bare name
+            ctx.global_vars[obj_name] = built
         ctx.func_id = original_func_id
         return call_op
 

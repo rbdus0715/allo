@@ -183,6 +183,27 @@ def mx_quantize_rows[
     return Q
 
 
+def mx_quantize_cols[
+    Ty, R, K
+](X: "float32[K, R]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
+    # float32 [K, R] -> MX matrix of X^T: blocks run down the columns, e.g.
+    # V in attention's P @ V (mx_linear2d reduces along the block axis). Its
+    # own loop, not _mx_quantize_rows: Allo would name that helper's instance
+    # here like the one inside mx_quantize_rows_<n>
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    Q: Ty[R, NB]
+    for r, b in allo.grid(R, NB):
+        blk: float32[BS]
+        for e in range(BS):
+            fq: float32 = 0.0
+            if b * BS + e < K:
+                fq = X[b * BS + e, r]
+            blk[e] = fq
+        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
+    return Q
+
+
 # earlier name; layers call mx_quantize_rows, which host code (mxint8.mx_quantize)
 # does not shadow in the caller's globals
 mx_quantize = mx_quantize_rows

@@ -22,6 +22,7 @@ from allo.library.nn import mx_linear2d_ref
 from allo.library.mxint8 import (
     mx_quantize,
     mx_pack_np,
+    mx_unpack_np,
     patch_extern_c_for_class_return_types,
 )
 
@@ -174,6 +175,19 @@ def test_mx_linear2d(Tf, dims):
     s = allo.customize(nn.mx_linear2d, instantiate=inst)
     code = str(nn.schedule_mx_linear2d(s).build(target="vhls"))
     assert "#pragma HLS pipeline" in code
+
+
+@pytest.mark.parametrize("Tf", FORMATS, ids=lambda t: t.name)
+def test_mx_quantize_cols(Tf):
+    # blocks down the columns of a [K, R] array == host packing of its transpose
+    k, r = 40, 3
+    X = np.random.default_rng(2).standard_normal((k, r)).astype(np.float32)
+    Q = allo.customize(nn.mx_quantize_cols, instantiate=[Tf, r, k]).build(
+        target="llvm"
+    )(X)
+    np.testing.assert_array_equal(
+        mx_unpack_np(Tf, Q), mx_unpack_np(Tf, mx_pack_np(Tf, X.T))
+    )
 
 
 if __name__ == "__main__":

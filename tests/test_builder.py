@@ -1490,5 +1490,24 @@ def test_generic_instances_with_property_named_local():
     np.testing.assert_array_equal(mod(np.arange(4, dtype=np.int32), b), b + 1)
 
 
+def test_generic_instance_called_again():
+    # an instance called again, also after another instance, is reused
+    def inc[T, N](x: "T[N]") -> "T[N]":
+        y: T[N]
+        for i in range(N):
+            y[i] = x[i] + 1
+        return y
+
+    def top(a: int32[4], b: int32[8]) -> int32[4]:
+        c = inc[int32, 4](a)
+        d = inc[int32, 8](b)
+        return inc[int32, 4](c)
+
+    s = allo.customize(top)
+    assert str(s.module).count("func.func @inc") == 2  # inc, inc_1
+    a = np.arange(4, dtype=np.int32)
+    np.testing.assert_array_equal(s.build()(a, np.arange(8, dtype=np.int32)), a + 2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
