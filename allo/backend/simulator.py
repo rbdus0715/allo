@@ -957,6 +957,8 @@ class LLVMOMPModule(LLVMModule):
                 os.path.join(os.getenv("LLVM_BUILD_DIR"), "lib", "libomp.so"),
             ]
             shared_libs += [lib.compile_shared_lib() for lib in ext_libs]
+            # size wide ints as the JIT's host codegen will (see AlloToLLVM.cpp)
+            allo_d.set_host_data_layout(self.module)
             self.execution_engine = ExecutionEngine(
                 self.module, opt_level=2, shared_libs=shared_libs
             )

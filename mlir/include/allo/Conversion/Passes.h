@@ -25,6 +25,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerMemCopyOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerPrintOpsPass();
 
 bool applyAlloToLLVMLoweringPass(ModuleOp &module, MLIRContext &context);
+// Sets the module's llvm.data_layout to the host target machine's, as the
+// MLIR ExecutionEngine JIT sees it; false if the host cannot be detected.
+bool setHostDataLayout(ModuleOp &module);
 bool applyFixedPointToInteger(ModuleOp &module);
 bool applyLowerCompositeType(ModuleOp &module);
 bool applyLowerBitOps(ModuleOp &module);

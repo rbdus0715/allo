@@ -5,18 +5,14 @@ import numpy as np
 import pytest
 import allo
 import allo.ir.types as T
-from allo.backend.simulator import LLVMOMPModule
 import allo.library.nn as nn
 from allo.library.nn import (
     mx_matmul,
     mx_linear2d,
     mx_linear2d_ref,
     mx_linear3d,
-    make_mx_matmul_dataflow,
-    make_mx_linear2d_dataflow,
-    mx_hbm_mapping,
 )
-from allo.library.mxint8 import mx_quantize, mx_pack_words
+from allo.library.mxint8 import mx_quantize, mx_pack_np
 
 Ty = T.mxint8
 
@@ -61,7 +57,7 @@ def test_mx_linear2d():
 
     s = allo.customize(mx_linear2d, instantiate=[Ty, M, N, K])
     mod = s.build(target="llvm")
-    Z = mod(X, W, bias)
+    Z = mod(mx_pack_np(Ty, X), mx_pack_np(Ty, W), bias)
 
     ref = X.astype(np.float64) @ W.astype(np.float64).T + bias.astype(np.float64)
     _assert_close(Z, ref, "mx_linear2d")
@@ -75,7 +71,9 @@ def test_mx_linear2d():
     def kernel(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        return nn.mx_linear2d[Ty, M, N, K](X, W, bias)
+        Xq = nn.mx_quantize_rows[Ty, M, K](X)
+        Wq = nn.mx_quantize_rows[Ty, N, K](W)
+        return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
 
     s_k = allo.customize(kernel)
     np.testing.assert_array_equal(Z, s_k.build(target="llvm")(X, W, bias))
@@ -90,7 +88,7 @@ def test_mx_linear3d():
 
     s = allo.customize(mx_linear3d, instantiate=[Ty, B, L, D, M])
     mod = s.build(target="llvm")
-    Z = mod(X, W, bias)
+    Z = mod(X, mx_pack_np(Ty, W), bias)
 
     ref = np.einsum("bld,md->blm", X.astype(np.float64), W.astype(np.float64))
     ref = ref + bias.astype(np.float64)
@@ -119,7 +117,9 @@ def test_mx_linear2d_vs_float():
     def kernel_mx(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        return nn.mx_linear2d[Ty, M, N, K](X, W, bias)
+        Xq = nn.mx_quantize_rows[Ty, M, K](X)
+        Wq = nn.mx_quantize_rows[Ty, N, K](W)
+        return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
 
     mod_mx = allo.customize(kernel_mx).build(target="llvm")
     Z_mx = mod_mx(X, W, bias)
@@ -218,54 +218,15 @@ def test_mx_gemm_variants(M, N, K):
     Xq, Xs = mx_quantize(Ty, X)
     Wq, Ws = mx_quantize(Ty, W)
     Bq, Bs = mx_quantize(Ty, B, axis=0)
-    build = lambda f, *t: allo.customize(
-        f, instantiate=[Ty, M, N, K, NB, *t]
-    ).build(target="llvm")
+    build = lambda f, *t: allo.customize(f, instantiate=[Ty, M, N, K, NB, *t]).build(
+        target="llvm"
+    )
     np.testing.assert_array_equal(build(nn.mx_gemm_wq, 0)(X, Wq, Ws, bias), ref_lin)
     np.testing.assert_array_equal(build(nn.mx_gemm_q, 0)(Xq, Xs, Wq, Ws, bias), ref_lin)
     np.testing.assert_array_equal(build(nn.mx_gemm_ff, 0)(X, W, bias), ref_lin)
     np.testing.assert_array_equal(build(nn.mx_matmul_wq)(X, Bq, Bs), ref_mm)
     np.testing.assert_array_equal(build(nn.mx_matmul_q)(Xq, Xs, Bq, Bs), ref_mm)
     np.testing.assert_array_equal(build(nn.mx_matmul_ff)(X, B), ref_mm)
-
-
-def test_mx_matmul_dataflow():
-    M, N, K, P = 8, 6, 64, 2  # M > stream depth (4)
-    rng = np.random.default_rng(0)
-    A = _rand((M, K), rng)
-    B = _rand((N, K), rng)
-
-    s = make_mx_matmul_dataflow(Ty, M, N, K, P)
-    mod = LLVMOMPModule(s.module, s.top_func_name)
-    Z = np.zeros(M * N, dtype=np.float32)
-    mod(mx_pack_words(A, 512), mx_pack_words(B, 512), Z)
-    Z = Z.reshape(M, N)
-
-    s_ref = allo.customize(mx_matmul, instantiate=[Ty, M, N, K])
-    np.testing.assert_array_equal(Z, s_ref.build(target="llvm")(A, B))
-
-    ref = A.astype(np.float64) @ B.astype(np.float64).T
-    _assert_close(Z, ref, "mx_matmul_dataflow")
-
-
-def test_mx_linear2d_dataflow():
-    M, N, K, P = 8, 6, 64, 2  # M > stream depth (4)
-    rng = np.random.default_rng(1)
-    X = _rand((M, K), rng)
-    W = _rand((N, K), rng)
-    bias = _rand((N,), rng)
-
-    s = make_mx_linear2d_dataflow(Ty, M, N, K, P)
-    mod = LLVMOMPModule(s.module, s.top_func_name)
-    Z = np.zeros(M * N, dtype=np.float32)
-    mod(mx_pack_words(X, 512), mx_pack_words(W, 512), bias, Z)
-    Z = Z.reshape(M, N)
-
-    s_ref = allo.customize(mx_linear2d_ref, instantiate=[Ty, M, N, K])
-    np.testing.assert_array_equal(Z, s_ref.build(target="llvm")(X, W, bias))
-
-    ref = X.astype(np.float64) @ W.astype(np.float64).T + bias.astype(np.float64)
-    _assert_close(Z, ref, "mx_linear2d_dataflow")
 
 
 # element width / block size other than mxint8's 8 / 32
@@ -289,7 +250,9 @@ def test_mx_custom_format_linear(Tc):
     def lin_ff(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        return nn.mx_linear2d[Tc, M, N, K](X, W, bias)
+        Xq = nn.mx_quantize_rows[Tc, M, K](X)
+        Wq = nn.mx_quantize_rows[Tc, N, K](W)
+        return nn.mx_linear2d[Tc, M, N, K](Xq, Wq, bias)
 
     def lin_q(
         Xq: "Int(EB)[M, K]",
@@ -306,38 +269,6 @@ def test_mx_custom_format_linear(Tc):
     build = lambda f: allo.customize(f).build(target="llvm")
     np.testing.assert_array_equal(build(lin_ff)(X, W, bias), ref)
     np.testing.assert_array_equal(build(lin_q)(Xq, Xs, Wq, Ws, bias), ref)
-
-
-@pytest.mark.parametrize("Tc", [T.MXInt(4, 16), T.MXInt(6, 64)], ids=lambda t: t.name)
-def test_mx_custom_format_dataflow(Tc):
-    M, N, K, P = 4, 6, 2 * Tc.block_size, 2
-    rng = np.random.default_rng(8)
-    X = _rand((M, K), rng)
-    W = _rand((N, K), rng)
-    bias = _rand((N,), rng)
-    X_w = mx_pack_words(X, 512)
-
-    s_ref = make_mx_linear2d_dataflow(Tc, M, N, K, P)
-    Z_ref = np.zeros(M * N, dtype=np.float32)
-    LLVMOMPModule(s_ref.module, s_ref.top_func_name)(
-        X_w, mx_pack_words(W, 512), bias, Z_ref
-    )
-    ref = allo.customize(mx_linear2d_ref, instantiate=[Tc, M, N, K]).build(
-        target="llvm"
-    )(X, W, bias)
-    np.testing.assert_array_equal(Z_ref.reshape(M, N), ref)
-
-
-def test_mx_hbm_mapping():
-    s = make_mx_linear2d_dataflow(Ty, 8, 6, 64, 2)
-    assert mx_hbm_mapping(s) == {
-        "X": "HBM[0]",
-        "W": "HBM[1]",
-        "bias": "HBM[2]",
-        "Z": "HBM[2]",
-    }
-    assert mx_hbm_mapping(s, base=4)["W"] == "HBM[5]"
-    assert mx_hbm_mapping(s, memory="DDR")["X"] == "DDR[0]"  # Alveo U250
 
 
 if __name__ == "__main__":
@@ -416,7 +347,9 @@ def test_mxfp_linear(Tf):
     def lin_ff(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        return nn.mx_linear2d[Tf, M, N, K](X, W, bias)
+        Xq = nn.mx_quantize_rows[Tf, M, K](X)
+        Wq = nn.mx_quantize_rows[Tf, N, K](W)
+        return nn.mx_linear2d[Tf, M, N, K](Xq, Wq, bias)
 
     def lin_q(
         Xq: "Int(EB)[M, K]",

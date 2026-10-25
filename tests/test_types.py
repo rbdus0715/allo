@@ -795,5 +795,46 @@ def test_wide_uint_array_stride():
     assert mod(raw.view(dt).reshape(4)) == 0xA3
 
 
+_WIDE_LOCAL_ARRAY = """
+import numpy as np, allo
+from allo.ir.types import UInt, int32
+
+def kernel(x: int32[16]) -> int32[16]:
+    a: UInt({bits})[16]
+    for i in range(16):
+        w: UInt({bits}) = 0
+        w[0:32] = x[i]
+        w[{bits} - 32 : {bits}] = x[i] + 1
+        a[i] = w
+    out: int32[16]
+    for j in range(16):
+        v: UInt({bits}) = a[j]
+        hi: int32 = v[{bits} - 32 : {bits}]
+        lo: int32 = v[0:32]
+        out[j] = hi * 1000 + lo
+    return out
+
+xs = np.arange(1, 17, dtype=np.int32)
+got = allo.customize(kernel).build(target="llvm")(xs)
+assert np.array_equal(got, (xs + 1) * 1000 + xs), got
+"""
+
+
+@pytest.mark.parametrize("bits", [200, 264])
+def test_wide_uint_local_array(bits, tmp_path):
+    # in-kernel arrays of ints whose LLVM default and host sizes differ
+    # (i264: 36 vs 48 B) used to overrun their mallocs; the heap corruption
+    # surfaced as a hang or an abort at exit, so run it in a fresh process
+    import subprocess
+    import sys
+
+    script = tmp_path / "kernel.py"
+    script.write_text(_WIDE_LOCAL_ARRAY.format(bits=bits))
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=300
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

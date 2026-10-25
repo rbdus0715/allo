@@ -1,6 +1,10 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# nn.mx_conv2d: LLVM numerics per MX format, plus Vitis HLS runs:
+#   pytest tests/test_mx_conv2d.py                       -> LLVM + HLS codegen
+#   python tests/test_mx_conv2d.py --mode csyn|hw_emu    -> + Vitis HLS
+
 import os
 import shutil
 
@@ -10,135 +14,109 @@ import allo
 import allo.backend.hls as hls
 import allo.ir.types as T
 import allo.library.nn as nn
-from allo.library.mxint8 import patch_extern_c_for_class_return_types
+from allo.ir.types import float32
+from allo.library.mxint8 import (
+    mx_pack_np,
+    mx_unpack_np,
+    patch_extern_c_for_class_return_types,
+)
 
-# MX element formats: integer and float elements, block sizes 32 and 16
+# MX formats as MXInt(elem_bits, block_size) / MXFP(exp_bits, mantissa_bits, block_size)
 FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
 
-# (B, Cin, Cout, H, K, S, P): Cin*K*K = 32 (one block), 27 -> 32, 36 -> 64
-HLS_CONFIG = (1, 4, 8, 8, 3, 1, 1)
-CONFIGS = [
-    (1, 2, 3, 6, 4, 1, 0),
-    (2, 3, 4, 7, 3, 2, 1),
-    HLS_CONFIG,
-    # line-buffer edge cases: stride 2 without padding, 1x1, Cin > block size
-    (1, 8, 4, 9, 3, 2, 0),
-    (1, 3, 2, 5, 1, 1, 0),
-    (1, 40, 2, 4, 3, 1, 1),
-]
-# every config in mxint8, plus the padded/strided and Cin > block cases in
-# the other formats
-CASES = [(FORMATS[0], c) for c in CONFIGS] + [
-    (Ty, c) for Ty in FORMATS[1:] for c in (CONFIGS[1], CONFIGS[-1])
-]
-
-
-def _rand(shape, rng):
-    return (rng.standard_normal(shape) * 2.0 ** rng.integers(-4, 4, shape)).astype(
-        np.float32
-    )
-
-
-def _inputs(B, Cin, Cout, H, K, seed=0):
-    rng = np.random.default_rng(seed)
-    return (
-        _rand((B, Cin, H, H), rng),
-        _rand((Cout, Cin, K, K), rng),
-        _rand((Cout,), rng),
-    )
-
-
-def _im2col(inp, K, S, P, CKK):
-    B, Cin, H, _ = inp.shape
-    Oh = (H + 2 * P - K) // S + 1
-    padded = np.pad(inp, ((0, 0), (0, 0), (P, P), (P, P)))
-    patches = np.zeros((B * Oh * Oh, CKK), np.float32)
-    for r, (n, oh, ow) in enumerate(np.ndindex(B, Oh, Oh)):
-        win = padded[n, :, oh * S : oh * S + K, ow * S : ow * S + K]
-        patches[r, : Cin * K * K] = win.reshape(-1)
-    return patches, Oh
-
-
-def _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P):
-    """mx_conv2d's numerics from host-side im2col patches through
-    nn.mx_linear2d (checked per format against mx_linear2d_ref in
-    test_mx_linear.py), plus the float64 conv."""
-    B, Cout = inp.shape[0], kernel.shape[0]
-    BS = Ty.block_size
-    NBc = (kernel[0].size + BS - 1) // BS
-    patches, Oh = _im2col(inp, K, S, P, NBc * BS)
-    kflat = np.zeros((Cout, NBc * BS), np.float32)
-    kflat[:, : kernel[0].size] = kernel.reshape(Cout, -1)
-    lin = allo.customize(
-        nn.mx_linear2d, instantiate=[Ty, patches.shape[0], Cout, NBc * BS]
-    ).build(target="llvm")
-    out = lin(patches, kflat, bias)
-    exact = patches.astype(np.float64) @ kflat.T.astype(np.float64) + bias
-    to_nchw = lambda x: x.reshape(B, Oh, Oh, Cout).transpose(0, 3, 1, 2)
-    return to_nchw(out), to_nchw(exact)
-
-
-def _inst(Ty, B, Cin, Cout, H, K, S, P):
-    Oh = (H + 2 * P - K) // S + 1
-    return [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P], Oh
-
-
-def _tol(Ty):
-    return 0.1 if Ty.elem_bits >= 8 else 0.5  # vs float64, loose for 4-bit
-
-
-@pytest.mark.parametrize("Ty, cfg", CASES, ids=lambda x: getattr(x, "name", str(x)))
-def test_mx_conv2d_llvm(Ty, cfg):
-    B, Cin, Cout, H, K, S, P = cfg
-    inp, kernel, bias = _inputs(B, Cin, Cout, H, K)
-    inst, _ = _inst(Ty, *cfg)
-    Z = allo.customize(nn.mx_conv2d, instantiate=inst).build(target="llvm")(
-        inp, kernel, bias
-    )
-    ref, exact = _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P)
-    np.testing.assert_array_equal(Z, ref)
-    rel_norm = np.linalg.norm(Z - exact) / np.linalg.norm(exact)
-    print(f"{Ty.name} mx_conv2d vs float64: rel norm {rel_norm:.4f}")
-    assert rel_norm < _tol(Ty)
+# (B, Cin, Cout, H, K, S, P)
+CONFIGS = [(1, 2, 3, 6, 4, 1, 0), (2, 3, 4, 7, 3, 2, 1), (1, 40, 8, 8, 3, 1, 1)]
 
 
 @pytest.mark.parametrize("Ty", FORMATS, ids=lambda t: t.name)
-def test_mx_conv2d_hls(Ty):
-    B, Cin, Cout, H, K, S, P = HLS_CONFIG
-    inst, Oh = _inst(Ty, B, Cin, Cout, H, K, S, P)
-    s = allo.customize(nn.mx_conv2d, instantiate=inst)
-    nn.schedule_mx_conv2d(s)
-    code = str(s.build(target="vhls"))
-    assert "#pragma HLS dataflow" in code
-    assert code.count("#pragma HLS stream") >= 3  # P, XS, XE
+@pytest.mark.parametrize("B, Cin, Cout, H, K, S, P", CONFIGS)
+def test_mx_conv2d(Ty, B, Cin, Cout, H, K, S, P):
+    rng = np.random.default_rng(0)
+    rand = lambda shape: (
+        rng.standard_normal(shape) * 2.0 ** rng.integers(-4, 4, shape)
+    ).astype(np.float32)
+    inp, kernel, bias = rand((B, Cin, H, H)), rand((Cout, Cin, K, K)), rand((Cout,))
+    # MX operands: blocks along the channels (axis 1), packed on the host
+    xq, wq = mx_pack_np(Ty, inp, axis=1), mx_pack_np(Ty, kernel, axis=1)
+    Oh = (H + 2 * P - K) // S + 1
+    inst = [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
+    Z = allo.customize(nn.mx_conv2d, instantiate=inst).build(target="llvm")(
+        xq, wq, bias
+    )
 
+    # reference: each block dot exact, summed in float32 onto the bias in
+    # (kh, kw, channel block) order
+    BS, NB = Ty.block_size, xq.shape[1]
+    blocks = lambda q: np.moveaxis(mx_unpack_np(Ty, q, axis=1), 1, -1).reshape(
+        *q.shape[:1], *q.shape[2:], NB, BS
+    )
+    xd, wd = blocks(xq), blocks(wq)  # [A, P, Q, NB, BS]
+    ref = np.zeros((B, Cout, Oh, Oh), np.float32) + bias[None, :, None, None]
+    for kh, kw, cb, oh, ow in np.ndindex(K, K, NB, Oh, Oh):
+        ih, iw = oh * S + kh - P, ow * S + kw - P
+        if 0 <= ih < H and 0 <= iw < H:
+            dot = (xd[:, ih, iw, cb, None, :] * wd[None, :, kh, kw, cb]).sum(-1)
+            ref[:, :, oh, ow] += dot.astype(np.float32)
+    np.testing.assert_array_equal(Z, ref)
+
+    exact = np.zeros((B, Cout, Oh, Oh)) + bias[None, :, None, None]
+    xp = np.pad(inp.astype(np.float64), ((0, 0), (0, 0), (P, P), (P, P)))
+    for oh, ow in np.ndindex(Oh, Oh):
+        win = xp[:, :, oh * S : oh * S + K, ow * S : ow * S + K]
+        exact[:, :, oh, ow] += np.einsum("bchw,ochw->bo", win, kernel)
+    rel = np.linalg.norm(Z - exact) / np.linalg.norm(exact)
+    print(f"{Ty.name} mx_conv2d vs float64: rel norm {rel:.4f}")
+    assert rel < (0.1 if Ty.elem_bits >= 8 else 0.5)  # loose for 4-bit elements
+
+    s = allo.customize(nn.mx_conv2d, instantiate=inst)
+    code = str(nn.schedule_mx_conv2d(s).build(target="vhls"))
+    assert "#pragma HLS pipeline" in code
+
+
+def test_mx_conv2d_hls():
+    # Vitis HLS run of one config/format, when --mode (ALLO_HLSMODE) is given
     mode = os.environ.get("ALLO_HLSMODE")
-    project = os.environ.get("ALLO_PROJECT")
-    if mode is None or not hls.is_available("vitis_hls"):
+    if not mode or not hls.is_available("vitis_hls"):
         return
-    if os.environ.get("ALLO_MXFORMAT", "mxint8_k32") != Ty.name:
-        return  # one Vitis run per invocation
     if mode != "csyn" and "XDEVICE" not in os.environ:
         print(f"Skipping {mode} run: set XDEVICE to a platform .xpfm to run this mode")
         return
+    Ty = {t.name: t for t in FORMATS}[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
+    B, Cin, Cout, H, K, S, P = CONFIGS[-1]
+    Oh = (H + 2 * P - K) // S + 1
+    conv = [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
 
+    def top(
+        inp: "float32[B, Cin, H, H]",
+        kernel: "float32[Cout, Cin, K, K]",
+        bias: "float32[Cout]",
+    ) -> "float32[B, Cout, Oh, Oh]":
+        xq = nn.mx_quantize_channels[Ty, B, Cin, H, H](inp)
+        wq = nn.mx_quantize_channels[Ty, Cout, Cin, K, K](kernel)
+        return nn.mx_conv2d[Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P](
+            xq, wq, bias
+        )
+
+    s = allo.customize(top)
+    s.compose(nn.mx_quantize_channels, instantiate=[Ty, B, Cin, H, H])
+    s.compose(nn.mx_quantize_channels, instantiate=[Ty, Cout, Cin, K, K], id="1")
+    s.compose(nn.mx_conv2d, instantiate=conv)
+    project = os.environ["ALLO_PROJECT"]
     hls_mod = s.build(target="vitis_hls", mode=mode, project=project)
     # issue #603: extern "C" functions returning ap_int<N> (the packed MX word)
     patch_extern_c_for_class_return_types(f"{project}/kernel.cpp")
-
     if mode == "csyn":
         hls_mod()
-        rpt = os.path.join(
-            project, "out.prj", "solution1", "syn", "report", "mx_conv2d_csynth.rpt"
-        )
-        assert os.path.isfile(rpt)
         return
 
-    inp, kernel, bias = _inputs(B, Cin, Cout, H, K)
+    rng = np.random.default_rng(0)
+    inp = rng.standard_normal((B, Cin, H, H)).astype(np.float32)
+    kernel = rng.standard_normal((Cout, Cin, K, K)).astype(np.float32)
+    bias = rng.standard_normal(Cout).astype(np.float32)
     Z = np.zeros((B, Cout, Oh, Oh), np.float32)
     hls_mod(inp, kernel, bias, Z)
-    ref, _ = _mx_conv2d_ref(Ty, inp, kernel, bias, K, S, P)
-    print(f"[{mode}] max abs diff vs ref: {np.abs(Z - ref).max()}")
+    ref = allo.customize(top).build(target="llvm")(inp, kernel, bias)
+    print(f"[{mode}] hw == LLVM bit-exact: {np.array_equal(Z, ref)}")
     np.testing.assert_array_equal(Z, ref)
 
 

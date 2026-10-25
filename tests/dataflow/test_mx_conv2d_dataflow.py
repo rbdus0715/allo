@@ -1,10 +1,9 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Chaining library kernels whose insides are a dataflow: nn.mx_conv2d is a
-# plain Allo function, and its registered schedule (im2col -> MX quantize ->
-# block dot, streamed one MX block per token) is applied per call site with
-# s.compose(nn.mx_conv2d, instantiate=..., id=...).
+# Chaining library kernels: the activations are MX-quantized on chip
+# (nn.mx_quantize_channels), the weights on the host (mx_pack_np). Each call's
+# registered schedule is applied with s.compose(fn, instantiate=..., id=...).
 
 import os
 import tempfile
@@ -15,7 +14,7 @@ import allo
 import allo.backend.hls as hls
 import allo.ir.types as T
 import allo.library.nn as nn
-from allo.library.mxint8 import patch_extern_c_for_class_return_types
+from allo.library.mxint8 import mx_pack_np, patch_extern_c_for_class_return_types
 
 # MX formats as MXInt(elem_bits, block_size) / MXFP(exp_bits, mantissa_bits, block_size)
 FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
@@ -30,13 +29,15 @@ def model[
     Ty
 ](
     inp: "float32[1, C0, H0, H0]",
-    k1: "float32[C1, C0, K0, K0]",
+    k1: "Ty[C1, (C0 + Ty.block_size - 1) // Ty.block_size, K0, K0]",
     b1: "float32[C1]",
-    k2: "float32[C2, C1, K0, K0]",
+    k2: "Ty[C2, (C1 + Ty.block_size - 1) // Ty.block_size, K0, K0]",
     b2: "float32[C2]",
 ) -> "float32[1, C2, H0, H0]":
-    a = nn.mx_conv2d[Ty, 1, C0, C1, H0, H0, K0, K0, H0, H0, 1, 1, 1, 1](inp, k1, b1)
-    return nn.mx_conv2d[Ty, 1, C1, C2, H0, H0, K0, K0, H0, H0, 1, 1, 1, 1](a, k2, b2)
+    x = nn.mx_quantize_channels[Ty, 1, C0, H0, H0](inp)
+    a = nn.mx_conv2d[Ty, 1, C0, C1, H0, H0, K0, K0, H0, H0, 1, 1, 1, 1](x, k1, b1)
+    aq = nn.mx_quantize_channels[Ty, 1, C1, H0, H0](a)
+    return nn.mx_conv2d[Ty, 1, C1, C2, H0, H0, K0, K0, H0, H0, 1, 1, 1, 1](aq, k2, b2)
 
 
 def _rand(shape, rng):
@@ -49,6 +50,8 @@ def _compose_model(Ty):
     s = allo.customize(model, instantiate=[Ty])
     # the n-th call of a library function (and of its helpers) is suffixed
     # "_n" for n > 0, so the first compose takes no id
+    s.compose(nn.mx_quantize_channels, instantiate=[Ty, 1, C0, H0, H0])
+    s.compose(nn.mx_quantize_channels, instantiate=[Ty, 1, C1, H0, H0], id="1")
     s.compose(nn.mx_conv2d, instantiate=[Ty, *CONV1])
     s.compose(nn.mx_conv2d, instantiate=[Ty, *CONV2], id="1")
     s.dataflow("model")
@@ -59,8 +62,9 @@ def _compose_model(Ty):
 def test_mx_conv2d_chain(Ty):
     rng = np.random.default_rng(1)
     inp = _rand((1, C0, H0, H0), rng)
-    k1, b1 = _rand((C1, C0, K0, K0), rng), _rand((C1,), rng)
-    k2, b2 = _rand((C2, C1, K0, K0), rng), _rand((C2,), rng)
+    k1 = mx_pack_np(Ty, _rand((C1, C0, K0, K0), rng), axis=1)
+    k2 = mx_pack_np(Ty, _rand((C2, C1, K0, K0), rng), axis=1)
+    b1, b2 = _rand((C1,), rng), _rand((C2,), rng)
 
     # numerics: the chain equals the two layers run one by one
     Y = allo.customize(model, instantiate=[Ty]).build(target="llvm")(
@@ -69,12 +73,12 @@ def test_mx_conv2d_chain(Ty):
     conv = lambda inst: allo.customize(nn.mx_conv2d, instantiate=[Ty, *inst]).build(
         target="llvm"
     )
-    a = conv(CONV1)(inp, k1, b1)
-    np.testing.assert_array_equal(Y, conv(CONV2)(a, k2, b2))
+    a = conv(CONV1)(mx_pack_np(Ty, inp, axis=1), k1, b1)
+    np.testing.assert_array_equal(Y, conv(CONV2)(mx_pack_np(Ty, a, axis=1), k2, b2))
 
     code = str(_compose_model(Ty).build(target="vhls"))
-    assert code.count("#pragma HLS dataflow") >= 3  # model + one per conv
-    assert code.count("#pragma HLS stream") >= 6  # P, XS, XE per conv
+    assert "#pragma HLS dataflow" in code  # the two layers overlap
+    assert code.count("#pragma HLS pipeline") >= 4  # quantizers + block-dot loops
 
 
 def test_mx_conv2d_chain_csyn():

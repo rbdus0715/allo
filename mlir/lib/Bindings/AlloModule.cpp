@@ -166,6 +166,11 @@ static bool lowerAlloToLLVM(MlirModule &mlir_mod, MlirContext &mlir_ctx) {
   return applyAlloToLLVMLoweringPass(mod, *ctx);
 }
 
+static bool setModuleHostDataLayout(MlirModule &mlir_mod) {
+  auto mod = unwrap(mlir_mod);
+  return mlir::allo::setHostDataLayout(mod);
+}
+
 static bool lowerFixedPointToInteger(MlirModule &mlir_mod) {
   auto mod = unwrap(mlir_mod);
   return applyFixedPointToInteger(mod);
@@ -354,6 +359,7 @@ NB_MODULE(_allo, m) {
 
   // LLVM backend APIs.
   allo_m.def("lower_allo_to_llvm", &lowerAlloToLLVM);
+  allo_m.def("set_host_data_layout", &setModuleHostDataLayout);
   allo_m.def("lower_fixed_to_int", &lowerFixedPointToInteger);
   allo_m.def("lower_anywidth_int", &lowerAnyWidthInteger);
   allo_m.def("move_return_to_input", &moveReturnToInput);

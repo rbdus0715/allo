@@ -131,14 +131,84 @@ def mx_pack_f32_blocks(x):
     )
 
 
-def mx_pack_nhwc_blocks(x):
-    """Packs a float32 NCHW feature map for nn.mx_unpack_nhwc: reordered to
-    NHWC rows (W * C % 32 == 0), then split like mx_pack_f32_blocks."""
+def mx_dequantize_np(Ty, elems, scales):
+    """Host inverse of mx_quantize, in float64: (elements, e8m0 scales along the
+    last axis) -> values. MXFP elements are bit patterns, MXINT the integers."""
     import numpy as np  # pylint: disable=import-outside-toplevel
 
-    x = np.asarray(x, dtype=np.float32)
-    B, C, H, W = x.shape
-    return mx_pack_f32_blocks(x.transpose(0, 2, 3, 1).reshape(B * H, W * C))
+    e = np.asarray(elems, dtype=np.int64)
+    if Ty.is_float:
+        m, eb = Ty.mantissa_bits, Ty.elem_bits
+        codes = e & ((1 << eb) - 1)
+        exp = (codes >> m) & ((1 << Ty.exp_bits) - 1)
+        mant = codes & ((1 << m) - 1)
+        mag = np.where(
+            exp == 0,
+            mant * 2.0 ** (1 - Ty.bias - m),
+            (1 + mant / 2.0**m) * 2.0 ** (exp - Ty.bias),
+        )
+        vals = np.where(codes >> (eb - 1), -mag, mag)
+    else:
+        vals = e.astype(np.float64)
+    scale = np.repeat(np.asarray(scales, dtype=np.int64), Ty.block_size, axis=-1)
+    return vals * 2.0 ** (scale - 127)
+
+
+def _mx_word_dtype(Ty):
+    # numpy dtype of one Ty element as the LLVM backend lays it out
+    from ..utils import (  # pylint: disable=import-outside-toplevel
+        get_llvm_wide_int_struct_type,
+        get_np_struct_type,
+    )
+
+    if Ty.bits > 64:
+        return get_llvm_wide_int_struct_type(Ty.bits)
+    return get_np_struct_type(max(8, 1 << (Ty.bits - 1).bit_length()))
+
+
+def mx_pack_np(Ty, x, axis=-1):
+    """Host MX quantization into an array of Ty words (scale | elements), the
+    operand of nn.mx_linear2d / nn.mx_conv2d: blocks run along `axis`, which
+    is zero-padded to whole blocks and becomes the block axis (length NB)."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    BS, EB = Ty.block_size, Ty.elem_bits
+    x = np.moveaxis(np.asarray(x, dtype=np.float32), axis, -1)
+    lead, K = x.shape[:-1], x.shape[-1]
+    NB = -(-K // BS)
+    rows = np.zeros((int(np.prod(lead)), NB * BS), np.float32)
+    rows[:, :K] = x.reshape(-1, K)
+    elems, scales = _mx_quantize_np(Ty, rows)
+    codes = elems.astype(np.int64).reshape(-1, NB, BS) & ((1 << EB) - 1)
+    bits = np.zeros((rows.shape[0], NB, Ty.bits), np.uint8)
+    bits[..., : BS * EB] = ((codes[..., None] >> np.arange(EB)) & 1).reshape(
+        *codes.shape[:2], -1
+    )
+    bits[..., BS * EB :] = (scales.astype(np.int64)[..., None] >> np.arange(8)) & 1
+    raw = np.packbits(bits, axis=-1, bitorder="little")
+    dtype = _mx_word_dtype(Ty)
+    words = np.zeros(raw.shape[:-1] + (dtype.itemsize,), np.uint8)
+    words[..., : raw.shape[-1]] = raw
+    words = words.view(dtype)[..., 0].reshape(*lead, NB)
+    return np.ascontiguousarray(np.moveaxis(words, -1, axis))
+
+
+def mx_unpack_np(Ty, q, axis=-1, length=None):
+    """Inverse of mx_pack_np, in float64: Ty words -> values along `axis`
+    (`length` of them, default all NB * block_size)."""
+    import numpy as np  # pylint: disable=import-outside-toplevel
+
+    BS, EB = Ty.block_size, Ty.elem_bits
+    q = np.moveaxis(np.asarray(q), axis, -1)
+    raw = np.ascontiguousarray(q).view(np.uint8).reshape(*q.shape, -1)
+    bits = np.unpackbits(raw, axis=-1, bitorder="little")[..., : Ty.bits]
+    bits = bits.astype(np.int64)
+    codes = (bits[..., : BS * EB].reshape(*q.shape, BS, EB) << np.arange(EB)).sum(-1)
+    scales = (bits[..., BS * EB :] << np.arange(8)).sum(-1)
+    elems = codes - ((codes >> (EB - 1)) << EB)  # sign-extend
+    vals = mx_dequantize_np(Ty, elems.reshape(*q.shape[:-1], -1), scales)
+    vals = vals[..., : length if length is not None else vals.shape[-1]]
+    return np.moveaxis(vals, -1, axis)
 
 
 def _mx_quantize_np(Ty, x):

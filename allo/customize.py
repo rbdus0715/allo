@@ -80,14 +80,7 @@ from .library.nn import (
     _mx_pack_rows,
     _mx_dot_rows,
     _mx_dequantize_elem,
-    _mx_conv_wquant,
-    _mx_conv_rowblocks,
-    _mx_conv_lb_im2col,
-    _mx_quant_blocks,
-    _mx_lin_wquant,
-    _mx_lin_xpack,
-    _mx_lin_dot,
-    _mx_conv_dot,
+    mx_quantize_rows,
     mx_dot,
 )
 from .ir import types as _mx_types
@@ -522,7 +515,12 @@ class Schedule:
                                 "name",
                                 getattr(getattr(owner, "operation", None), "name", ""),
                             )
-                            if op_name == "memref.alloc" and "name" in owner.attributes:
+                            # a local array, or a named call result (the
+                            # callee returns what another function returned)
+                            if (
+                                op_name in ("memref.alloc", "func.call")
+                                and "name" in owner.attributes
+                            ):
                                 buf_name = StringAttr(owner.attributes["name"]).value
                                 result.append(MockBuffer(callee_name, buf_name))
                         break
@@ -1419,17 +1417,7 @@ def customize(
     global_vars.setdefault("_mx_pack_rows", _mx_pack_rows)
     global_vars.setdefault("_mx_dot_rows", _mx_dot_rows)
     global_vars.setdefault("_mx_dequantize_elem", _mx_dequantize_elem)
-    for _fn in (
-        _mx_conv_wquant,
-        _mx_conv_rowblocks,
-        _mx_conv_lb_im2col,
-        _mx_quant_blocks,
-        _mx_conv_dot,
-        _mx_lin_wquant,
-        _mx_lin_xpack,
-        _mx_lin_dot,
-    ):
-        global_vars.setdefault(_fn.__name__, _fn)  # mx_conv2d / mx_linear2d stages
+    global_vars.setdefault("mx_quantize_rows", mx_quantize_rows)  # in mx_linear3d
     global_vars.setdefault("mx_dot", mx_dot)
     global_vars.setdefault("mx_linear2d", mx_linear2d)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies

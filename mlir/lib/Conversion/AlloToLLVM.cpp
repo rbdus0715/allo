@@ -27,6 +27,8 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
+#include "llvm/Support/TargetSelect.h"
 
 using namespace mlir;
 using namespace allo;
@@ -80,6 +82,34 @@ struct AlloToLLVMLoweringPass
   }
 };
 } // namespace
+
+namespace mlir {
+namespace allo {
+// Translating an LLVM-dialect module without a data layout constant-folds
+// sizeof() with LLVM's default layout (64-bit ints 4-byte aligned: i264 is
+// 36 B), while the JIT's host codegen strides arrays at the host size (48 B
+// on x86-64), so in-kernel arrays of wide ints overrun their allocations.
+// Give the module the layout the JIT's target machine will use.
+bool setHostDataLayout(ModuleOp &module) {
+  llvm::InitializeNativeTarget();
+  auto builder = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!builder) {
+    llvm::consumeError(builder.takeError());
+    return false;
+  }
+  auto machine = builder->createTargetMachine();
+  if (!machine) {
+    llvm::consumeError(machine.takeError());
+    return false;
+  }
+  module->setAttr(
+      LLVM::LLVMDialect::getDataLayoutAttrName(),
+      StringAttr::get(module.getContext(),
+                      (*machine)->createDataLayout().getStringRepresentation()));
+  return true;
+}
+} // namespace allo
+} // namespace mlir
 
 namespace mlir {
 namespace allo {

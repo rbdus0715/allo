@@ -314,7 +314,33 @@ def build_for_loops(grid, ip, name="loop", stage_name=None):
     return for_loops
 
 
+def _stream_type(memref, depth):
+    if depth == -1:
+        depth = int(np.prod(memref.shape))
+    return MemRefType.get(
+        memref.shape,
+        memref.element_type,
+        memref.layout,
+        StringAttr.get(f"stream:{depth}"),
+    )
+
+
 def update_streaming_interface(module, target, depth=-1):
+    # A call result streamed to its consumer: the producer must return the
+    # stream too, or its signature no longer matches the call
+    if isinstance(target, func_d.CallOp):
+        callee = FlatSymbolRefAttr(target.attributes["callee"]).value
+        for func in module.body.operations:
+            if isinstance(func, func_d.FuncOp) and func.name.value == callee:
+                ret = func.entry_block.operations[
+                    len(func.entry_block.operations) - 1
+                ]
+                new_type = _stream_type(MemRefType(ret.operands[0].type), depth)
+                ret.operands[0].set_type(new_type)
+                in_types = func.attributes["function_type"].value.inputs
+                func.attributes["function_type"] = TypeAttr.get(
+                    FunctionType.get(in_types, [new_type])
+                )
     # Find target in the top function
     target_arr = {}
     # pylint: disable=too-many-nested-blocks

@@ -114,6 +114,8 @@ class LLVMModule:
                 ),
             ]
             shared_libs += [lib.compile_shared_lib() for lib in ext_libs]
+            # size wide ints as the JIT's host codegen will (see AlloToLLVM.cpp)
+            allo_d.set_host_data_layout(self.module)
             # opt_level should be set to 2 to avoid the following issue
             # https://github.com/cornell-zhang/allo/issues/72
             self.execution_engine = ExecutionEngine(

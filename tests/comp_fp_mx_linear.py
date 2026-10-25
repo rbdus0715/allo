@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=unsubscriptable-object, no-value-for-parameter
 
-# nn.mx_linear2d (mxint8) vs the same dataflow in plain float32: X rows stream
-# one 32-element block per token and the dot stage does one block dot per
-# cycle in both; float32 just has no quantize stages.
+# nn.mx_linear2d vs the same loop in plain float32: one block dot of 32
+# elements per cycle in both. MX: X is quantized on chip, W arrives
+# host-packed (one word per block); float32 reads a block from 32 banks.
 
 import os
 import shutil
@@ -17,9 +17,10 @@ import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import int32, float32, UInt, ConstExpr
 from allo.ir.utils import MockBuffer
-from allo.library.nn import _mx_lin_xpack, partition_block_lanes
+from allo.library.nn import partition_block_lanes
 from allo.library.mxint8 import (
     mx_pack_f32_blocks,
+    mx_pack_np,
     patch_extern_c_for_class_return_types,
 )
 
@@ -33,41 +34,21 @@ CONFIGS = {
 }
 
 
-def _fp_lin_wpack[N, K, NB, BS](W: "float32[N, K]", WF: "UInt(32 * BS)[N, NB]"):
-    # same as nn._mx_lin_wquant: one weight block per iteration (zero past K)
-    for wn, b in allo.grid(N, NB):
-        word: UInt(32 * BS) = 0
-        with allo.meta_for(BS) as e:
-            fw: float32 = 0.0
-            if b * BS + e < K:
-                fw = W[wn, b * BS + e]
-            word[e * 32 : (e + 1) * 32] = fw.bitcast()
-        WF[wn, b] = word
-
-
-def _fp_lin_dot[
-    M, N, NB, BS
-](
-    P: "UInt(32 * BS)[M, NB]",
-    WF: "UInt(32 * BS)[N, NB]",
-    bias: "float32[N]",
-    Z: "float32[M, N]",
-):
-    # same loop order as nn._mx_lin_dot: one float32 block dot per iteration
+def fp32_linear2d[
+    M, N, K
+](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
+    # nn.mx_linear2d's loops with a float32 block dot of BS elements
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    Z: float32[M, N]
     acc: float32[N] = 0.0
-    xw: UInt(32 * BS) = 0
     for m in range(M):
         for b, n in allo.grid(NB, N):
-            if n == 0:
-                xw = P[m, b]
-            ww: UInt(32 * BS) = WF[n, b]
             d: float32 = 0.0
             with allo.meta_for(BS) as e:
-                xb: int32 = xw[e * 32 : (e + 1) * 32]
-                wb: int32 = ww[e * 32 : (e + 1) * 32]
-                xf: float32 = xb.bitcast()
-                wf: float32 = wb.bitcast()
-                d = d + xf * wf
+                fx: float32 = 0.0
+                if b * BS + e < K:
+                    fx = X[m, b * BS + e] * W[n, b * BS + e]
+                d = d + fx
             prev: float32 = 0.0
             if b > 0:
                 prev = acc[n]
@@ -75,34 +56,16 @@ def _fp_lin_dot[
             acc[n] = total
             if b == NB - 1:
                 Z[m, n] = total + bias[n]
-
-
-def fp32_linear2d[
-    M, N, K
-](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
-    NB: ConstExpr[int32] = (K + BS - 1) // BS
-    PW: ConstExpr[int32] = 32 * BS
-    WF: UInt(PW)[N, NB]
-    _fp_lin_wpack[N, K, NB, BS](W, WF)
-    P: UInt(PW)[M, NB]
-    _mx_lin_xpack[M, K, BS, NB](X, P)
-    Z: float32[M, N]
-    _fp_lin_dot[M, N, NB, BS](P, WF, bias, Z)
     return Z
 
 
-def schedule_fp32_linear2d(s, depth=4):
-    """Same schedule as nn.schedule_mx_linear2d, minus the quantize stage."""
+def schedule_fp32_linear2d(s):
+    """nn.schedule_mx_linear2d plus block-lane banks for X/W."""
     _, _, K = s.inst_list[:3]
-    NB = (K + BS - 1) // BS
     top = s.top_func_name
     for arr in ("X", "W"):
         partition_block_lanes(s, MockBuffer(top, arr), K, BS)
-    s.pipeline("_fp_lin_wpack:b")
-    s.pipeline("_mx_lin_xpack:b")
-    s.pipeline("_fp_lin_dot:n")
-    s.to(MockBuffer(top, "P"), "_fp_lin_dot", depth=max(depth, NB))
-    s.dataflow(top)
+    s.pipeline(f"{top}:n")
     return s
 
 
@@ -117,22 +80,20 @@ def _mx_format():
     return FORMATS[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
 
 
-# DRAM boundary: X and W arrive as 512b words over two ports (one 32-float
-# block per cycle), unpacked on chip by nn.mx_unpack_f32
+# DRAM boundary: float32 X (and fp32 W) arrive as 512b words over two ports
+# (one 32-float block per cycle), unpacked on chip by nn.mx_unpack_f32
 def mx_linear_top[
     Ty, M, N, K
 ](
     X0: "UInt(512)[M, K // 32]",
     X1: "UInt(512)[M, K // 32]",
-    W0: "UInt(512)[N, K // 32]",
-    W1: "UInt(512)[N, K // 32]",
+    Wq: "Ty[N, K // Ty.block_size]",
     bias: "float32[N]",
 ) -> "float32[M, N]":
     X: float32[M, K]
-    W: float32[N, K]
     nn.mx_unpack_f32[M, K](X0, X1, X)
-    nn.mx_unpack_f32[N, K](W0, W1, W)
-    return nn.mx_linear2d[Ty, M, N, K](X, W, bias)
+    Xq = nn.mx_quantize_rows[Ty, M, K](X)
+    return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
 
 
 def fp32_linear_top[
@@ -151,13 +112,22 @@ def fp32_linear_top[
     return fp32_linear2d[M, N, K](X, W, bias)
 
 
-def _top_schedule(top, layer, inst, M, N, K):
-    s = allo.customize(top, instantiate=inst)
-    s.compose(nn.mx_unpack_f32, instantiate=[M, K])
-    s.compose(nn.mx_unpack_f32, instantiate=[N, K], id="1")
-    s.compose(layer)  # its X/W block-lane partitions reach the unpacks too
-    s.dataflow(top.__name__)
-    return s
+def _schedules(name, Ty):
+    M, N, K = CONFIGS[name]
+    s_mx = allo.customize(mx_linear_top, instantiate=[Ty, M, N, K])
+    s_mx.compose(nn.mx_unpack_f32, instantiate=[M, K])
+    # its X block-lane banks reach the unpack too
+    s_mx.compose(nn.mx_quantize_rows, instantiate=[Ty, M, K])
+    s_mx.compose(nn.mx_linear2d, instantiate=[Ty, M, N, K])
+    s_mx.dataflow("mx_linear_top")
+    s_fp = allo.customize(fp32_linear_top, instantiate=[M, N, K])
+    s_fp.compose(nn.mx_unpack_f32, instantiate=[M, K])
+    s_fp.compose(nn.mx_unpack_f32, instantiate=[N, K], id="1")
+    s_fp.compose(
+        schedule_fp32_linear2d(allo.customize(fp32_linear2d, instantiate=[M, N, K]))
+    )
+    s_fp.dataflow("fp32_linear_top")
+    return s_mx, s_fp
 
 
 def _rand(shape, rng):
@@ -174,17 +144,17 @@ def test_linear_numerics(name, Ty):
     X, W, bias = _rand((M, K), rng), _rand((N, K), rng), _rand((N,), rng)
     exact = X.astype(np.float64) @ W.astype(np.float64).T + bias
     rel = lambda Z: np.linalg.norm(Z - exact) / np.linalg.norm(exact)
-    args = (*mx_pack_f32_blocks(X), *mx_pack_f32_blocks(W), bias)
     Z_fp = allo.customize(fp32_linear_top, instantiate=[M, N, K]).build(target="llvm")(
-        *args
+        *mx_pack_f32_blocks(X), *mx_pack_f32_blocks(W), bias
     )
+    Wq = mx_pack_np(Ty, W)
     Z_mx = allo.customize(mx_linear_top, instantiate=[Ty, M, N, K]).build(
         target="llvm"
-    )(*args)
-    # the packed interface changes nothing but how X and W reach the chip
+    )(*mx_pack_f32_blocks(X), Wq, bias)
+    # on-chip quantization of X equals packing it on the host
     ref_mx = allo.customize(nn.mx_linear2d, instantiate=[Ty, M, N, K]).build(
         target="llvm"
-    )(X, W, bias)
+    )(mx_pack_np(Ty, X), Wq, bias)
     np.testing.assert_array_equal(Z_mx, ref_mx)
     print(
         f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, "
@@ -192,18 +162,6 @@ def test_linear_numerics(name, Ty):
     )
     assert rel(Z_fp) < 1e-5
     assert rel(Z_mx) < (0.1 if Ty.elem_bits >= 8 else 0.5)
-
-
-def _schedules(name, Ty):
-    M, N, K = CONFIGS[name]
-    s_mx = nn.schedule_mx_linear2d(
-        allo.customize(nn.mx_linear2d, instantiate=[Ty, M, N, K])
-    )
-    s_fp = schedule_fp32_linear2d(allo.customize(fp32_linear2d, instantiate=[M, N, K]))
-    return (
-        _top_schedule(mx_linear_top, s_mx, [Ty, M, N, K], M, N, K),
-        _top_schedule(fp32_linear_top, s_fp, [M, N, K], M, N, K),
-    )
 
 
 @pytest.mark.parametrize("name", list(CONFIGS))

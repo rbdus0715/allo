@@ -1,15 +1,16 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Chaining nn.mx_linear2d calls: each call's registered dataflow schedule
-# (row pack -> MX block quantize -> block dot, one MX block per stream token)
-# is applied per call site with s.compose(nn.mx_linear2d, instantiate=..., id=...).
+# Chaining nn.mx_linear2d calls: the activations are MX-quantized on chip
+# (nn.mx_quantize_rows), the weights on the host (mx_pack_np). Each call's
+# registered schedule is applied with s.compose(fn, instantiate=..., id=...).
 
 import numpy as np
 import pytest
 import allo
 import allo.ir.types as T
 import allo.library.nn as nn
+from allo.library.mxint8 import mx_pack_np
 
 # MX formats as MXInt(elem_bits, block_size) / MXFP(exp_bits, mantissa_bits, block_size)
 FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
@@ -22,13 +23,15 @@ def mlp[
     Ty
 ](
     X: "float32[M, K0]",
-    W1: "float32[N1, K0]",
+    W1: "Ty[N1, (K0 + Ty.block_size - 1) // Ty.block_size]",
     b1: "float32[N1]",
-    W2: "float32[N2, N1]",
+    W2: "Ty[N2, (N1 + Ty.block_size - 1) // Ty.block_size]",
     b2: "float32[N2]",
 ) -> "float32[M, N2]":
-    a = nn.mx_linear2d[Ty, M, N1, K0](X, W1, b1)
-    return nn.mx_linear2d[Ty, M, N2, N1](a, W2, b2)
+    Xq = nn.mx_quantize_rows[Ty, M, K0](X)
+    a = nn.mx_linear2d[Ty, M, N1, K0](Xq, W1, b1)
+    aq = nn.mx_quantize_rows[Ty, M, N1](a)
+    return nn.mx_linear2d[Ty, M, N2, N1](aq, W2, b2)
 
 
 def _rand(shape, rng):
@@ -41,8 +44,8 @@ def _rand(shape, rng):
 def test_mx_linear2d_chain(Ty):
     rng = np.random.default_rng(2)
     X = _rand((M, K0), rng)
-    W1, b1 = _rand((N1, K0), rng), _rand((N1,), rng)
-    W2, b2 = _rand((N2, N1), rng), _rand((N2,), rng)
+    W1, W2 = mx_pack_np(Ty, _rand((N1, K0), rng)), mx_pack_np(Ty, _rand((N2, N1), rng))
+    b1, b2 = _rand((N1,), rng), _rand((N2,), rng)
 
     # numerics: the chain equals the two layers run one by one
     FC1, FC2 = [Ty, M, N1, K0], [Ty, M, N2, N1]
@@ -50,17 +53,19 @@ def test_mx_linear2d_chain(Ty):
     fc = lambda inst: allo.customize(nn.mx_linear2d, instantiate=inst).build(
         target="llvm"
     )
-    a = fc(FC1)(X, W1, b1)
-    np.testing.assert_array_equal(Y, fc(FC2)(a, W2, b2))
+    a = fc(FC1)(mx_pack_np(Ty, X), W1, b1)
+    np.testing.assert_array_equal(Y, fc(FC2)(mx_pack_np(Ty, a), W2, b2))
 
     s = allo.customize(mlp, instantiate=[Ty])
     # the n-th call (and its helpers) is suffixed "_n" for n > 0
+    s.compose(nn.mx_quantize_rows, instantiate=[Ty, M, K0])
+    s.compose(nn.mx_quantize_rows, instantiate=[Ty, M, N1], id="1")
     s.compose(nn.mx_linear2d, instantiate=FC1)
     s.compose(nn.mx_linear2d, instantiate=FC2, id="1")
     s.dataflow("mlp")
     code = str(s.build(target="vhls"))
-    assert code.count("#pragma HLS dataflow") >= 3  # mlp + one per layer
-    assert code.count("#pragma HLS stream") >= 6  # P, XS, XE per layer
+    assert "#pragma HLS dataflow" in code  # the four stages overlap
+    assert code.count("#pragma HLS pipeline") >= 4  # one loop per stage
 
 
 if __name__ == "__main__":

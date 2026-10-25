@@ -19,7 +19,11 @@ import allo.ir.types as T
 from allo.ir.types import float32, int8, e8m0
 import allo.library.nn as nn
 from allo.library.nn import mx_linear2d_ref
-from allo.library.mxint8 import mx_quantize, patch_extern_c_for_class_return_types
+from allo.library.mxint8 import (
+    mx_quantize,
+    mx_pack_np,
+    patch_extern_c_for_class_return_types,
+)
 
 Ty = T.mxint8
 M, N, K = 4, 16, 128
@@ -151,7 +155,7 @@ FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]
     ids=lambda x: getattr(x, "name", str(x)),
 )
 def test_mx_linear2d(Tf, dims):
-    # float32 operands: the block-streamed dataflow equals mx_linear2d_ref
+    # MX operands packed on the host: equals mx_linear2d_ref on float32 ones
     m, n, k = dims
     rng = np.random.default_rng(1)
     rand = lambda shape: (
@@ -160,7 +164,7 @@ def test_mx_linear2d(Tf, dims):
     X, W, bias = rand((m, k)), rand((n, k)), rand((n,))
     inst = [Tf, m, n, k]
     Z = allo.customize(nn.mx_linear2d, instantiate=inst).build(target="llvm")(
-        X, W, bias
+        mx_pack_np(Tf, X), mx_pack_np(Tf, W), bias
     )
     ref = allo.customize(mx_linear2d_ref, instantiate=inst).build(target="llvm")(
         X, W, bias
@@ -169,8 +173,7 @@ def test_mx_linear2d(Tf, dims):
 
     s = allo.customize(nn.mx_linear2d, instantiate=inst)
     code = str(nn.schedule_mx_linear2d(s).build(target="vhls"))
-    assert "#pragma HLS dataflow" in code
-    assert code.count("#pragma HLS stream") >= 3  # P, XS, XE
+    assert "#pragma HLS pipeline" in code
 
 
 if __name__ == "__main__":

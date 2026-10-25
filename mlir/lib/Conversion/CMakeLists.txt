@@ -17,6 +17,9 @@ add_mlir_dialect_library(MLIRAlloConversion
     MLIRAlloPassesIncGen
     MLIRAlloConversionPassesIncGen
 
+    LINK_COMPONENTS
+    OrcJIT
+
     LINK_LIBS PUBLIC
     ${conversion_libs}
     MLIRIR
