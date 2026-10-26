@@ -168,9 +168,9 @@ def test_mx_linear2d(Tf, dims):
     Z = allo.customize(nn.mx_linear2d, instantiate=inst).build(target="llvm")(
         X, mx_pack_np(Tf, W), bias
     )
-    ref = allo.customize(mx_linear2d_ref, instantiate=inst).build(target="llvm")(
-        X, W, bias
-    )
+    ref = allo.customize(mx_linear2d_ref, instantiate=[Tf, m, n, k]).build(
+        target="llvm"
+    )(X, W, bias)
     np.testing.assert_array_equal(Z, ref)
 
     s = allo.customize(nn.mx_linear2d, instantiate=inst)

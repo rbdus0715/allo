@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import allo
 import allo.ir.types as T
+from allo.ir.types import float32
 import allo.library.nn as nn
 from allo.library.nn import (
     mx_matmul_ref,
@@ -65,7 +66,6 @@ def test_mx_linear2d():
     s_ref = allo.customize(mx_linear2d_ref, instantiate=[Ty, M, N, K])
     np.testing.assert_array_equal(Z, s_ref.build(target="llvm")(X, W, bias))
 
-    from allo.ir.types import float32
     from allo.library import nn
 
     def kernel(
@@ -383,7 +383,7 @@ def test_mx_api_linear():
     def user_linear(
         X: "float32[M, K]", Wq: "int8[N, K]", Ws: "e8m0[N, NB]", b: "float32[N]"
     ) -> "float32[M, N]":
-        qx = nn.mx_quantize[Ty, M, K](X)
+        qx = nn.mx_quantize[Ty, float32, M, K](X)
         qw = nn.mx_pack[Ty, N, K](Wq, Ws)
         Z: float32[M, N]
         for i, j in allo.grid(M, N):
@@ -397,7 +397,7 @@ def test_mx_api_linear():
         b: "float32[N]",
         R: "float32[M, N]",
     ) -> "float32[M, N]":
-        qx = nn.mx_quantize[Ty, M, K](X)
+        qx = nn.mx_quantize[Ty, float32, M, K](X)
         qw = nn.mx_pack[Ty, N, K](Wq, Ws)
         Z: float32[M, N]
         for i, j in allo.grid(M, N):
@@ -444,7 +444,7 @@ def test_mx_api_conv2d_im2col():
             patch: float32[1, CKK]
             for c, kh, kw in allo.grid(Cin, Kh, Kw):
                 patch[0, (c * Kh + kh) * Kw + kw] = inp[c, oh + kh, ow + kw]
-            qp = nn.mx_quantize[Ty, 1, CKK](patch)
+            qp = nn.mx_quantize[Ty, float32, 1, CKK](patch)
             for co in range(Cout):
                 Y[co, oh, ow] = nn.mx_dot[Ty, NBc](qp[0], qw[co]) + bias[co]
         return Y
@@ -473,8 +473,8 @@ def test_mx_api_attention_scores():
     Q, K_ = _rand((L, D), rng), _rand((L, D), rng)
 
     def scores(Q: "float32[L, D]", K_: "float32[L, D]") -> "float32[L, L]":
-        qq = nn.mx_quantize[Ty, L, D](Q)
-        qk = nn.mx_quantize[Ty, L, D](K_)
+        qq = nn.mx_quantize[Ty, float32, L, D](Q)
+        qk = nn.mx_quantize[Ty, float32, L, D](K_)
         S: float32[L, L]
         for i, j in allo.grid(L, L):
             S[i, j] = nn.mx_dot[Ty, NB](qq[i], qk[j]) * c
@@ -497,7 +497,8 @@ def test_mx_api_dequantize(Td):
     X = _rand((R, K), np.random.default_rng(15))
 
     def roundtrip(X: "float32[R, K]") -> "float32[R, K]":
-        return nn.mx_dequantize[Td, R, K](nn.mx_quantize[Td, R, K](X))
+        Q = nn.mx_quantize[Td, float32, R, K](X)
+        return nn.mx_dequantize[Td, R, K](Q)
 
     got = allo.customize(roundtrip).build(target="llvm")(X)
     elems, scales = mx_quantize(Td, X)
