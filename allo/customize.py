@@ -517,7 +517,7 @@ class Schedule:
                             # a local array, or a named call result (the
                             # callee returns what another function returned)
                             if (
-                                op_name in ("memref.alloc", "func.call")
+                                op_name in {"memref.alloc", "func.call"}
                                 and "name" in owner.attributes
                             ):
                                 buf_name = StringAttr(owner.attributes["name"]).value
@@ -595,13 +595,12 @@ class Schedule:
         address_idx = []
 
         for i, size in enumerate(shape):
-            applies_to_dim = False
-            for partition_type, dim, factor in partitions:
-                if dim == 0 or i == dim - 1:
-                    applies_to_dim = True
-                    break
-
-            if applies_to_dim:
+            applied = next(
+                ((ptype, fac) for ptype, dim, fac in partitions if dim in (0, i + 1)),
+                None,
+            )
+            if applied is not None:
+                partition_type, factor = applied
                 if partition_type == Partition.Cyclic:
                     partition_idx.append(AffineDimExpr.get(i) % factor)
                     address_idx.append(
@@ -1166,7 +1165,7 @@ class Schedule:
         # TODO: use a class to wrap the results
         return axes
 
-    # pylint: disable=redefined-builtin
+    # pylint: disable=redefined-builtin, too-many-branches
     @wrapped_apply
     def compose(self, schs: list, id=None, instantiate=None):
         """
@@ -1423,18 +1422,17 @@ def customize(
         global_vars = get_global_vars(fn)
     # MX library functions and types, visible to nn.mx_* bodies called from
     # user kernels (a callee resolves names in the caller's globals)
+    global_vars.setdefault("mx_linear2d", _mx_nn.mx_linear2d)
     for _name in (
-        "mx_linear2d",
         "mx_matmul",
         "bias_add",
         "mx_quantize_rows",
         "mx_quantize_channels",
         "mx_conv_windows",
         "rows_to_nchw",
+        "merge_rows",
+        "split_rows",
         "_mx_dequantize_elem",
-    ):
-        global_vars.setdefault(_name, getattr(_mx_nn, _name))
-    for _name in (
         "mx_quantize_block_f32",
         "mx_block_dot",
         "_mx_quantize_elem_int_f32",
@@ -1449,8 +1447,8 @@ def customize(
     global_vars.setdefault("ConstExpr", _mx_types.ConstExpr)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
     global_vars.setdefault("dsl", sys.modules["allo.dsl"])  # dsl.grid in nn bodies
-    # read at customize time, so setting nn.MX_ACC_LATENCY takes effect
-    global_vars.setdefault("MX_ACC_LATENCY", _mx_nn.MX_ACC_LATENCY)
+    # read at customize time, so setting mx.MX_ACC_LATENCY takes effect
+    global_vars.setdefault("MX_ACC_LATENCY", _mx_lib.MX_ACC_LATENCY)
     # Type construction
     ctx_type_inf = ASTContext(
         tree=tree,

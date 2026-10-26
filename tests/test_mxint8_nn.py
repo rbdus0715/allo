@@ -94,8 +94,6 @@ def test_mx_linear2d():
     s_ref = allo.customize(mx_linear2d_ref, instantiate=[Ty, M, N, K])
     np.testing.assert_array_equal(Z, s_ref.build(target="llvm")(X, W, bias))
 
-    from allo.library import nn
-
     def kernel(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
@@ -113,13 +111,23 @@ def test_mx_linear3d():
     W = _rand((M, D), rng)
     bias = _rand((M,), rng)
 
-    s = allo.customize(nn.mx_linear3d, instantiate=[Ty, float32, B, L, D, M])
-    mod = s.build(target="llvm")
-    Z = mod(X, mx_pack_np(Ty, W), bias)
-
+    inst = [Ty, float32, B, L, D, M]
+    Wq = mx_pack_np(Ty, W)
+    Z = allo.customize(nn.mx_linear3d, instantiate=inst).build(target="llvm")(
+        X, Wq, bias
+    )
+    # the B x L rows through one mx_linear2d
+    Z2 = allo.customize(nn.mx_linear2d, instantiate=[Ty, float32, B * L, M, D]).build(
+        target="llvm"
+    )(X.reshape(B * L, D), Wq, bias)
+    np.testing.assert_array_equal(Z, Z2.reshape(B, L, M))
     ref = np.einsum("bld,md->blm", X.astype(np.float64), W.astype(np.float64))
-    ref = ref + bias.astype(np.float64)
-    _assert_close(Z, ref, "mx_linear3d")
+    _assert_close(Z, ref + bias.astype(np.float64), "mx_linear3d")
+
+    s = nn.schedule_mx_linear3d(allo.customize(nn.mx_linear3d, instantiate=inst))
+    code = str(s.build(target="vhls"))
+    assert code.count("#pragma HLS dataflow") >= 2  # mx_linear3d, mx_linear2d
+    assert code.count("hls::stream<") >= 4  # X2, Z2, and Xq, C in mx_linear2d
 
 
 def test_mx_linear2d_vs_float():

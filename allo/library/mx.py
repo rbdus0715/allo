@@ -1,11 +1,12 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-# pylint: disable=used-before-assignment, unsubscriptable-object
+# pylint: disable=used-before-assignment, unsubscriptable-object, unsupported-assignment-operation, chained-comparison, no-value-for-parameter
 
 import re
 
 import allo
-from ..ir.types import Int, UInt, int32, uint8, float32, Stream, ConstExpr
+from ..ir.utils import MockBuffer
+from ..ir.types import Int, UInt, int32, uint8, float32, ConstExpr
 
 
 def _mx_quantize_elem_int_f32[
@@ -360,6 +361,269 @@ def mx_block_dot[Ty, K](data_a: "Ty", data_b: "Ty") -> float32:
 def schedule_mx_block_dot(s):
     s.unroll("mx_block_dot:j0")
     s.unroll("mx_block_dot:j1")
+
+
+# ---- MX matrices (Ty[R, NB]: an R x K matrix in MX blocks along K) and the
+# stages MX layers are built from ----
+
+
+def mx_quantize_rows[
+    Ty, TyX, R, K
+](X: "TyX[R, K]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
+    # float32 [R, K] -> MX matrix: one packed scale | elems word per block along
+    # K (zero-padded to whole blocks); X is read once, row by row
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    Q: Ty[R, NB]
+    for r, b in allo.grid(R, NB):
+        blk: float32[BS]
+        for e in range(BS):
+            fq: float32 = 0.0
+            if b * BS + e < K:
+                fq = X[r, b * BS + e]
+            blk[e] = fq
+        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
+    return Q
+
+
+def mx_quantize_cols[
+    Ty, TyX, R, K
+](X: "TyX[K, R]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
+    # float32 [K, R] -> MX matrix of X^T: blocks run down the columns, e.g.
+    # V in attention's P @ V (mx_linear2d reduces along the block axis)
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    Q: Ty[R, NB]
+    for r, b in allo.grid(R, NB):
+        blk: float32[BS]
+        for e in range(BS):
+            fq: float32 = 0.0
+            if b * BS + e < K:
+                fq = X[b * BS + e, r]
+            blk[e] = fq
+        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
+    return Q
+
+
+def _mx_dequantize_elem[Ty](e: "UInt(Ty.elem_bits)", scale: int32) -> float32:
+    # value = mag * 2^sh, built by adjusting the exponent field of float(mag)
+    v: int32 = int(e)
+    neg: int32 = (v >> (Ty.elem_bits - 1)) & 1
+    mag: int32 = 0
+    sh: int32 = scale - 127
+    with allo.meta_if(Ty.is_float):
+        exp_field: int32 = (v >> Ty.mantissa_bits) & ((1 << Ty.exp_bits) - 1)
+        mag = v & ((1 << Ty.mantissa_bits) - 1)
+        sh = sh + 1 - Ty.bias - Ty.mantissa_bits  # subnormal: 0.m * 2^(1 - bias)
+        if exp_field != 0:  # normal: 1.m * 2^(exp_field - bias)
+            mag = mag | (1 << Ty.mantissa_bits)
+            sh = sh + exp_field - 1
+    with allo.meta_else():
+        mag = v
+        if neg == 1:  # two's complement
+            mag = (1 << Ty.elem_bits) - v
+    f: float32 = float(mag)
+    bits: int32 = f.bitcast()
+    new_exp: int32 = int(bits[23:31]) + sh
+    result_bits: int32 = 0
+    if mag != 0 and new_exp >= 255:
+        result_bits = (neg << 31) | (255 << 23)
+    elif mag != 0 and new_exp > 0:
+        result_bits = (neg << 31) | (new_exp << 23) | (bits & 0x7FFFFF)
+    return result_bits.bitcast()
+
+
+def mx_dequantize[Ty, R, K](Q: "Ty[R, K // Ty.block_size]") -> "float32[R, K]":
+    # MX matrix -> float32 [R, K] (debugging, mixing with other precisions)
+    BS: ConstExpr[int32] = Ty.block_size
+    EB: ConstExpr[int32] = Ty.elem_bits
+    X: float32[R, K]
+    for r, b in allo.grid(R, K // BS):
+        w: Ty = Q[r, b]
+        scale: int32 = int(w[Ty.bits - 8 : Ty.bits])
+        for e in range(BS):
+            el: UInt(Ty.elem_bits) = w[e * EB : (e + 1) * EB]
+            X[r, b * BS + e] = _mx_dequantize_elem[Ty](el, scale)
+    return X
+
+
+def schedule_mx(s):
+    """Unrolls the block-level loops inside the MX primitives a kernel uses."""
+    for fn, loops in (
+        ("mx_block_dot", ("j0", "j1")),
+        ("mx_quantize_block_f32", ("i1",)),
+    ):
+        if s._find_function(fn, error=False) is not None:
+            for loop in loops:
+                s.unroll(f"{fn}:{loop}")
+    return s
+
+
+def partition_block_lanes(s, buf, length, BS, dim=2):
+    """Partitions `buf` along `dim` (of `length` elements) into one bank per
+    block lane, so the BS elements of a block are read or written in one cycle."""
+    if length <= BS:
+        s.partition(buf, dim=dim)
+    else:
+        s.partition(buf, partition_type=2, dim=dim, factor=BS)
+
+
+def mx_unpack_f32[
+    R, C
+](A0: "UInt(512)[R, C // 32]", A1: "UInt(512)[R, C // 32]", X: "float32[R, C]"):
+    # DRAM -> chip at one 32-float block per cycle: each block arrives as two
+    # 512b words, one per port (A0: floats 0-15, A1: 16-31). C % 32 == 0;
+    # mx.mx_pack_f32_blocks builds A0/A1 on the host. X is an output
+    # argument, so the consumer's banking of it reaches this function too.
+    for r, i in allo.grid(R, C // 32):
+        lo: UInt(512) = A0[r, i]
+        hi: UInt(512) = A1[r, i]
+        with allo.meta_for(16) as e:
+            lb: int32 = lo[e * 32 : (e + 1) * 32]
+            hb: int32 = hi[e * 32 : (e + 1) * 32]
+            X[r, i * 32 + e] = lb.bitcast()
+            X[r, i * 32 + 16 + e] = hb.bitcast()
+
+
+def schedule_mx_unpack_f32(s):
+    # X's block-lane banks come from the consuming layer's schedule (its
+    # partition of the same buffer propagates here); a second one would clash
+    s.pipeline(f"{s.top_func_name}:i")
+    return s
+
+
+def schedule_mx_quantize_rows(s):
+    """One block per cycle: X is banked by block lane."""
+    Ty, _, _, K = s.inst_list[:4]
+    schedule_mx(s)
+    top = s.top_func_name
+    partition_block_lanes(s, MockBuffer(top, "X"), K, Ty.block_size)
+    s.pipeline(f"{top}:b")
+    return s
+
+
+def mx_quantize_channels[
+    Ty, TyX, B, C, H, W
+](X: "TyX[B, C, H, W]") -> "Ty[B, (C + Ty.block_size - 1) // Ty.block_size * H * W]":
+    # float32 NCHW -> MX blocks along the channels (zero-padded to whole
+    # blocks), one row per image: block (cb, h, w) at column (cb * H + h) * W + w
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (C + BS - 1) // BS
+    Q: Ty[B, NB * H * W]
+    for n, cb, h, w in allo.grid(B, NB, H, W):
+        blk: float32[BS]
+        for e in range(BS):
+            fx: float32 = 0.0
+            if cb * BS + e < C:
+                fx = X[n, cb * BS + e, h, w]
+            blk[e] = fx
+        Q[n, (cb * H + h) * W + w] = mx_quantize_block_f32[Ty, BS](blk)
+    return Q
+
+
+def schedule_mx_quantize_channels(s):
+    """One block per cycle: X is banked by block lane along the channels."""
+    Ty, _, _, C = s.inst_list[:4]
+    top = s.top_func_name
+    schedule_mx(s)
+    partition_block_lanes(s, MockBuffer(top, "X"), C, Ty.block_size)
+    s.pipeline(f"{top}:w")
+    return s
+
+
+MX_ACC_LATENCY = 6
+
+
+def mx_matmul[
+    Ty, M, N, K
+](
+    Aq: "Ty[M, (K + Ty.block_size - 1) // Ty.block_size]",
+    Bq: "Ty[N, (K + Ty.block_size - 1) // Ty.block_size]",
+) -> "float32[M, N]":
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
+    P: ConstExpr[int32] = 4 - 3 * (N >= MX_ACC_LATENCY)
+    C: float32[M, N]
+    acc: float32[N] = 0.0
+    aw: Ty[P]
+    for m in range(M):
+        for g, n in allo.grid((NB + P - 1) // P, N):
+            d: float32 = 0.0
+            with allo.meta_for(P) as j:
+                if g * P + j < NB:
+                    if n == 0:
+                        aw[j] = Aq[m, g * P + j]
+                    d += mx_block_dot[Ty, BS](aw[j], Bq[n, g * P + j])
+            prev: float32 = 0.0
+            if g > 0:
+                prev = acc[n]
+            total: float32 = prev + d
+            acc[n] = total
+            if g == (NB - 1) // P:
+                C[m, n] = total
+    return C
+
+
+def pipeline_mx_matmul(s, func, N):
+    s.pipeline(f"{func}:n", initiation_interval=1 if N >= MX_ACC_LATENCY else 4)
+
+
+def schedule_mx_matmul(s):
+    schedule_mx(s)
+    pipeline_mx_matmul(s, s.top_func_name, s.inst_list[2])
+    return s
+
+
+def bias_add[Ty, M, N](X: "float32[M, N]", bias: "Ty[N]") -> "Ty[M, N]":
+    # X + bias per row; X is read once, row by row
+    Z: Ty[M, N]
+    for m, n in allo.grid(M, N):
+        Z[m, n] = X[m, n] + bias[n]
+    return Z
+
+
+def merge_rows[Ty, B, L, D](X: "Ty[B, L, D]") -> "Ty[B * L, D]":
+    # [B, L, D] -> [B * L, D], read and written in order
+    Y: Ty[B * L, D]
+    for b, i, d in allo.grid(B, L, D):
+        Y[b * L + i, d] = X[b, i, d]
+    return Y
+
+
+def split_rows[Ty, B, L, D](X: "Ty[B * L, D]") -> "Ty[B, L, D]":
+    # [B * L, D] -> [B, L, D], read and written in order
+    Y: Ty[B, L, D]
+    for b, i, d in allo.grid(B, L, D):
+        Y[b, i, d] = X[b * L + i, d]
+    return Y
+
+
+def mx_conv_windows[
+    Ty, B, C, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
+](
+    Xq: "Ty[B, (C + Ty.block_size - 1) // Ty.block_size * H * W]",
+) -> "Ty[B * Oh * Ow, (C + Ty.block_size - 1) // Ty.block_size * Kh * Kw]":
+    # MX image rows -> one row per output pixel holding its receptive field,
+    # blocks in (channel block, kh, kw) order and zero blocks for the padding,
+    # written in order, one block per iteration
+    NB: ConstExpr[int32] = (C + Ty.block_size - 1) // Ty.block_size
+    Xw: Ty[B * Oh * Ow, NB * Kh * Kw]
+    for n, oh, ow, cb, kh, kw in allo.grid(B, Oh, Ow, NB, Kh, Kw):
+        ih: int32 = oh * Sh + kh - Pd0
+        iw: int32 = ow * Sw + kw - Pd1
+        blk: Ty = 0
+        if ih >= 0 and ih < H and iw >= 0 and iw < W:
+            blk = Xq[n, (cb * H + ih) * W + iw]
+        Xw[(n * Oh + oh) * Ow + ow, (cb * Kh + kh) * Kw + kw] = blk
+    return Xw
+
+
+def rows_to_nchw[Ty, B, C, H, W](Z: "Ty[B * H * W, C]") -> "Ty[B, C, H, W]":
+    # one row per pixel (row-major, read in order) -> NCHW
+    Y: Ty[B, C, H, W]
+    for n, h, w, c in allo.grid(B, H, W, C):
+        Y[n, c, h, w] = Z[(n * H + h) * W + w, c]
+    return Y
 
 
 def patch_extern_c_for_class_return_types(kernel_cpp_path):
