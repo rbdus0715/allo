@@ -21,7 +21,7 @@ import allo
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
-from allo.library.mxint8 import mx_pack_np, patch_extern_c_for_class_return_types
+from allo.library.mx import mx_pack_np, patch_extern_c_for_class_return_types
 
 # sequence length, model width, heads, MLP width, layers, vocabulary
 L, D, H, F, N_LAYER, VOCAB = 8, 64, 2, 256, 2, 128

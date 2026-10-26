@@ -15,7 +15,7 @@ import allo.backend.hls as hls
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
-from allo.library.mxint8 import (
+from allo.library.mx import (
     mx_pack_channels_np,
     mx_unpack_np,
     patch_extern_c_for_class_return_types,

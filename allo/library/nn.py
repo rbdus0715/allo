@@ -7,10 +7,9 @@ import re
 import allo
 from .. import dsl
 from .systolic import systolic
-from .mxint8 import (
+from .mx import (
     mx_quantize_block_f32,
     mx_block_dot,
-    _mx_pack_word,
     schedule_mx_quantize_block_f32,
     schedule_mx_block_dot,
 )
@@ -73,109 +72,7 @@ def schedule_linear3d(s):
     return s
 
 
-def mx_matmul_ref[
-    Ty, M, N, K
-](A: "float32[M, K]", B: "float32[N, K]") -> "float32[M, N]":
-    # reference: A @ B^T with A, B quantized block by block (float32 operands)
-    BS: ConstExpr[int32] = Ty.block_size
-    NB: ConstExpr[int32] = K // BS
-    Z: float32[M, N]
-    for i in range(M):
-        for j in range(N):
-            acc: float32 = 0.0
-            for b in range(NB):
-                blk_a: float32[BS]
-                blk_b: float32[BS]
-                for e in range(BS):
-                    blk_a[e] = A[i, b * BS + e]
-                    blk_b[e] = B[j, b * BS + e]
-                qa: Ty = mx_quantize_block_f32[Ty, BS](blk_a)
-                qb: Ty = mx_quantize_block_f32[Ty, BS](blk_b)
-                acc += mx_block_dot[Ty, BS](qa, qb)
-            Z[i, j] = acc
-    return Z
-
-
-def schedule_mx_matmul_ref(s):
-    schedule_mx_quantize_block_f32(s)
-    schedule_mx_block_dot(s)
-    s.unroll("mx_matmul_ref:e")
-    s.pipeline("mx_matmul_ref:b")
-    s.pipeline("mx_matmul_ref:j")
-    return s
-
-
-def mx_linear2d_ref[
-    Ty, M, N, K
-](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
-    Z = mx_matmul_ref[Ty, M, N, K](X, W)
-    for i in range(M):
-        for j in range(N):
-            Z[i, j] = Z[i, j] + bias[j]
-    return Z
-
-
-def _mx_quantize_rows[
-    Ty, R, K, NB, TRANS
-](X: "float32[K if TRANS else R, R if TRANS else K]", Q: "Ty[R, NB]"):
-    # X is [R, K], or [K, R] when TRANS; blocks run along K either way, the
-    # last one zero-padded when K is not a multiple of the block size
-    BS: ConstExpr[int32] = Ty.block_size
-    for r, b in allo.grid(R, NB):
-        blk: float32[BS]
-        for e in range(BS):
-            fq: float32 = 0.0
-            if b * BS + e < K:
-                with allo.meta_if(TRANS):
-                    fq = X[b * BS + e, r]
-                with allo.meta_else():
-                    fq = X[r, b * BS + e]
-            blk[e] = fq
-        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
-
-
-def _mx_pack_rows[
-    Ty, R, K, NB, TRANS
-](
-    E: "Int(Ty.elem_bits)[K if TRANS else R, R if TRANS else K]",
-    S: "e8m0[NB if TRANS else R, R if TRANS else NB]",
-    Q: "Ty[R, NB]",
-):
-    # pre-quantized (elements, scales) -> packed scale | elems words
-    BS: ConstExpr[int32] = Ty.block_size
-    EB: ConstExpr[int32] = Ty.elem_bits
-    for r, b in allo.grid(R, NB):
-        w: Ty = 0
-        for e in range(BS):
-            with allo.meta_if(TRANS):
-                w[e * EB : (e + 1) * EB] = E[b * BS + e, r]
-            with allo.meta_else():
-                w[e * EB : (e + 1) * EB] = E[r, b * BS + e]
-        with allo.meta_if(TRANS):
-            w[Ty.bits - 8 : Ty.bits] = S[b, r]
-        with allo.meta_else():
-            w[Ty.bits - 8 : Ty.bits] = S[r, b]
-        Q[r, b] = w
-
-
-def _mx_dot_rows[
-    Ty, M, N, NB
-](qx: "Ty[M, NB]", qw: "Ty[N, NB]", bias: "float32[N]", Z: "float32[M, N]"):
-    # each X block is read once, in order, so qx can be a FIFO; W stays resident
-    BS: ConstExpr[int32] = Ty.block_size
-    acc: float32[N]
-    for i in range(M):
-        for j_init in range(N):
-            acc[j_init] = 0.0
-        for b in range(NB):
-            xb: Ty = qx[i, b]
-            for j in range(N):
-                acc[j] += mx_block_dot[Ty, BS](xb, qw[j, b])
-        for j_back in range(N):
-            Z[i, j_back] = acc[j_back] + bias[j_back]
-
-
-# ---- MX matrix API: Ty[R, NB] is an R x K matrix in MX blocks along K ----
+# ---- MX matrices: Ty[R, NB] is an R x K matrix in MX blocks along K ----
 
 
 def mx_quantize_rows[
@@ -214,31 +111,6 @@ def mx_quantize_cols[
             blk[e] = fq
         Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
     return Q
-
-
-# earlier name; layers call mx_quantize_rows, which host code (mxint8.mx_quantize)
-# does not shadow in the caller's globals
-mx_quantize = mx_quantize_rows
-
-
-def mx_pack[
-    Ty, R, K
-](
-    E: "Int(Ty.elem_bits)[R, K]", S: "e8m0[R, K // Ty.block_size]"
-) -> "Ty[R, K // Ty.block_size]":
-    # host-quantized (elements, scales), e.g. from mxint8.mx_quantize -> MX matrix
-    Q: "Ty[R, K // Ty.block_size]"
-    _mx_pack_rows[Ty, R, K, K // Ty.block_size, 0](E, S, Q)
-    return Q
-
-
-def mx_dot[Ty, NB](x: "Ty[NB]", w: "Ty[NB]") -> float32:
-    # dot product of two MX rows: exact within each block, float32 across blocks
-    BS: ConstExpr[int32] = Ty.block_size
-    acc: float32 = 0.0
-    for b in range(NB):
-        acc += mx_block_dot[Ty, BS](x[b], w[b])
-    return acc
 
 
 def _mx_dequantize_elem[Ty](e: "UInt(Ty.elem_bits)", scale: int32) -> float32:
@@ -283,113 +155,15 @@ def mx_dequantize[Ty, R, K](Q: "Ty[R, K // Ty.block_size]") -> "float32[R, K]":
     return X
 
 
-def schedule_mx(s, id=None):
-    """Unrolls the block-level loops inside the MX primitives a kernel uses.
-
-    Like tests/dataflow/test_mlp.py's schedule_linear: `id` names the n-th
-    instantiation (suffix "_<id>"), as in compose(..., id=...).
-    """
-    sfx = "" if id is None else f"_{id}"
+def schedule_mx(s):
+    """Unrolls the block-level loops inside the MX primitives a kernel uses."""
     for fn, loops in (
         ("mx_block_dot", ("j0", "j1")),
         ("mx_quantize_block_f32", ("i1",)),
     ):
-        if s._find_function(fn + sfx, error=False) is not None:
+        if s._find_function(fn, error=False) is not None:
             for loop in loops:
-                s.unroll(f"{fn}{sfx}:{loop}")
-    return s
-
-
-def mx_gemm_q[
-    Ty, M, N, K, NB, TRANS
-](
-    Xq: "Int(Ty.elem_bits)[M, K]",
-    Xs: "e8m0[M, NB]",
-    Wq: "Int(Ty.elem_bits)[K if TRANS else N, N if TRANS else K]",
-    Ws: "e8m0[NB if TRANS else N, N if TRANS else NB]",
-    bias: "float32[N]",
-) -> "float32[M, N]":
-    # Z = X @ W.T + bias (W is [N, K]), or X @ W + bias when TRANS (W is [K, N])
-    qx: Ty[M, NB]
-    qw: Ty[N, NB]
-    _mx_pack_rows[Ty, M, K, NB, 0](Xq, Xs, qx)
-    _mx_pack_rows[Ty, N, K, NB, TRANS](Wq, Ws, qw)
-    Z: float32[M, N]
-    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
-    return Z
-
-
-def mx_gemm_wq[
-    Ty, M, N, K, NB, TRANS
-](
-    X: "float32[M, K]",
-    Wq: "Int(Ty.elem_bits)[K if TRANS else N, N if TRANS else K]",
-    Ws: "e8m0[NB if TRANS else N, N if TRANS else NB]",
-    bias: "float32[N]",
-) -> "float32[M, N]":
-    qx: Ty[M, NB]
-    qw: Ty[N, NB]
-    _mx_quantize_rows[Ty, M, K, NB, 0](X, qx)
-    _mx_pack_rows[Ty, N, K, NB, TRANS](Wq, Ws, qw)
-    Z: float32[M, N]
-    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
-    return Z
-
-
-def mx_gemm_ff[
-    Ty, M, N, K, NB, TRANS
-](
-    X: "float32[M, K]",
-    W: "float32[K if TRANS else N, N if TRANS else K]",
-    bias: "float32[N]",
-) -> "float32[M, N]":
-    qx: Ty[M, NB]
-    qw: Ty[N, NB]
-    _mx_quantize_rows[Ty, M, K, NB, 0](X, qx)
-    _mx_quantize_rows[Ty, N, K, NB, TRANS](W, qw)
-    Z: float32[M, N]
-    _mx_dot_rows[Ty, M, N, NB](qx, qw, bias, Z)
-    return Z
-
-
-def mx_matmul_q[
-    Ty, M, N, K, NB
-](
-    Aq: "Int(Ty.elem_bits)[M, K]",
-    As: "e8m0[M, NB]",
-    Bq: "Int(Ty.elem_bits)[K, N]",
-    Bs: "e8m0[NB, N]",
-) -> "float32[M, N]":
-    zero: float32[N] = 0.0
-    return mx_gemm_q[Ty, M, N, K, NB, 1](Aq, As, Bq, Bs, zero)
-
-
-def mx_matmul_wq[
-    Ty, M, N, K, NB
-](
-    A: "float32[M, K]", Bq: "Int(Ty.elem_bits)[K, N]", Bs: "e8m0[NB, N]"
-) -> "float32[M, N]":
-    zero: float32[N] = 0.0
-    return mx_gemm_wq[Ty, M, N, K, NB, 1](A, Bq, Bs, zero)
-
-
-def mx_matmul_ff[
-    Ty, M, N, K, NB
-](A: "float32[M, K]", B: "float32[K, N]") -> "float32[M, N]":
-    zero: float32[N] = 0.0
-    return mx_gemm_ff[Ty, M, N, K, NB, 1](A, B, zero)
-
-
-def schedule_mx_gemm(s, depth=16):
-    """Streams the quantized X blocks into the block dot (HLS dataflow)."""
-    mode = s.top_func_name.rsplit("_", 1)[1]  # q / wq / ff
-    gemm = f"mx_gemm_{mode}"  # also the callee of mx_matmul_{mode}
-    schedule_mx_block_dot(s)
-    if mode != "q":  # mx_gemm_q takes pre-quantized operands
-        schedule_mx_quantize_block_f32(s)
-    s.pipeline("_mx_dot_rows:j")
-    s.to(MockBuffer(gemm, "qx"), "_mx_dot_rows", depth=depth)
-    s.dataflow(gemm)
+                s.unroll(f"{fn}:{loop}")
     return s
 
 
@@ -407,7 +181,7 @@ def mx_unpack_f32[
 ](A0: "UInt(512)[R, C // 32]", A1: "UInt(512)[R, C // 32]", X: "float32[R, C]"):
     # DRAM -> chip at one 32-float block per cycle: each block arrives as two
     # 512b words, one per port (A0: floats 0-15, A1: 16-31). C % 32 == 0;
-    # mxint8.mx_pack_f32_blocks builds A0/A1 on the host. X is an output
+    # mx.mx_pack_f32_blocks builds A0/A1 on the host. X is an output
     # argument, so the consumer's banking of it reaches this function too.
     for r, i in allo.grid(R, C // 32):
         lo: UInt(512) = A0[r, i]
@@ -428,7 +202,7 @@ def schedule_mx_unpack_f32(s):
 
 # --- MX layers: operands are Ty arrays (one scale | elems word per block) ------
 # Quantize activations on chip with mx_quantize_rows / mx_quantize_channels, and
-# weights once on the host with mxint8.mx_pack_np.
+# weights once on the host with mx.mx_pack_np.
 
 
 def schedule_mx_quantize_rows(s):
@@ -529,7 +303,7 @@ def mx_linear2d[
     bias: "TyX[N]",
 ) -> "TyX[M, N]":
     # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html with MX
-    # arithmetic: X is quantized here, Wq on the host (mxint8.mx_pack_np)
+    # arithmetic: X is quantized here, Wq on the host (mx.mx_pack_np)
     Xq = mx_quantize_rows[Ty, TyX, M, K](X)
     C = mx_matmul[Ty, M, N, K](Xq, Wq)
     Z = bias_add[TyX, M, N](C, bias)
@@ -621,7 +395,7 @@ def mx_conv2d[
     bias: "TyX[Cout]",
 ) -> "TyX[B, Cout, Oh, Ow]":
     # nn.conv2d with MX arithmetic, blocks along the input channels: X is
-    # quantized here, Wq on the host (mxint8.mx_pack_channels_np). Each output
+    # quantized here, Wq on the host (mx.mx_pack_channels_np). Each output
     # pixel's receptive field is one row of blocks, so the conv is a matmul of
     # those rows with the weights (flattened the same way), then the bias
     Xq = mx_quantize_channels[Ty, TyX, B, Cin, H, W](X)

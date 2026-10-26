@@ -12,7 +12,7 @@ from allo.ir.types import float32, int32, UInt, Stream
 
 
 def make_fp32_dot_general_dataflow(K, NB, P, depth=4):
-    # Same 512b channel-split read as make_mx_dot_general_dataflow: a block
+    # Same 512b channel-split read as the old MX dot product dataflow: a block
     # is K*32b = 1024b for K=32, wider than Alveo shells auto-widen m_axi to
     # (Vitis HLS's default config_interface -m_axi_max_widen_bitwidth=512),
     # so each block is read as two 512b halves, each its own top-level array
@@ -170,8 +170,13 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["csyn", "sw_emu", "hw_emu", "hw"], default="csyn")
-    parser.add_argument("--project", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fp32.prj"))
+    parser.add_argument(
+        "--mode", choices=["csyn", "sw_emu", "hw_emu", "hw"], default="csyn"
+    )
+    parser.add_argument(
+        "--project",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fp32.prj"),
+    )
     parser.add_argument("--clean", action="store_true", help="Clean the project dir")
 
     args, pytest_args = parser.parse_known_args()

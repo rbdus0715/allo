@@ -420,7 +420,7 @@ applies its registered schedule, and replaces that call in the caller.
 For example, ``nn.mx_conv2d`` (2D convolution with MX arithmetic) takes a
 float32 NCHW input like ``nn.conv2d`` and MX weights: ``Ty`` words that each
 hold one block (the shared scale and its elements) along the input channels,
-packed once on the host with ``mxint8.mx_pack_channels_np``. Inside, it is
+packed once on the host with ``mx.mx_pack_channels_np``. Inside, it is
 function calls: ``nn.mx_quantize_channels`` quantizes the input,
 ``nn.mx_conv_windows`` emits each output pixel's receptive field as one row of
 blocks, ``nn.mx_matmul`` reduces those rows against the weights,
@@ -434,7 +434,7 @@ block dot per cycle. Two layers chain like ordinary function calls:
     import allo.ir.types as T
     import allo.library.nn as nn
     from allo.ir.types import float32
-    from allo.library.mxint8 import mx_pack_channels_np, mx_pack_np
+    from allo.library.mx import mx_pack_channels_np, mx_pack_np
 
     Ty = T.MXInt(8, 32)  # 8-bit elements, 32 per block
     # [Ty, TyX, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, pad_h, pad_w]

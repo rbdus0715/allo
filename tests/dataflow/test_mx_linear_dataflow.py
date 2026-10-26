@@ -11,7 +11,7 @@ import allo
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
-from allo.library.mxint8 import mx_pack_np
+from allo.library.mx import mx_pack_np
 
 # MX formats as MXInt(elem_bits, block_size) / MXFP(exp_bits, mantissa_bits, block_size)
 FORMATS = [T.MXInt(8, 32), T.MXInt(4, 16), T.MXFP(4, 3, 32), T.MXFP(2, 1, 32)]

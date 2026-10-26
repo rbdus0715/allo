@@ -70,44 +70,8 @@ from .backend.hls import HLSModule
 from .backend.xls import XLSCCModule
 from .library import KERNEL2SCHEDULE
 from .library.systolic import check_systolic, prepare_systolic
-from .library.nn import (
-    mx_linear2d,
-    mx_matmul,
-    mx_matmul_ref,
-    bias_add,
-    mx_gemm_q,
-    mx_gemm_wq,
-    mx_gemm_ff,
-    _mx_quantize_rows,
-    _mx_pack_rows,
-    _mx_dot_rows,
-    _mx_dequantize_elem,
-    mx_quantize_rows,
-    mx_quantize_channels,
-    mx_conv_windows,
-    rows_to_nchw,
-    mx_dot,
-)
+from .library import nn as _mx_nn, mx as _mx_lib
 from .ir import types as _mx_types
-from .library.mxint8 import (
-    mx_quantize_block_f32,
-    mx_block_dot,
-    _mx_quantize_elem_int_f32,
-    _mx_quantize_elem_fp_f32,
-    _mx_fp_mul,
-    _mx_get_scale,
-    _mx_pack_word,
-    _mx_acc_bits,
-)
-from .ir.types import (
-    Int as _mx_Int,
-    UInt as _mx_UInt,
-    int32 as _mx_int32,
-    uint8 as _mx_uint8,
-    float32 as _mx_float32,
-    Stream as _mx_Stream,
-    ConstExpr as _mx_ConstExpr,
-)
 from .logging import print_error_message
 
 
@@ -1457,48 +1421,36 @@ def customize(
         instantiate = []
     if global_vars is None:
         global_vars = get_global_vars(fn)
-    # MX library internals, visible to nn.mx_* bodies called from user kernels
-    for _fn in (mx_gemm_q, mx_gemm_wq, mx_gemm_ff):
-        global_vars.setdefault(_fn.__name__, _fn)
-    global_vars.setdefault("_mx_quantize_rows", _mx_quantize_rows)
-    global_vars.setdefault("_mx_pack_rows", _mx_pack_rows)
-    global_vars.setdefault("_mx_dot_rows", _mx_dot_rows)
-    global_vars.setdefault("_mx_dequantize_elem", _mx_dequantize_elem)
-    for _fn in (  # in nn bodies
-        mx_quantize_rows,
-        mx_quantize_channels,
-        mx_conv_windows,
-        rows_to_nchw,
-        bias_add,
-        mx_matmul_ref,
+    # MX library functions and types, visible to nn.mx_* bodies called from
+    # user kernels (a callee resolves names in the caller's globals)
+    for _name in (
+        "mx_linear2d",
+        "mx_matmul",
+        "bias_add",
+        "mx_quantize_rows",
+        "mx_quantize_channels",
+        "mx_conv_windows",
+        "rows_to_nchw",
+        "_mx_dequantize_elem",
     ):
-        global_vars.setdefault(_fn.__name__, _fn)
-    global_vars.setdefault("mx_dot", mx_dot)
-    global_vars.setdefault("mx_linear2d", mx_linear2d)
+        global_vars.setdefault(_name, getattr(_mx_nn, _name))
+    for _name in (
+        "mx_quantize_block_f32",
+        "mx_block_dot",
+        "_mx_quantize_elem_int_f32",
+        "_mx_quantize_elem_fp_f32",
+        "_mx_fp_mul",
+        "_mx_get_scale",
+        "_mx_acc_bits",
+    ):
+        global_vars.setdefault(_name, getattr(_mx_lib, _name))
+    for _name in ("Int", "UInt", "int8", "int32", "uint8", "float32", "e8m0"):
+        global_vars.setdefault(_name, getattr(_mx_types, _name))
+    global_vars.setdefault("ConstExpr", _mx_types.ConstExpr)
     global_vars.setdefault("allo", sys.modules["allo"])  # allo.meta_if in their bodies
     global_vars.setdefault("dsl", sys.modules["allo.dsl"])  # dsl.grid in nn bodies
     # read at customize time, so setting nn.MX_ACC_LATENCY takes effect
-    global_vars.setdefault(
-        "MX_ACC_LATENCY", sys.modules["allo.library.nn"].MX_ACC_LATENCY
-    )
-    global_vars.setdefault("mx_matmul", mx_matmul)
-    global_vars.setdefault("mx_quantize_block_f32", mx_quantize_block_f32)
-    global_vars.setdefault("mx_block_dot", mx_block_dot)
-    global_vars.setdefault("_mx_quantize_elem_int_f32", _mx_quantize_elem_int_f32)
-    global_vars.setdefault("_mx_quantize_elem_fp_f32", _mx_quantize_elem_fp_f32)
-    global_vars.setdefault("_mx_fp_mul", _mx_fp_mul)
-    global_vars.setdefault("_mx_get_scale", _mx_get_scale)
-    global_vars.setdefault("_mx_pack_word", _mx_pack_word)
-    global_vars.setdefault("_mx_acc_bits", _mx_acc_bits)
-    global_vars.setdefault("Int", _mx_Int)
-    global_vars.setdefault("UInt", _mx_UInt)
-    global_vars.setdefault("int32", _mx_int32)
-    global_vars.setdefault("uint8", _mx_uint8)
-    global_vars.setdefault("float32", _mx_float32)
-    global_vars.setdefault("Stream", _mx_Stream)
-    global_vars.setdefault("ConstExpr", _mx_ConstExpr)
-    global_vars.setdefault("int8", _mx_types.int8)
-    global_vars.setdefault("e8m0", _mx_types.e8m0)
+    global_vars.setdefault("MX_ACC_LATENCY", _mx_nn.MX_ACC_LATENCY)
     # Type construction
     ctx_type_inf = ASTContext(
         tree=tree,

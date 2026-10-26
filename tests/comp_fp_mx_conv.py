@@ -21,7 +21,7 @@ import allo.library.nn as nn
 from allo.ir.types import int32, float32, ConstExpr
 from allo.ir.utils import MockBuffer
 from allo.library.nn import partition_block_lanes
-from allo.library.mxint8 import (
+from allo.library.mx import (
     mx_pack_channels_np,
     patch_extern_c_for_class_return_types,
 )
