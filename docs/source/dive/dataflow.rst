@@ -417,46 +417,58 @@ kernels in ``allo.library`` register such schedules in ``KERNEL2SCHEDULE``;
 ``s.compose(fn, instantiate=..., id=...)`` customizes ``fn`` for one call site,
 applies its registered schedule, and replaces that call in the caller.
 
-For example, ``nn.mx_conv2d`` (2D convolution with MX arithmetic) takes MX
-tensors, arrays of ``Ty`` words that each hold one block (the shared scale and
-its elements) along the input channels, and does one block dot per cycle.
-Activations are quantized on chip with ``nn.mx_quantize_channels``; weights
-are packed once on the host with ``mxint8.mx_pack_np``. Two layers chain like
-ordinary function calls:
+For example, ``nn.mx_conv2d`` (2D convolution with MX arithmetic) takes a
+float32 NCHW input like ``nn.conv2d`` and MX weights: ``Ty`` words that each
+hold one block (the shared scale and its elements) along the input channels,
+packed once on the host with ``mxint8.mx_pack_channels_np``. Inside, it is
+function calls: ``nn.mx_quantize_channels`` quantizes the input,
+``nn.mx_conv_windows`` emits each output pixel's receptive field as one row of
+blocks, ``nn.mx_matmul`` reduces those rows against the weights,
+``nn.bias_add`` adds the bias and ``nn.rows_to_nchw`` restores the layout.
+Its registered schedule streams the stages and makes them a dataflow, one
+block dot per cycle. Two layers chain like ordinary function calls:
 
 .. code-block:: python
 
     import allo
     import allo.ir.types as T
     import allo.library.nn as nn
-    from allo.library.mxint8 import mx_pack_np
+    from allo.ir.types import float32
+    from allo.library.mxint8 import mx_pack_channels_np, mx_pack_np
 
     Ty = T.MXInt(8, 32)  # 8-bit elements, 32 per block
-    # [Ty, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, pad_h, pad_w]
-    CONV1 = [Ty, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
-    CONV2 = [Ty, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
+    # [Ty, TyX, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, pad_h, pad_w]
+    CONV1 = [Ty, float32, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
+    CONV2 = [Ty, float32, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1]
 
     def model(inp: "float32[1, 2, 6, 6]",
-              k1: "Ty[3, 1, 3, 3]", b1: "float32[3]",
-              k2: "Ty[2, 1, 3, 3]", b2: "float32[2]") -> "float32[1, 2, 6, 6]":
-        x = nn.mx_quantize_channels[Ty, 1, 2, 6, 6](inp)
-        a = nn.mx_conv2d[Ty, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](x, k1, b1)
-        aq = nn.mx_quantize_channels[Ty, 1, 3, 6, 6](a)
-        return nn.mx_conv2d[Ty, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](aq, k2, b2)
+              k1: "Ty[3, 9]", b1: "float32[3]",
+              k2: "Ty[2, 9]", b2: "float32[2]") -> "float32[1, 2, 6, 6]":
+        a = nn.mx_conv2d[Ty, float32, 1, 2, 3, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](inp, k1, b1)
+        return nn.mx_conv2d[Ty, float32, 1, 3, 2, 6, 6, 3, 3, 6, 6, 1, 1, 1, 1](a, k2, b2)
 
     s = allo.customize(model)
-    s.compose(nn.mx_quantize_channels, instantiate=[Ty, 1, 2, 6, 6])
-    s.compose(nn.mx_quantize_channels, instantiate=[Ty, 1, 3, 6, 6], id="1")
     s.compose(nn.mx_conv2d, instantiate=CONV1)            # first call
     s.compose(nn.mx_conv2d, instantiate=CONV2, id="1")    # second call
-    s.dataflow("model")                                   # overlap the layers
+    nn.mx_dataflow(s)                                     # overlap the layers
     mod = s.build(target="vitis_hls", mode="csyn", project="model.prj")
 
-    # weights: blocks along the input channels (axis 1)
-    # k1 = mx_pack_np(Ty, w1, axis=1)
+    # weights [Cout, Cin, Kh, Kw] -> Ty[Cout, NB * Kh * Kw]
+    # k1 = mx_pack_channels_np(Ty, w1)
 
-``nn.mx_linear2d`` works the same way with ``nn.mx_quantize_rows`` (blocks
-along the rows; ``mx_pack_np(Ty, W)`` for its weights).
+``nn.mx_linear2d`` works the same way: ``nn.mx_quantize_rows``,
+``nn.mx_matmul`` and ``nn.bias_add`` (weights from ``mx_pack_np(Ty, W)``).
+``nn.mx_matmul`` alone computes ``A @ B`` on MX operands, from
+``nn.mx_quantize_rows(A)`` and ``nn.mx_quantize_cols(B)``.
+
+``nn.mx_dataflow(s)`` applies ``s.dataflow`` to the top function and turns
+each MX result into a FIFO (``s.to``) when its single consumer reads it once,
+in the order the producer writes it. ``nn.MX_STREAM_PORTS`` declares this per
+op: the inputs read once in row-major order, and whether the result is written
+that way. A chain of ``mx_quantize_rows`` and ``mx_linear2d`` streams every
+hand-off, so the layers overlap within one call. A convolution reads
+overlapping windows, so the hand-offs above stay buffers (ping-pong between
+calls). A new MX op takes part by adding its entry to ``MX_STREAM_PORTS``.
 The unscheduled ``allo.customize(model).build(target="llvm")`` computes the
 same results on the CPU. When a library function is called more than once,
 the ``n``-th call (and its helper functions) is suffixed ``_n`` for ``n > 0``,

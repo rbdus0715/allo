@@ -7,7 +7,7 @@ import allo
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.library.nn import (
-    mx_matmul,
+    mx_matmul_ref,
     mx_linear2d,
     mx_linear2d_ref,
     mx_linear3d,
@@ -40,12 +40,12 @@ def test_mx_matmul():
     A = _rand((M, K), rng)
     B = _rand((N, K), rng)
 
-    s = allo.customize(mx_matmul, instantiate=[Ty, M, N, K])
+    s = allo.customize(mx_matmul_ref, instantiate=[Ty, M, N, K])
     mod = s.build(target="llvm")
     Z = mod(A, B)
 
     ref = A.astype(np.float64) @ B.astype(np.float64).T
-    _assert_close(Z, ref, "mx_matmul")
+    _assert_close(Z, ref, "mx_matmul_ref")
 
 
 def test_mx_linear2d():
@@ -55,9 +55,9 @@ def test_mx_linear2d():
     W = _rand((N, K), rng)
     bias = _rand((N,), rng)
 
-    s = allo.customize(mx_linear2d, instantiate=[Ty, M, N, K])
+    s = allo.customize(mx_linear2d, instantiate=[Ty, float32, M, N, K])
     mod = s.build(target="llvm")
-    Z = mod(mx_pack_np(Ty, X), mx_pack_np(Ty, W), bias)
+    Z = mod(X, mx_pack_np(Ty, W), bias)
 
     ref = X.astype(np.float64) @ W.astype(np.float64).T + bias.astype(np.float64)
     _assert_close(Z, ref, "mx_linear2d")
@@ -71,9 +71,8 @@ def test_mx_linear2d():
     def kernel(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        Xq = nn.mx_quantize_rows[Ty, M, K](X)
-        Wq = nn.mx_quantize_rows[Ty, N, K](W)
-        return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
+        Wq = nn.mx_quantize_rows[Ty, float32, N, K](W)
+        return nn.mx_linear2d[Ty, float32, M, N, K](X, Wq, bias)
 
     s_k = allo.customize(kernel)
     np.testing.assert_array_equal(Z, s_k.build(target="llvm")(X, W, bias))
@@ -86,7 +85,7 @@ def test_mx_linear3d():
     W = _rand((M, D), rng)
     bias = _rand((M,), rng)
 
-    s = allo.customize(mx_linear3d, instantiate=[Ty, B, L, D, M])
+    s = allo.customize(mx_linear3d, instantiate=[Ty, float32, B, L, D, M])
     mod = s.build(target="llvm")
     Z = mod(X, mx_pack_np(Ty, W), bias)
 
@@ -117,9 +116,8 @@ def test_mx_linear2d_vs_float():
     def kernel_mx(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        Xq = nn.mx_quantize_rows[Ty, M, K](X)
-        Wq = nn.mx_quantize_rows[Ty, N, K](W)
-        return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
+        Wq = nn.mx_quantize_rows[Ty, float32, N, K](W)
+        return nn.mx_linear2d[Ty, float32, M, N, K](X, Wq, bias)
 
     mod_mx = allo.customize(kernel_mx).build(target="llvm")
     Z_mx = mod_mx(X, W, bias)
@@ -212,9 +210,9 @@ def test_mx_gemm_variants(M, N, K):
     ref_lin = allo.customize(mx_linear2d_ref, instantiate=[Ty, M, N, K]).build(
         target="llvm"
     )(X, W, bias)
-    ref_mm = allo.customize(mx_matmul, instantiate=[Ty, M, N, K]).build(target="llvm")(
-        X, np.ascontiguousarray(B.T)
-    )
+    ref_mm = allo.customize(mx_matmul_ref, instantiate=[Ty, M, N, K]).build(
+        target="llvm"
+    )(X, np.ascontiguousarray(B.T))
     Xq, Xs = mx_quantize(Ty, X)
     Wq, Ws = mx_quantize(Ty, W)
     Bq, Bs = mx_quantize(Ty, B, axis=0)
@@ -250,9 +248,8 @@ def test_mx_custom_format_linear(Tc):
     def lin_ff(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        Xq = nn.mx_quantize_rows[Tc, M, K](X)
-        Wq = nn.mx_quantize_rows[Tc, N, K](W)
-        return nn.mx_linear2d[Tc, M, N, K](Xq, Wq, bias)
+        Wq = nn.mx_quantize_rows[Tc, float32, N, K](W)
+        return nn.mx_linear2d[Tc, float32, M, N, K](X, Wq, bias)
 
     def lin_q(
         Xq: "Int(EB)[M, K]",
@@ -347,9 +344,8 @@ def test_mxfp_linear(Tf):
     def lin_ff(
         X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]"
     ) -> "float32[M, N]":
-        Xq = nn.mx_quantize_rows[Tf, M, K](X)
-        Wq = nn.mx_quantize_rows[Tf, N, K](W)
-        return nn.mx_linear2d[Tf, M, N, K](Xq, Wq, bias)
+        Wq = nn.mx_quantize_rows[Tf, float32, N, K](W)
+        return nn.mx_linear2d[Tf, float32, M, N, K](X, Wq, bias)
 
     def lin_q(
         Xq: "Int(EB)[M, K]",

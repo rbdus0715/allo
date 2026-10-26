@@ -11,14 +11,17 @@
 # attn_mx=True also puts attention's Q @ K^T and P @ V on MX operands.
 #
 # One transformer block is the Allo kernel; the host runs it once per layer.
-#   python examples/mx_gpt2.py
+#   python examples/mx_gpt2.py                                -> LLVM, all formats
+#   python examples/mx_gpt2.py --mode csyn|hw_emu [--attn-mx] -> one block on HLS
+
+import re
 
 import numpy as np
 import allo
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
-from allo.library.mxint8 import mx_pack_np
+from allo.library.mxint8 import mx_pack_np, patch_extern_c_for_class_return_types
 
 # sequence length, model width, heads, MLP width, layers, vocabulary
 L, D, H, F, N_LAYER, VOCAB = 8, 64, 2, 256, 2, 128
@@ -40,19 +43,17 @@ def make_block(Ty, attn_mx):
         for i, j in allo.grid(L, L):
             if j <= i and S[i, j] * SCALE > mx[i]:
                 mx[i] = S[i, j] * SCALE
-        for i1, j1 in allo.grid(L, L):
-            if j1 <= i1:
-                P[i1, j1] = allo.exp(S[i1, j1] * SCALE - mx[i1])
-                tot[i1] += P[i1, j1]
-        for i2, j2 in allo.grid(L, L):
-            P[i2, j2] = P[i2, j2] / tot[i2]
+        for ie, je in allo.grid(L, L):
+            if je <= ie:
+                P[ie, je] = allo.exp(S[ie, je] * SCALE - mx[ie])
+                tot[ie] += P[ie, je]
+        for iz, jz in allo.grid(L, L):
+            P[iz, jz] = P[iz, jz] / tot[iz]
         return P
 
     def attention(qkv: "float32[L, QKV]") -> "float32[L, D]":
         # causal multi-head attention on qkv = [Q | K | V]
         Z: float32[L, D]
-        zl: float32[L] = 0.0
-        zd: float32[DH] = 0.0
         for h in range(H):
             q: float32[L, DH]
             k: float32[L, DH]
@@ -61,30 +62,31 @@ def make_block(Ty, attn_mx):
                 q[r, c] = qkv[r, h * DH + c]
                 k[r, c] = qkv[r, D + h * DH + c]
                 v[r, c] = qkv[r, 2 * D + h * DH + c]
-            S: float32[L, L]
-            O: float32[L, DH]
+            # each branch writes its head's columns of Z (assigning a call's
+            # result to an existing array would lower to an unsupported copy)
             with allo.meta_if(ATTN_MX):
-                qq = nn.mx_quantize_rows[Ty, L, DH](q)
-                kq = nn.mx_quantize_rows[Ty, L, DH](k)
-                S = nn.mx_linear2d[Ty, L, L, DH](qq, kq, zl)  # Q @ K^T
-                P = causal_softmax(S)
-                pq = nn.mx_quantize_rows[Ty, L, L](P)
-                vq = nn.mx_quantize_cols[Ty, DH, L](v)  # V^T blocked along L
-                O = nn.mx_linear2d[Ty, L, DH, L](pq, vq, zd)  # P @ V
+                qq = nn.mx_quantize_rows[Ty, float32, L, DH](q)
+                kq = nn.mx_quantize_rows[Ty, float32, L, DH](k)
+                S1 = nn.mx_matmul[Ty, L, L, DH](qq, kq)  # Q @ K^T
+                P1 = causal_softmax(S1)
+                pq = nn.mx_quantize_rows[Ty, float32, L, L](P1)
+                vq = nn.mx_quantize_cols[Ty, float32, DH, L](v)  # V^T blocked along L
+                O1 = nn.mx_matmul[Ty, L, DH, L](pq, vq)  # P @ V
+                for rm, cm in allo.grid(L, DH):
+                    Z[rm, h * DH + cm] = O1[rm, cm]
             with allo.meta_else():
+                S: float32[L, L]
                 for i, j in allo.grid(L, L):
                     acc: float32 = 0.0
                     for d in range(DH):
                         acc += q[i, d] * k[j, d]
                     S[i, j] = acc
                 P = causal_softmax(S)
-                for i3, d3 in allo.grid(L, DH):
-                    acc3: float32 = 0.0
-                    for j3 in range(L):
-                        acc3 += P[i3, j3] * v[j3, d3]
-                    O[i3, d3] = acc3
-            for r1, c1 in allo.grid(L, DH):
-                Z[r1, h * DH + c1] = O[r1, c1]
+                for ip, dp in allo.grid(L, DH):
+                    accp: float32 = 0.0
+                    for jp in range(L):
+                        accp += P[ip, jp] * v[jp, dp]
+                    Z[ip, h * DH + dp] = accp
         return Z
 
     def block(
@@ -104,21 +106,81 @@ def make_block(Ty, attn_mx):
     ) -> "float32[L, D]":
         # x + attn(ln1(x)), then + mlp(ln2(.))
         h1 = nn.layer_norm[float32, L, D](x, ln1_g, ln1_b)
-        h1q = nn.mx_quantize_rows[Ty, L, D](h1)
-        qkv = nn.mx_linear2d[Ty, L, QKV, D](h1q, w_qkv, b_qkv)
+        qkv = nn.mx_linear2d[Ty, float32, L, QKV, D](h1, w_qkv, b_qkv)
         a = attention(qkv)
-        aq = nn.mx_quantize_rows[Ty, L, D](a)
-        o = nn.mx_linear2d[Ty, L, D, D](aq, w_o, b_o)
+        o = nn.mx_linear2d[Ty, float32, L, D, D](a, w_o, b_o)
         x1 = nn.residual_add[float32, L, D](x, o)
         h2 = nn.layer_norm[float32, L, D](x1, ln2_g, ln2_b)
-        h2q = nn.mx_quantize_rows[Ty, L, D](h2)
-        f = nn.mx_linear2d[Ty, L, F, D](h2q, w_fc1, b_fc1)
+        f = nn.mx_linear2d[Ty, float32, L, F, D](h2, w_fc1, b_fc1)
         g = nn.GeLU[float32, L, F](f)
-        gq = nn.mx_quantize_rows[Ty, L, F](g)
-        y = nn.mx_linear2d[Ty, L, D, F](gq, w_fc2, b_fc2)
+        y = nn.mx_linear2d[Ty, float32, L, D, F](g, w_fc2, b_fc2)
         return nn.residual_add[float32, L, D](x1, y)
 
     return block
+
+
+def make_block_hw(Ty, attn_mx):
+    """make_block with float32 weights quantized on chip, for hw_emu: Allo's
+    HLS host does not yet lay out Ty words the way the AXI ports read them."""
+    block = make_block(Ty, attn_mx)
+
+    def block_hw(
+        x: "float32[L, D]",
+        ln1_g: "float32[D]",
+        ln1_b: "float32[D]",
+        w_qkv: "float32[QKV, D]",
+        b_qkv: "float32[QKV]",
+        w_o: "float32[D, D]",
+        b_o: "float32[D]",
+        ln2_g: "float32[D]",
+        ln2_b: "float32[D]",
+        w_fc1: "float32[F, D]",
+        b_fc1: "float32[F]",
+        w_fc2: "float32[D, F]",
+        b_fc2: "float32[D]",
+    ) -> "float32[L, D]":
+        q_qkv = nn.mx_quantize_rows[Ty, float32, QKV, D](w_qkv)
+        q_o = nn.mx_quantize_rows[Ty, float32, D, D](w_o)
+        q_fc1 = nn.mx_quantize_rows[Ty, float32, F, D](w_fc1)
+        q_fc2 = nn.mx_quantize_rows[Ty, float32, D, F](w_fc2)
+        return block(
+            x,
+            ln1_g,
+            ln1_b,
+            q_qkv,
+            b_qkv,
+            q_o,
+            b_o,
+            ln2_g,
+            ln2_b,
+            q_fc1,
+            b_fc1,
+            q_fc2,
+            b_fc2,
+        )
+
+    return block_hw
+
+
+def schedule_mx_all(s):
+    """One block per cycle in every MX function instance of `s`: unrolled
+    block primitives, pipelined block loops."""
+    loops = {
+        "mx_block_dot": ("unroll", ("j0", "j1")),
+        "mx_quantize_block_f32": ("unroll", ("i1",)),
+        "mx_matmul": ("pipeline", ("n",)),
+        "bias_add": ("pipeline", ("n",)),
+        "mx_quantize_rows": ("pipeline", ("b",)),
+        "mx_quantize_cols": ("pipeline", ("b",)),
+    }
+    for op in s.module.body.operations:
+        name = op.attributes["sym_name"].value
+        base = re.sub(r"_\d+$", "", name)
+        if base in loops:
+            prim, names = loops[base]
+            for loop in names:
+                getattr(s, prim)(f"{name}:{loop}")
+    return s
 
 
 # ---- weights and the float64 reference ---------------------------------------
@@ -233,5 +295,38 @@ def main():
     return results
 
 
+def run_hw(mode, project, Ty=FORMATS[0], attn_mx=False):
+    """One block on Vitis HLS (csyn / hw_emu), checked against LLVM."""
+    layers, head = init_weights()
+    p = layers[0]
+    tokens = np.random.default_rng(1).integers(0, VOCAB, L)
+    x = np.ascontiguousarray(head["wte"][tokens] + head["wpe"], np.float32)
+    args = [x, *(np.ascontiguousarray(v) for v in p.values())]
+    top = make_block_hw(Ty, attn_mx)
+    ref = allo.customize(top).build(target="llvm")(*args)
+    s = schedule_mx_all(allo.customize(top))
+    mod = s.build(target="vitis_hls", mode=mode, project=project)
+    # issue #603: extern "C" functions returning ap_int<N> (the packed MX word)
+    patch_extern_c_for_class_return_types(f"{project}/kernel.cpp")
+    if mode == "csyn":
+        mod()
+        return None
+    y = np.zeros((L, D), np.float32)
+    mod(*args, y)
+    rel = np.linalg.norm(y - ref) / np.linalg.norm(ref)
+    print(f"[{mode}] {Ty.name} block: rel diff vs LLVM {rel:.2e}")
+    return rel
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["llvm", "csyn", "hw_emu"], default="llvm")
+    parser.add_argument("--project", default="mx_gpt2_block.prj")
+    parser.add_argument("--attn-mx", action="store_true")
+    args = parser.parse_args()
+    if args.mode == "llvm":
+        main()
+    else:
+        run_hw(args.mode, args.project, attn_mx=args.attn_mx)

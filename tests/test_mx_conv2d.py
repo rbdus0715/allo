@@ -16,7 +16,7 @@ import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
 from allo.library.mxint8 import (
-    mx_pack_np,
+    mx_pack_channels_np,
     mx_unpack_np,
     patch_extern_c_for_class_return_types,
 )
@@ -36,27 +36,39 @@ def test_mx_conv2d(Ty, B, Cin, Cout, H, K, S, P):
         rng.standard_normal(shape) * 2.0 ** rng.integers(-4, 4, shape)
     ).astype(np.float32)
     inp, kernel, bias = rand((B, Cin, H, H)), rand((Cout, Cin, K, K)), rand((Cout,))
-    # MX operands: blocks along the channels (axis 1), packed on the host
-    xq, wq = mx_pack_np(Ty, inp, axis=1), mx_pack_np(Ty, kernel, axis=1)
+    # weights packed on the host (blocks along the input channels); xq is the
+    # same packing of inp, as the layer quantizes it, for the reference
+    xq, wq = mx_pack_channels_np(Ty, inp), mx_pack_channels_np(Ty, kernel)
     Oh = (H + 2 * P - K) // S + 1
-    inst = [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
+    inst = [Ty, float32, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
     Z = allo.customize(nn.mx_conv2d, instantiate=inst).build(target="llvm")(
-        xq, wq, bias
+        inp, wq, bias
     )
 
-    # reference: each block dot exact, summed in float32 onto the bias in
-    # (kh, kw, channel block) order
-    BS, NB = Ty.block_size, xq.shape[1]
-    blocks = lambda q: np.moveaxis(mx_unpack_np(Ty, q, axis=1), 1, -1).reshape(
-        *q.shape[:1], *q.shape[2:], NB, BS
-    )
-    xd, wd = blocks(xq), blocks(wq)  # [A, P, Q, NB, BS]
-    ref = np.zeros((B, Cout, Oh, Oh), np.float32) + bias[None, :, None, None]
-    for kh, kw, cb, oh, ow in np.ndindex(K, K, NB, Oh, Oh):
-        ih, iw = oh * S + kh - P, ow * S + kw - P
-        if 0 <= ih < H and 0 <= iw < H:
-            dot = (xd[:, ih, iw, cb, None, :] * wd[None, :, kh, kw, cb]).sum(-1)
-            ref[:, :, oh, ow] += dot.astype(np.float32)
+    # reference: per output pixel, exact block dots in (channel block, kh, kw)
+    # order (padding taps are 0), summed in float32 in groups of G blocks as
+    # mx_matmul does (G = 4 for fewer than 6 output channels), then the bias
+    BS, NB = Ty.block_size, -(-Cin // Ty.block_size)
+    G = 1 if Cout >= 6 else 4
+    xd = mx_unpack_np(Ty, xq.reshape(B, NB, H, H), axis=1)  # [B, NB * BS, H, W]
+    wd = mx_unpack_np(Ty, wq.reshape(Cout, NB, K, K), axis=1)
+    ref = np.zeros((B, Cout, Oh, Oh), np.float32)
+    for n, oh, ow in np.ndindex(B, Oh, Oh):
+        dots = []
+        for cb, kh, kw in np.ndindex(NB, K, K):
+            ih, iw = oh * S + kh - P, ow * S + kw - P
+            dot = np.zeros(Cout, np.float32)
+            if 0 <= ih < H and 0 <= iw < H:
+                lanes = slice(cb * BS, (cb + 1) * BS)
+                dot = (wd[:, lanes, kh, kw] @ xd[n, lanes, ih, iw]).astype(np.float32)
+            dots.append(dot)
+        acc = np.zeros(Cout, np.float32)
+        for g in range(0, len(dots), G):
+            part = np.zeros(Cout, np.float32)
+            for dot in dots[g : g + G]:
+                part += dot
+            acc += part
+        ref[n, :, oh, ow] = acc + bias
     np.testing.assert_array_equal(Z, ref)
 
     exact = np.zeros((B, Cout, Oh, Oh)) + bias[None, :, None, None]
@@ -70,7 +82,8 @@ def test_mx_conv2d(Ty, B, Cin, Cout, H, K, S, P):
 
     s = allo.customize(nn.mx_conv2d, instantiate=inst)
     code = str(nn.schedule_mx_conv2d(s).build(target="vhls"))
-    assert "#pragma HLS pipeline" in code
+    assert "#pragma HLS dataflow" in code  # windows -> mx_linear2d -> NCHW
+    assert code.count("hls::stream<") >= 2
 
 
 def test_mx_conv2d_hls():
@@ -84,22 +97,20 @@ def test_mx_conv2d_hls():
     Ty = {t.name: t for t in FORMATS}[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
     B, Cin, Cout, H, K, S, P = CONFIGS[-1]
     Oh = (H + 2 * P - K) // S + 1
-    conv = [Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
+    conv = [Ty, float32, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P]
 
     def top(
         inp: "float32[B, Cin, H, H]",
         kernel: "float32[Cout, Cin, K, K]",
         bias: "float32[Cout]",
     ) -> "float32[B, Cout, Oh, Oh]":
-        xq = nn.mx_quantize_channels[Ty, B, Cin, H, H](inp)
-        wq = nn.mx_quantize_channels[Ty, Cout, Cin, K, K](kernel)
-        return nn.mx_conv2d[Ty, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P](
-            xq, wq, bias
+        wq = nn.mx_quantize_channels[Ty, float32, Cout, Cin, K, K](kernel)
+        return nn.mx_conv2d[Ty, float32, B, Cin, Cout, H, H, K, K, Oh, Oh, S, S, P, P](
+            inp, wq, bias
         )
 
     s = allo.customize(top)
-    s.compose(nn.mx_quantize_channels, instantiate=[Ty, B, Cin, H, H])
-    s.compose(nn.mx_quantize_channels, instantiate=[Ty, Cout, Cin, K, K], id="1")
+    s.compose(nn.mx_quantize_channels, instantiate=[Ty, float32, Cout, Cin, K, K])
     s.compose(nn.mx_conv2d, instantiate=conv)
     project = os.environ["ALLO_PROJECT"]
     hls_mod = s.build(target="vitis_hls", mode=mode, project=project)

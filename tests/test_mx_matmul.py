@@ -18,7 +18,7 @@ import allo.backend.hls as hls
 import allo.ir.types as T
 from allo.ir.types import float32, int8, e8m0
 import allo.library.nn as nn
-from allo.library.nn import mx_matmul
+from allo.library.nn import mx_matmul_ref
 from allo.library.mxint8 import mx_quantize, patch_extern_c_for_class_return_types
 
 Ty = T.mxint8
@@ -131,7 +131,7 @@ def test_mx_matmul(kernel):
         args = (A, B)
     Z = allo.customize(kernel).build(target="llvm")(*args)
 
-    ref = allo.customize(mx_matmul, instantiate=[Ty, M, N, K]).build(target="llvm")(
+    ref = allo.customize(mx_matmul_ref, instantiate=[Ty, M, N, K]).build(target="llvm")(
         A, np.ascontiguousarray(B.T)
     )
     np.testing.assert_array_equal(Z, ref)

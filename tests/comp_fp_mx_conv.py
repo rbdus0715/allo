@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=unsubscriptable-object, no-value-for-parameter
 
-# nn.mx_conv2d vs the same direct convolution in plain float32: both take one
-# block of BS input channels per tap per cycle (cout innermost, pipelined).
-# The MX operands come quantized (one word per block); float32 reads a block
-# from BS banks.
+# nn.mx_conv2d vs a direct convolution in plain float32, both one block of BS
+# input channels per tap per cycle. MX: windows -> mx_linear2d -> NCHW as a
+# dataflow on quantized operands (one word per block); float32 reads a block
+# from BS banks in one pipelined loop nest (cout innermost).
 #   pytest tests/comp_fp_mx_conv.py                                -> numerics
 #   python tests/comp_fp_mx_conv.py --format mxint8_k32 -k csyn    -> + csynth
 
@@ -21,7 +21,10 @@ import allo.library.nn as nn
 from allo.ir.types import int32, float32, ConstExpr
 from allo.ir.utils import MockBuffer
 from allo.library.nn import partition_block_lanes
-from allo.library.mxint8 import mx_pack_np, patch_extern_c_for_class_return_types
+from allo.library.mxint8 import (
+    mx_pack_channels_np,
+    patch_extern_c_for_class_return_types,
+)
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BS = 32  # channels per block, as in the 32-element MX formats
@@ -46,7 +49,7 @@ def fp32_conv2d[
     kernel: "float32[Cout, Cin, Kh, Kw]",
     bias: "float32[Cout]",
 ) -> "float32[B, Cout, Oh, Ow]":
-    # nn.mx_conv2d's loops with a float32 block dot of BS channels
+    # direct conv with a float32 block dot of BS channels
     NB: ConstExpr[int32] = (Cin + BS - 1) // BS
     Z: float32[B, Cout, Oh, Ow]
     for n0, c0, oh0, ow0 in allo.grid(B, Cout, Oh, Ow):
@@ -66,7 +69,7 @@ def fp32_conv2d[
 
 
 def schedule_fp32_conv2d(s):
-    """nn.schedule_mx_conv2d plus block-lane banks for inp/kernel."""
+    """cout innermost, pipelined; block-lane banks for inp/kernel."""
     _, Cin = s.inst_list[:2]
     top = s.top_func_name
     for arr in ("inp", "kernel"):
@@ -103,8 +106,9 @@ def test_conv_numerics(name, Ty):
     rel = lambda Z: np.linalg.norm(Z - exact) / np.linalg.norm(exact)
     build = lambda fn, i: allo.customize(fn, instantiate=i).build(target="llvm")
     Z_fp = build(fp32_conv2d, inst)(inp, kernel, bias)
-    xq, wq = mx_pack_np(Ty, inp, axis=1), mx_pack_np(Ty, kernel, axis=1)
-    Z_mx = build(nn.mx_conv2d, [Ty, *inst])(xq, wq, bias)
+    Z_mx = build(nn.mx_conv2d, [Ty, float32, *inst])(
+        inp, mx_pack_channels_np(Ty, kernel), bias
+    )
     print(
         f"\n[{name}] rel norm vs fp64: fp32 {rel(Z_fp):.2e}, {Ty.name} {rel(Z_mx):.2e}"
     )
@@ -116,7 +120,9 @@ def test_conv_numerics(name, Ty):
 def test_conv_csyn(name):
     Ty = FORMATS[os.environ.get("ALLO_MXFORMAT", "mxint8_k32")]
     inst = _inst(*CONFIGS[name])
-    s_mx = nn.schedule_mx_conv2d(allo.customize(nn.mx_conv2d, instantiate=[Ty, *inst]))
+    s_mx = nn.schedule_mx_conv2d(
+        allo.customize(nn.mx_conv2d, instantiate=[Ty, float32, *inst])
+    )
     s_fp = schedule_fp32_conv2d(allo.customize(fp32_conv2d, instantiate=inst))
     for s in (s_mx, s_fp):
         assert "#pragma HLS pipeline" in str(s.build(target="vhls"))

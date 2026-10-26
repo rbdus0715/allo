@@ -325,22 +325,75 @@ def _stream_type(memref, depth):
     )
 
 
+def find_func(module, name):
+    for func in module.body.operations:
+        if isinstance(func, func_d.FuncOp) and func.name.value == name:
+            return func
+    return None
+
+
+def stream_func_result(module, name, depth):
+    # function `name` returns a stream; so does the call it forwards, if any
+    func = find_func(module, name)
+    if func is None:
+        return
+    ret = func.entry_block.operations[len(func.entry_block.operations) - 1]
+    new_type = _stream_type(MemRefType(ret.operands[0].type), depth)
+    ret.operands[0].set_type(new_type)
+    in_types = func.attributes["function_type"].value.inputs
+    func.attributes["function_type"] = TypeAttr.get(
+        FunctionType.get(in_types, [new_type])
+    )
+    producer = getattr(ret.operands[0].owner, "operation", None)  # None: an argument
+    if producer is not None and producer.name == "func.call":
+        stream_func_result(
+            module, FlatSymbolRefAttr(producer.attributes["callee"]).value, depth
+        )
+
+
+def stream_func_argument(module, name, idx, depth):
+    # argument `idx` of function `name` is a stream; so is every call
+    # argument it is passed to directly
+    func = find_func(module, name)
+    if func is None:
+        return
+    in_types = func.attributes["function_type"].value.inputs
+    out_types = func.attributes["function_type"].value.results
+    arg = func.arguments[idx]
+    memref = MemRefType(arg.type)
+    if depth == -1:
+        depth = int(np.prod(memref.shape))
+    new_memref = MemRefType.get(
+        memref.shape,
+        memref.element_type,
+        memref.layout,
+        StringAttr.get(f"stream:{depth}"),
+    )
+    arg.set_type(new_memref)
+    new_in_types = []
+    for i, in_type in enumerate(in_types):
+        new_in_types.append(new_memref if i == idx else in_type)
+    func_type = FunctionType.get(new_in_types, out_types)
+    func.attributes["function_type"] = TypeAttr.get(func_type)
+    for op in func.entry_block.operations:
+        if isinstance(op, func_d.CallOp):
+            for i, operand in enumerate(op.operands):
+                if operand == arg:
+                    stream_func_argument(
+                        module,
+                        FlatSymbolRefAttr(op.attributes["callee"]).value,
+                        i,
+                        depth,
+                    )
+
+
 def update_streaming_interface(module, target, depth=-1):
     # A call result streamed to its consumer: the producer must return the
     # stream too, or its signature no longer matches the call
     if isinstance(target, func_d.CallOp):
-        callee = FlatSymbolRefAttr(target.attributes["callee"]).value
-        for func in module.body.operations:
-            if isinstance(func, func_d.FuncOp) and func.name.value == callee:
-                ret = func.entry_block.operations[
-                    len(func.entry_block.operations) - 1
-                ]
-                new_type = _stream_type(MemRefType(ret.operands[0].type), depth)
-                ret.operands[0].set_type(new_type)
-                in_types = func.attributes["function_type"].value.inputs
-                func.attributes["function_type"] = TypeAttr.get(
-                    FunctionType.get(in_types, [new_type])
-                )
+        stream_func_result(
+            module, FlatSymbolRefAttr(target.attributes["callee"]).value, depth
+        )
     # Find target in the top function
     target_arr = {}
     # pylint: disable=too-many-nested-blocks
@@ -354,27 +407,8 @@ def update_streaming_interface(module, target, depth=-1):
                                 FlatSymbolRefAttr(op.attributes["callee"]).value
                             ] = idx
     # update function arguments
-    for func in module.body.operations:
-        if isinstance(func, func_d.FuncOp) and func.name.value in target_arr:
-            in_types = func.attributes["function_type"].value.inputs
-            out_types = func.attributes["function_type"].value.results
-            idx = target_arr[func.name.value]
-            arg = func.arguments[idx]
-            memref = MemRefType(arg.type)
-            if depth == -1:
-                depth = int(np.prod(memref.shape))
-            new_memref = MemRefType.get(
-                memref.shape,
-                memref.element_type,
-                memref.layout,
-                StringAttr.get(f"stream:{depth}"),
-            )
-            arg.set_type(new_memref)
-            new_in_types = []
-            for i, in_type in enumerate(in_types):
-                new_in_types.append(new_memref if i == idx else in_type)
-            func_type = FunctionType.get(new_in_types, out_types)
-            func.attributes["function_type"] = TypeAttr.get(func_type)
+    for name, idx in target_arr.items():
+        stream_func_argument(module, name, idx, depth)
 
 
 def create_data_movement(

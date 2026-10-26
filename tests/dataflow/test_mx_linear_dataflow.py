@@ -1,8 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Chaining nn.mx_linear2d calls: the activations are MX-quantized on chip
-# (nn.mx_quantize_rows), the weights on the host (mx_pack_np). Each call's
+# Chaining nn.mx_linear2d calls: each layer quantizes its float32 input on
+# chip, the weights come packed from the host (mx_pack_np). Each call's
 # registered schedule is applied with s.compose(fn, instantiate=..., id=...).
 
 import numpy as np
@@ -10,6 +10,7 @@ import pytest
 import allo
 import allo.ir.types as T
 import allo.library.nn as nn
+from allo.ir.types import float32
 from allo.library.mxint8 import mx_pack_np
 
 # MX formats as MXInt(elem_bits, block_size) / MXFP(exp_bits, mantissa_bits, block_size)
@@ -28,10 +29,8 @@ def mlp[
     W2: "Ty[N2, (N1 + Ty.block_size - 1) // Ty.block_size]",
     b2: "float32[N2]",
 ) -> "float32[M, N2]":
-    Xq = nn.mx_quantize_rows[Ty, M, K0](X)
-    a = nn.mx_linear2d[Ty, M, N1, K0](Xq, W1, b1)
-    aq = nn.mx_quantize_rows[Ty, M, N1](a)
-    return nn.mx_linear2d[Ty, M, N2, N1](aq, W2, b2)
+    a = nn.mx_linear2d[Ty, float32, M, N1, K0](X, W1, b1)
+    return nn.mx_linear2d[Ty, float32, M, N2, N1](a, W2, b2)
 
 
 def _rand(shape, rng):
@@ -48,24 +47,23 @@ def test_mx_linear2d_chain(Ty):
     b1, b2 = _rand((N1,), rng), _rand((N2,), rng)
 
     # numerics: the chain equals the two layers run one by one
-    FC1, FC2 = [Ty, M, N1, K0], [Ty, M, N2, N1]
+    FC1, FC2 = [Ty, float32, M, N1, K0], [Ty, float32, M, N2, N1]
     Y = allo.customize(mlp, instantiate=[Ty]).build(target="llvm")(X, W1, b1, W2, b2)
     fc = lambda inst: allo.customize(nn.mx_linear2d, instantiate=inst).build(
         target="llvm"
     )
-    a = fc(FC1)(mx_pack_np(Ty, X), W1, b1)
-    np.testing.assert_array_equal(Y, fc(FC2)(mx_pack_np(Ty, a), W2, b2))
+    a = fc(FC1)(X, W1, b1)
+    np.testing.assert_array_equal(Y, fc(FC2)(a, W2, b2))
 
     s = allo.customize(mlp, instantiate=[Ty])
     # the n-th call (and its helpers) is suffixed "_n" for n > 0
-    s.compose(nn.mx_quantize_rows, instantiate=[Ty, M, K0])
-    s.compose(nn.mx_quantize_rows, instantiate=[Ty, M, N1], id="1")
     s.compose(nn.mx_linear2d, instantiate=FC1)
     s.compose(nn.mx_linear2d, instantiate=FC2, id="1")
-    s.dataflow("mlp")
+    # fc1's output is read once, in the order it is written: a FIFO
+    assert nn.mx_dataflow(s) == ["a"]
     code = str(s.build(target="vhls"))
-    assert "#pragma HLS dataflow" in code  # the four stages overlap
-    assert code.count("#pragma HLS pipeline") >= 4  # one loop per stage
+    assert code.count("#pragma HLS dataflow") >= 3  # mlp + one per layer
+    assert code.count("hls::stream<") >= 5  # a, and Xq, C in each layer
 
 
 if __name__ == "__main__":

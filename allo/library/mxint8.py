@@ -193,6 +193,12 @@ def mx_pack_np(Ty, x, axis=-1):
     return np.ascontiguousarray(np.moveaxis(words, -1, axis))
 
 
+def mx_pack_channels_np(Ty, x):
+    """Host counterpart of nn.mx_quantize_channels: NCHW (or a conv kernel
+    [Cout, Cin, Kh, Kw]) -> Ty[N, NB * H * W], blocks along the channels."""
+    return mx_pack_np(Ty, x, axis=1).reshape(len(x), -1)
+
+
 def mx_unpack_np(Ty, q, axis=-1, length=None):
     """Inverse of mx_pack_np, in float64: Ty words -> values along `axis`
     (`length` of them, default all NB * block_size)."""

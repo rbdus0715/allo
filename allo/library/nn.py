@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # pylint: disable=used-before-assignment, unsubscriptable-object, unsupported-assignment-operation, chained-comparison, no-value-for-parameter
 
+import re
+
 import allo
 from .. import dsl
 from .systolic import systolic
@@ -14,6 +16,8 @@ from .mxint8 import (
 )
 from ..ir.types import float32, uint8, int32, UInt, ConstExpr, Stream
 from ..ir.utils import MockBuffer
+from .._mlir.dialects import func as func_d
+from .._mlir.ir import MemRefType
 
 
 def linear2d[
@@ -69,8 +73,10 @@ def schedule_linear3d(s):
     return s
 
 
-def mx_matmul[Ty, M, N, K](A: "float32[M, K]", B: "float32[N, K]") -> "float32[M, N]":
-    # https://pytorch.org/docs/stable/generated/torch.matmul.html
+def mx_matmul_ref[
+    Ty, M, N, K
+](A: "float32[M, K]", B: "float32[N, K]") -> "float32[M, N]":
+    # reference: A @ B^T with A, B quantized block by block (float32 operands)
     BS: ConstExpr[int32] = Ty.block_size
     NB: ConstExpr[int32] = K // BS
     Z: float32[M, N]
@@ -90,19 +96,19 @@ def mx_matmul[Ty, M, N, K](A: "float32[M, K]", B: "float32[N, K]") -> "float32[M
     return Z
 
 
-def schedule_mx_matmul(s):
+def schedule_mx_matmul_ref(s):
     schedule_mx_quantize_block_f32(s)
     schedule_mx_block_dot(s)
-    s.unroll("mx_matmul:e")
-    s.pipeline("mx_matmul:b")
-    s.pipeline("mx_matmul:j")
+    s.unroll("mx_matmul_ref:e")
+    s.pipeline("mx_matmul_ref:b")
+    s.pipeline("mx_matmul_ref:j")
     return s
 
 
 def mx_linear2d_ref[
     Ty, M, N, K
 ](X: "float32[M, K]", W: "float32[N, K]", bias: "float32[N]") -> "float32[M, N]":
-    Z = mx_matmul[Ty, M, N, K](X, W)
+    Z = mx_matmul_ref[Ty, M, N, K](X, W)
     for i in range(M):
         for j in range(N):
             Z[i, j] = Z[i, j] + bias[j]
@@ -173,23 +179,29 @@ def _mx_dot_rows[
 
 
 def mx_quantize_rows[
-    Ty, R, K
-](X: "float32[R, K]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
+    Ty, TyX, R, K
+](X: "TyX[R, K]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
     # float32 [R, K] -> MX matrix: one packed scale | elems word per block along
-    # K (zero-padded to whole blocks)
-    NB: ConstExpr[int32] = (K + Ty.block_size - 1) // Ty.block_size
+    # K (zero-padded to whole blocks); X is read once, row by row
+    BS: ConstExpr[int32] = Ty.block_size
+    NB: ConstExpr[int32] = (K + BS - 1) // BS
     Q: Ty[R, NB]
-    _mx_quantize_rows[Ty, R, K, NB, 0](X, Q)
+    for r, b in allo.grid(R, NB):
+        blk: float32[BS]
+        for e in range(BS):
+            fq: float32 = 0.0
+            if b * BS + e < K:
+                fq = X[r, b * BS + e]
+            blk[e] = fq
+        Q[r, b] = mx_quantize_block_f32[Ty, BS](blk)
     return Q
 
 
 def mx_quantize_cols[
-    Ty, R, K
-](X: "float32[K, R]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
+    Ty, TyX, R, K
+](X: "TyX[K, R]") -> "Ty[R, (K + Ty.block_size - 1) // Ty.block_size]":
     # float32 [K, R] -> MX matrix of X^T: blocks run down the columns, e.g.
-    # V in attention's P @ V (mx_linear2d reduces along the block axis). Its
-    # own loop, not _mx_quantize_rows: Allo would name that helper's instance
-    # here like the one inside mx_quantize_rows_<n>
+    # V in attention's P @ V (mx_linear2d reduces along the block axis)
     BS: ConstExpr[int32] = Ty.block_size
     NB: ConstExpr[int32] = (K + BS - 1) // BS
     Q: Ty[R, NB]
@@ -421,20 +433,22 @@ def schedule_mx_unpack_f32(s):
 
 def schedule_mx_quantize_rows(s):
     """One block per cycle: X is banked by block lane."""
-    Ty, _, K = s.inst_list[:3]
+    Ty, _, _, K = s.inst_list[:4]
     schedule_mx(s)
-    partition_block_lanes(s, MockBuffer(s.top_func_name, "X"), K, Ty.block_size)
-    s.pipeline("_mx_quantize_rows:b")
+    top = s.top_func_name
+    partition_block_lanes(s, MockBuffer(top, "X"), K, Ty.block_size)
+    s.pipeline(f"{top}:b")
     return s
 
 
 def mx_quantize_channels[
-    Ty, B, C, H, W
-](X: "float32[B, C, H, W]") -> "Ty[B, (C + Ty.block_size - 1) // Ty.block_size, H, W]":
-    # float32 NCHW -> MX blocks along the channels (zero-padded to whole blocks)
+    Ty, TyX, B, C, H, W
+](X: "TyX[B, C, H, W]") -> "Ty[B, (C + Ty.block_size - 1) // Ty.block_size * H * W]":
+    # float32 NCHW -> MX blocks along the channels (zero-padded to whole
+    # blocks), one row per image: block (cb, h, w) at column (cb * H + h) * W + w
     BS: ConstExpr[int32] = Ty.block_size
     NB: ConstExpr[int32] = (C + BS - 1) // BS
-    Q: Ty[B, NB, H, W]
+    Q: Ty[B, NB * H * W]
     for n, cb, h, w in allo.grid(B, NB, H, W):
         blk: float32[BS]
         for e in range(BS):
@@ -442,13 +456,13 @@ def mx_quantize_channels[
             if cb * BS + e < C:
                 fx = X[n, cb * BS + e, h, w]
             blk[e] = fx
-        Q[n, cb, h, w] = mx_quantize_block_f32[Ty, BS](blk)
+        Q[n, (cb * H + h) * W + w] = mx_quantize_block_f32[Ty, BS](blk)
     return Q
 
 
 def schedule_mx_quantize_channels(s):
     """One block per cycle: X is banked by block lane along the channels."""
-    Ty, _, C = s.inst_list[:3]
+    Ty, _, _, C = s.inst_list[:4]
     top = s.top_func_name
     schedule_mx(s)
     partition_block_lanes(s, MockBuffer(top, "X"), C, Ty.block_size)
@@ -456,60 +470,108 @@ def schedule_mx_quantize_channels(s):
     return s
 
 
-def mx_linear2d[
+MX_ACC_LATENCY = 6
+
+
+def mx_matmul[
     Ty, M, N, K
 ](
-    Xq: "Ty[M, (K + Ty.block_size - 1) // Ty.block_size]",
-    Wq: "Ty[N, (K + Ty.block_size - 1) // Ty.block_size]",
-    bias: "float32[N]",
+    Aq: "Ty[M, (K + Ty.block_size - 1) // Ty.block_size]",
+    Bq: "Ty[N, (K + Ty.block_size - 1) // Ty.block_size]",
 ) -> "float32[M, N]":
-    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html on MX
-    # matrices: one block dot per iteration; each X block is read once (n == 0)
-    # and reused for every output column, acc[n] is revisited every N iterations
     BS: ConstExpr[int32] = Ty.block_size
     NB: ConstExpr[int32] = (K + BS - 1) // BS
-    Z: float32[M, N]
+    P: ConstExpr[int32] = 4 - 3 * (N >= MX_ACC_LATENCY)
+    C: float32[M, N]
     acc: float32[N] = 0.0
-    xw: Ty = 0
+    aw: Ty[P]
     for m in range(M):
-        for b, n in allo.grid(NB, N):
-            if n == 0:
-                xw = Xq[m, b]
-            d: float32 = mx_block_dot[Ty, BS](xw, Wq[n, b])
+        for g, n in allo.grid((NB + P - 1) // P, N):
+            d: float32 = 0.0
+            with allo.meta_for(P) as j:
+                if g * P + j < NB:
+                    if n == 0:
+                        aw[j] = Aq[m, g * P + j]
+                    d += mx_block_dot[Ty, BS](aw[j], Bq[n, g * P + j])
             prev: float32 = 0.0
-            if b > 0:
+            if g > 0:
                 prev = acc[n]
             total: float32 = prev + d
             acc[n] = total
-            if b == NB - 1:
-                Z[m, n] = total + bias[n]
+            if g == (NB - 1) // P:
+                C[m, n] = total
+    return C
+
+
+def pipeline_mx_matmul(s, func, N):
+    s.pipeline(f"{func}:n", initiation_interval=1 if N >= MX_ACC_LATENCY else 4)
+
+
+def schedule_mx_matmul(s):
+    schedule_mx(s)
+    pipeline_mx_matmul(s, s.top_func_name, s.inst_list[2])
+    return s
+
+
+def bias_add[Ty, M, N](X: "float32[M, N]", bias: "Ty[N]") -> "Ty[M, N]":
+    # X + bias per row; X is read once, row by row
+    Z: Ty[M, N]
+    for m, n in allo.grid(M, N):
+        Z[m, n] = X[m, n] + bias[n]
+    return Z
+
+
+def mx_linear2d[
+    Ty, TyX, M, N, K
+](
+    X: "TyX[M, K]",
+    Wq: "Ty[N, (K + Ty.block_size - 1) // Ty.block_size]",
+    bias: "TyX[N]",
+) -> "TyX[M, N]":
+    # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html with MX
+    # arithmetic: X is quantized here, Wq on the host (mxint8.mx_pack_np)
+    Xq = mx_quantize_rows[Ty, TyX, M, K](X)
+    C = mx_matmul[Ty, M, N, K](Xq, Wq)
+    Z = bias_add[TyX, M, N](C, bias)
     return Z
 
 
 def schedule_mx_linear2d(s):
-    """One block dot per cycle. Registered in KERNEL2SCHEDULE, so
+    """quantize -> mx_matmul -> bias_add as an HLS dataflow, streamed one
+    block (one output) per token. Registered in KERNEL2SCHEDULE, so
     s.compose(mx_linear2d, instantiate=..., id=...) applies it."""
+    Ty, _, _, N, K = s.inst_list[:5]
+    top = s.top_func_name
     schedule_mx(s)
-    s.pipeline(f"{s.top_func_name}:n")
+    partition_block_lanes(s, MockBuffer(top, "X"), K, Ty.block_size)
+    s.pipeline("mx_quantize_rows:b")
+    pipeline_mx_matmul(s, "mx_matmul", N)
+    s.pipeline("bias_add:n")
+    s.to(
+        MockBuffer(top, "Xq"),
+        "mx_matmul",
+        depth=(K + Ty.block_size - 1) // Ty.block_size,
+    )
+    s.to(MockBuffer(top, "C"), "bias_add", depth=N)
+    s.dataflow(top)
     return s
 
 
 def mx_linear3d[
-    Ty, B, L, D, M
+    Ty, TyX, B, L, D, M
 ](
-    X: "float32[B, L, D]",
+    X: "TyX[B, L, D]",
     Wq: "Ty[M, (D + Ty.block_size - 1) // Ty.block_size]",
-    bias: "float32[M]",
-) -> "float32[B, L, M]":
+    bias: "TyX[M]",
+) -> "TyX[B, L, M]":
     # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
-    Z: float32[B, L, M]
+    Z: TyX[B, L, M]
     for b in range(B):
-        X_b: float32[L, D]
+        X_b: TyX[L, D]
         for i in range(L):
             for k in range(D):
                 X_b[i, k] = X[b, i, k]
-        Xq_b = mx_quantize_rows[Ty, L, D](X_b)
-        Z_b = mx_linear2d[Ty, L, M, D](Xq_b, Wq, bias)
+        Z_b = mx_linear2d[Ty, TyX, L, M, D](X_b, Wq, bias)
         for i in range(L):
             for j in range(M):
                 Z[b, i, j] = Z_b[i, j]
@@ -523,42 +585,129 @@ def schedule_mx_linear3d(s):
     return s
 
 
-def mx_conv2d[
-    Ty, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
+def mx_conv_windows[
+    Ty, B, C, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
 ](
-    Xq: "Ty[B, (Cin + Ty.block_size - 1) // Ty.block_size, H, W]",
-    Wq: "Ty[Cout, (Cin + Ty.block_size - 1) // Ty.block_size, Kh, Kw]",
-    bias: "float32[Cout]",
-) -> "float32[B, Cout, Oh, Ow]":
-    # nn.conv2d on MX tensors blocked along the input channels: every kernel
-    # tap is one block dot per channel block
-    BS: ConstExpr[int32] = Ty.block_size
-    NB: ConstExpr[int32] = (Cin + BS - 1) // BS
-    Z: float32[B, Cout, Oh, Ow]
-    for n0, c0, oh0, ow0 in allo.grid(B, Cout, Oh, Ow):
-        Z[n0, c0, oh0, ow0] = bias[c0]
-    for n, cout, oh, ow, kh, kw, cb in allo.grid(B, Cout, Oh, Ow, Kh, Kw, NB):
+    Xq: "Ty[B, (C + Ty.block_size - 1) // Ty.block_size * H * W]",
+) -> "Ty[B * Oh * Ow, (C + Ty.block_size - 1) // Ty.block_size * Kh * Kw]":
+    # MX image rows -> one row per output pixel holding its receptive field,
+    # blocks in (channel block, kh, kw) order and zero blocks for the padding,
+    # written in order, one block per iteration
+    NB: ConstExpr[int32] = (C + Ty.block_size - 1) // Ty.block_size
+    Xw: Ty[B * Oh * Ow, NB * Kh * Kw]
+    for n, oh, ow, cb, kh, kw in allo.grid(B, Oh, Ow, NB, Kh, Kw):
         ih: int32 = oh * Sh + kh - Pd0
         iw: int32 = ow * Sw + kw - Pd1
+        blk: Ty = 0
         if ih >= 0 and ih < H and iw >= 0 and iw < W:
-            Z[n, cout, oh, ow] += mx_block_dot[Ty, BS](
-                Xq[n, cb, ih, iw], Wq[cout, cb, kh, kw]
-            )
+            blk = Xq[n, (cb * H + ih) * W + iw]
+        Xw[(n * Oh + oh) * Ow + ow, (cb * Kh + kh) * Kw + kw] = blk
+    return Xw
+
+
+def rows_to_nchw[Ty, B, C, H, W](Z: "Ty[B * H * W, C]") -> "Ty[B, C, H, W]":
+    # one row per pixel (row-major, read in order) -> NCHW
+    Y: Ty[B, C, H, W]
+    for n, h, w, c in allo.grid(B, H, W, C):
+        Y[n, c, h, w] = Z[(n * H + h) * W + w, c]
+    return Y
+
+
+def mx_conv2d[
+    Ty, TyX, B, Cin, Cout, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1
+](
+    X: "TyX[B, Cin, H, W]",
+    Wq: "Ty[Cout, (Cin + Ty.block_size - 1) // Ty.block_size * Kh * Kw]",
+    bias: "TyX[Cout]",
+) -> "TyX[B, Cout, Oh, Ow]":
+    # nn.conv2d with MX arithmetic, blocks along the input channels: X is
+    # quantized here, Wq on the host (mxint8.mx_pack_channels_np). Each output
+    # pixel's receptive field is one row of blocks, so the conv is a matmul of
+    # those rows with the weights (flattened the same way), then the bias
+    Xq = mx_quantize_channels[Ty, TyX, B, Cin, H, W](X)
+    Xw = mx_conv_windows[Ty, B, Cin, H, W, Kh, Kw, Oh, Ow, Sh, Sw, Pd0, Pd1](Xq)
+    C = mx_matmul[
+        Ty,
+        B * Oh * Ow,
+        Cout,
+        (Cin + Ty.block_size - 1) // Ty.block_size * Ty.block_size * Kh * Kw,
+    ](Xw, Wq)
+    Zr = bias_add[TyX, B * Oh * Ow, Cout](C, bias)
+    Z = rows_to_nchw[TyX, B, Cout, Oh, Ow](Zr)
     return Z
 
 
 def schedule_mx_conv2d(s):
-    """One block dot per cycle: cout innermost, so each input block is reused
-    for every output channel and Z[.., cout, ..] is revisited every Cout
-    cycles. Registered in KERNEL2SCHEDULE for s.compose(mx_conv2d, ...)."""
+    """quantize -> windows -> mx_matmul -> bias_add -> NCHW as an HLS
+    dataflow, streamed one block (one output) per token, one block dot per
+    cycle. Registered in KERNEL2SCHEDULE, so s.compose(mx_conv2d, ...)
+    applies it."""
+    Ty, _, _, Cin, Cout, _, _, Kh, Kw = s.inst_list[:9]
     top = s.top_func_name
+    NB = (Cin + Ty.block_size - 1) // Ty.block_size
     schedule_mx(s)
-    s.pipeline(f"{top}:ow0")
-    s.reorder(
-        f"{top}:oh", f"{top}:ow", f"{top}:kh", f"{top}:kw", f"{top}:cb", f"{top}:cout"
-    )
-    s.pipeline(f"{top}:cout")
+    partition_block_lanes(s, MockBuffer(top, "X"), Cin, Ty.block_size)
+    s.pipeline("mx_quantize_channels:w")
+    s.pipeline("mx_conv_windows:kw")
+    pipeline_mx_matmul(s, "mx_matmul", Cout)
+    s.pipeline("bias_add:n")
+    s.pipeline("rows_to_nchw:c")
+    s.to(MockBuffer(top, "Xw"), "mx_matmul", depth=NB * Kh * Kw)
+    s.to(MockBuffer(top, "C"), "bias_add", depth=Cout)
+    s.to(MockBuffer(top, "Zr"), "rows_to_nchw", depth=Cout)
+    s.dataflow(top)
     return s
+
+
+# --- dataflow across MX ops ---------------------------------------------------
+# Each MX op's stream ports: the inputs it reads exactly once in row-major
+# order, and whether it writes its result in that order. mx_dataflow turns a
+# buffer into a FIFO only when its producer writes it in order and its single
+# consumer reads it in order. A new MX op adds its entry here.
+MX_STREAM_PORTS = {
+    "mx_quantize_rows": ((0,), True),
+    "mx_quantize_cols": ((), True),  # reads X down the columns
+    "mx_quantize_channels": ((), True),  # reads X across the channels
+    "mx_matmul": ((0,), True),  # Bq is re-read for every row
+    "mx_linear2d": ((0,), True),  # Wq is re-read for every row
+    "bias_add": ((0,), True),
+    "mx_conv_windows": ((), True),  # windows overlap
+    "mx_conv2d": ((), False),  # X feeds overlapping windows; Z is NCHW
+}
+
+
+def mx_dataflow(s, depth=None):
+    """HLS dataflow over the calls in `s`'s top function: every MX result
+    that the next MX op reads once, in the order it is written, becomes a
+    FIFO (`depth`: default one row). Call after composing the ops' schedules.
+    Returns the names of the streamed buffers."""
+    top = s.top_func_name
+    ports = {}
+    for op in s._find_function(top).entry_block.operations:
+        if isinstance(op, func_d.CallOp):
+            callee = op.attributes["callee"].value
+            ports[callee] = MX_STREAM_PORTS.get(re.sub(r"_\d+$", "", callee))
+    streamed = []
+    for op in s._find_function(top).entry_block.operations:
+        if not isinstance(op, func_d.CallOp) or "name" not in op.attributes:
+            continue
+        src = ports[op.attributes["callee"].value]
+        uses = list(op.result.uses)
+        if src is None or not src[1] or len(uses) != 1:
+            continue
+        user = uses[0].owner
+        if not isinstance(user, func_d.CallOp):
+            continue
+        dst_name = user.attributes["callee"].value
+        dst = ports[dst_name]
+        if dst is None or uses[0].operand_number not in dst[0]:
+            continue
+        name = op.attributes["name"].value
+        row = MemRefType(op.result.type).shape[-1]
+        s.to(MockBuffer(top, name), dst_name, depth=depth or row)
+        streamed.append(name)
+    s.dataflow(top)
+    return streamed
 
 
 def relu2d[Ty, H, W](X: "Ty[H, W]") -> "Ty[H, W]":

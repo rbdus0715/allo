@@ -92,8 +92,7 @@ def mx_linear_top[
 ) -> "float32[M, N]":
     X: float32[M, K]
     nn.mx_unpack_f32[M, K](X0, X1, X)
-    Xq = nn.mx_quantize_rows[Ty, M, K](X)
-    return nn.mx_linear2d[Ty, M, N, K](Xq, Wq, bias)
+    return nn.mx_linear2d[Ty, float32, M, N, K](X, Wq, bias)
 
 
 def fp32_linear_top[
@@ -117,8 +116,7 @@ def _schedules(name, Ty):
     s_mx = allo.customize(mx_linear_top, instantiate=[Ty, M, N, K])
     s_mx.compose(nn.mx_unpack_f32, instantiate=[M, K])
     # its X block-lane banks reach the unpack too
-    s_mx.compose(nn.mx_quantize_rows, instantiate=[Ty, M, K])
-    s_mx.compose(nn.mx_linear2d, instantiate=[Ty, M, N, K])
+    s_mx.compose(nn.mx_linear2d, instantiate=[Ty, float32, M, N, K])
     s_mx.dataflow("mx_linear_top")
     s_fp = allo.customize(fp32_linear_top, instantiate=[M, N, K])
     s_fp.compose(nn.mx_unpack_f32, instantiate=[M, K])
@@ -151,10 +149,10 @@ def test_linear_numerics(name, Ty):
     Z_mx = allo.customize(mx_linear_top, instantiate=[Ty, M, N, K]).build(
         target="llvm"
     )(*mx_pack_f32_blocks(X), Wq, bias)
-    # on-chip quantization of X equals packing it on the host
-    ref_mx = allo.customize(nn.mx_linear2d, instantiate=[Ty, M, N, K]).build(
+    # the packed DRAM interface changes nothing but how X reaches the chip
+    ref_mx = allo.customize(nn.mx_linear2d, instantiate=[Ty, float32, M, N, K]).build(
         target="llvm"
-    )(mx_pack_np(Ty, X), Wq, bias)
+    )(X, Wq, bias)
     np.testing.assert_array_equal(Z_mx, ref_mx)
     print(
         f"\n[{name}] rel norm err vs fp64: fp32 {rel(Z_fp):.2e}, "

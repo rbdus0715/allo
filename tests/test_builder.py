@@ -1509,5 +1509,31 @@ def test_generic_instance_called_again():
     np.testing.assert_array_equal(s.build()(a, np.arange(8, dtype=np.int32)), a + 2)
 
 
+def test_generic_nested_and_top_level_instances():
+    # inc inside wrap_1 takes wrap_1's id ("inc_1"); a later top-level inc with
+    # other parameters must not take that name too
+    def inc[T, N](x: "T[N]") -> "T[N]":
+        y: T[N]
+        for i in range(N):
+            y[i] = x[i] + 1
+        return y
+
+    def wrap[T, N](x: "T[N]") -> "T[N]":
+        return inc[T, N](x)
+
+    def top(a: int32[4], b: int32[8], c: int32[2]) -> int32[2]:
+        d = wrap[int32, 4](a)
+        e = wrap[int32, 8](b)
+        return inc[int32, 2](c)
+
+    s = allo.customize(top)
+    names = {op.attributes["sym_name"].value for op in s.module.body.operations}
+    assert {"inc", "inc_1", "inc_2"} <= names
+    c = np.arange(2, dtype=np.int32)
+    np.testing.assert_array_equal(
+        s.build()(np.zeros(4, np.int32), np.zeros(8, np.int32), c), c + 1
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
