@@ -69,6 +69,26 @@ ctype_map = {
 }
 
 
+def axi_element_bytes(bitwidth):
+    """Bytes one element spans behind an AXI port: a power of two, so a 264-bit
+    ap_int takes 64."""
+    return 1 << (((bitwidth + 7) // 8) - 1).bit_length()
+
+
+def axi_bytes(arr, bitwidth):
+    """Raw bytes of `arr` as an AXI port reads them, each element zero-padded
+    to axi_element_bytes (the LLVM layout of a wide int has another size)."""
+    stride = axi_element_bytes(bitwidth)
+    size = arr.dtype.itemsize
+    if size == stride:
+        return arr.tobytes()
+    raw = np.ascontiguousarray(arr).view(np.uint8).reshape(-1, size)
+    out = np.zeros((raw.shape[0], stride), np.uint8)
+    used = min(size, (bitwidth + 7) // 8)
+    out[:, :used] = raw[:, :used]
+    return out.tobytes()
+
+
 def codegen_host(top, module, num_output_args=0):
     """Generate OpenCL host code for Vitis HLS.
 
@@ -106,8 +126,7 @@ def codegen_host(top, module, num_output_args=0):
     buffer_bytes: list[int] = []
     for i, (in_dtype, in_shape) in enumerate(inputs):
         ele_bitwidth = get_bitwidth_from_type(in_dtype)
-        # bool -> 1 byte
-        ele_bytes = 1 if ele_bitwidth == 1 else ele_bitwidth // 8
+        ele_bytes = axi_element_bytes(ele_bitwidth)
         # read file
         out_str += format_str(
             f'std::ifstream ifile{i}("input{i}.data", std::ios::binary);'
@@ -148,8 +167,7 @@ def codegen_host(top, module, num_output_args=0):
             )
     for i, (out_dtype, out_shape) in enumerate(outputs):
         ele_bitwidth = get_bitwidth_from_type(out_dtype)
-        # bool -> 1 byte
-        ele_bytes = 1 if ele_bitwidth == 1 else ele_bitwidth // 8
+        ele_bytes = axi_element_bytes(ele_bitwidth)
         size = np.prod(out_shape) if len(out_shape) > 0 else 1
         byte_num = size * ele_bytes
         buffer_bytes.append(byte_num)

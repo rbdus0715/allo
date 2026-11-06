@@ -343,9 +343,19 @@ class Schedule:
         # Check for duplicate partitioning
         target_key = f"{target.func}:{target.name}"
         if target_key in self.partitioned_arrays:
-            for existing_type, existing_dim, _ in self.partitioned_arrays[target_key]:
+            for existing_type, existing_dim, existing_factor in self.partitioned_arrays[
+                target_key
+            ]:
                 # If already completely partitioned on all dims, nothing more to do
                 if existing_type == Partition.Complete and existing_dim == 0:
+                    return
+                # The same partition again (e.g. reached through another call
+                # of the same function): nothing more to do
+                if (existing_type, existing_dim, existing_factor) == (
+                    partition_type_int,
+                    dim,
+                    factor,
+                ):
                     return
                 # Cannot mix all-dim partition (dim=0) with per-dim partitions
                 if existing_dim == 0 or dim == 0:

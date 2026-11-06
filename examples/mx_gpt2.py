@@ -21,6 +21,8 @@ import allo
 import allo.ir.types as T
 import allo.library.nn as nn
 from allo.ir.types import float32
+from allo.customize import call_names
+from allo.ir.utils import MockBuffer
 from allo.library.mx import mx_pack_np, patch_extern_c_for_class_return_types
 
 # sequence length, model width, heads, MLP width, layers, vocabulary
@@ -34,6 +36,11 @@ def make_block(Ty, attn_mx):
     """Builds one pre-LN GPT-2 block on MX format Ty."""
     # annotations name Ty (captured: the body uses it), not a closure count
     ATTN_MX = int(attn_mx)
+
+    def fork2(X: "float32[L, D]", A: "float32[L, D]", B: "float32[L, D]"):
+        for i, j in allo.grid(L, D):
+            A[i, j] = X[i, j]
+            B[i, j] = X[i, j]
 
     def causal_softmax(S: "float32[L, L]") -> "float32[L, L]":
         # row softmax of S * SCALE over j <= i
@@ -89,7 +96,8 @@ def make_block(Ty, attn_mx):
                     Z[ip, h * DH + dp] = accp
         return Z
 
-    def block(
+    # `block` is a reserved name in the generated HDL
+    def block_mx(
         x: "float32[L, D]",
         ln1_g: "float32[D]",
         ln1_b: "float32[D]",
@@ -104,67 +112,31 @@ def make_block(Ty, attn_mx):
         w_fc2: "Ty[D, (F + Ty.block_size - 1) // Ty.block_size]",
         b_fc2: "float32[D]",
     ) -> "float32[L, D]":
-        # x + attn(ln1(x)), then + mlp(ln2(.))
-        h1 = nn.layer_norm[float32, L, D](x, ln1_g, ln1_b)
+        # x + attn(ln1(x)), then + mlp(ln2(.)); x and x1 are forked into two
+        # copies, as an HLS dataflow buffer can have only one reader
+        xa: float32[L, D]
+        xb: float32[L, D]
+        fork2(x, xa, xb)
+        h1 = nn.layer_norm[float32, L, D](xa, ln1_g, ln1_b)
         qkv = nn.mx_linear2d[Ty, float32, L, QKV, D](h1, w_qkv, b_qkv)
         a = attention(qkv)
         o = nn.mx_linear2d[Ty, float32, L, D, D](a, w_o, b_o)
-        x1 = nn.residual_add[float32, L, D](x, o)
-        h2 = nn.layer_norm[float32, L, D](x1, ln2_g, ln2_b)
+        x1 = nn.residual_add[float32, L, D](xb, o)
+        x1a: float32[L, D]
+        x1b: float32[L, D]
+        fork2(x1, x1a, x1b)
+        h2 = nn.layer_norm[float32, L, D](x1a, ln2_g, ln2_b)
         f = nn.mx_linear2d[Ty, float32, L, F, D](h2, w_fc1, b_fc1)
         g = nn.GeLU[float32, L, F](f)
         y = nn.mx_linear2d[Ty, float32, L, D, F](g, w_fc2, b_fc2)
-        return nn.residual_add[float32, L, D](x1, y)
+        return nn.residual_add[float32, L, D](x1b, y)
 
-    return block
-
-
-def make_block_hw(Ty, attn_mx):
-    """make_block with float32 weights quantized on chip, for hw_emu: Allo's
-    HLS host does not yet lay out Ty words the way the AXI ports read them."""
-    block = make_block(Ty, attn_mx)
-
-    def block_hw(
-        x: "float32[L, D]",
-        ln1_g: "float32[D]",
-        ln1_b: "float32[D]",
-        w_qkv: "float32[QKV, D]",
-        b_qkv: "float32[QKV]",
-        w_o: "float32[D, D]",
-        b_o: "float32[D]",
-        ln2_g: "float32[D]",
-        ln2_b: "float32[D]",
-        w_fc1: "float32[F, D]",
-        b_fc1: "float32[F]",
-        w_fc2: "float32[D, F]",
-        b_fc2: "float32[D]",
-    ) -> "float32[L, D]":
-        q_qkv = nn.mx_quantize_rows[Ty, float32, QKV, D](w_qkv)
-        q_o = nn.mx_quantize_rows[Ty, float32, D, D](w_o)
-        q_fc1 = nn.mx_quantize_rows[Ty, float32, F, D](w_fc1)
-        q_fc2 = nn.mx_quantize_rows[Ty, float32, D, F](w_fc2)
-        return block(
-            x,
-            ln1_g,
-            ln1_b,
-            q_qkv,
-            b_qkv,
-            q_o,
-            b_o,
-            ln2_g,
-            ln2_b,
-            q_fc1,
-            b_fc1,
-            q_fc2,
-            b_fc2,
-        )
-
-    return block_hw
+    return block_mx
 
 
-def schedule_mx_all(s):
-    """One block per cycle in every MX function instance of `s`: unrolled
-    block primitives, pipelined block loops."""
+def schedule_mx_all(s, funcs=None):
+    """One block per cycle in the MX function instances of `s` (or those in
+    `funcs`): unrolled block primitives, pipelined block loops."""
     loops = {
         "mx_block_dot": ("unroll", ("j0", "j1")),
         "mx_quantize_block_f32": ("unroll", ("i1",)),
@@ -176,10 +148,42 @@ def schedule_mx_all(s):
     for op in s.module.body.operations:
         name = op.attributes["sym_name"].value
         base = re.sub(r"_\d+$", "", name)
-        if base in loops:
+        if base in loops and (funcs is None or name in funcs):
             prim, names = loops[base]
             for loop in names:
                 getattr(s, prim)(f"{name}:{loop}")
+    return s
+
+
+def callees(s, func):
+    """Every function `func` calls, directly or not."""
+    seen, todo = set(), [func]
+    while todo:
+        f = s._find_function(todo.pop(), error=False)
+        for name in [] if f is None else call_names(f):
+            if name not in seen:
+                seen.add(name)
+                todo.append(name)
+    return seen
+
+
+def schedule_block(s, Ty):
+    """The block as a dataflow: each linear, LayerNorm and GeLU takes its
+    registered schedule (the linears: quantize -> mx_matmul -> bias_add
+    streamed), the block's stages overlap, and fc1 -> GeLU -> fc2 stream."""
+    weights = [(QKV, D), (D, D), (F, D), (D, F)]  # w_qkv, w_o, w_fc1, w_fc2
+    for i, (n, k) in enumerate(weights):  # qkv, o, fc1, fc2 in call order
+        s.compose(
+            nn.mx_linear2d, instantiate=[Ty, float32, L, n, k], id=str(i) if i else None
+        )
+    s.compose(nn.layer_norm, instantiate=[float32, L, D])
+    s.compose(nn.GeLU, instantiate=[float32, L, F])
+    # attention calls its MX stages in a loop over heads: pipelines only
+    schedule_mx_all(s, callees(s, "attention"))
+    s.pipeline("fork2:j")
+    s.to(MockBuffer("block_mx", "f"), "GeLU", depth=F)
+    s.to(MockBuffer("block_mx", "g"), "mx_linear2d_3", depth=F)
+    s.dataflow("block_mx")
     return s
 
 
@@ -301,10 +305,13 @@ def run_hw(mode, project, Ty=FORMATS[0], attn_mx=False):
     p = layers[0]
     tokens = np.random.default_rng(1).integers(0, VOCAB, L)
     x = np.ascontiguousarray(head["wte"][tokens] + head["wpe"], np.float32)
-    args = [x, *(np.ascontiguousarray(v) for v in p.values())]
-    top = make_block_hw(Ty, attn_mx)
+    args = [
+        x,
+        *(mx_pack_np(Ty, v) if k in LINEARS else v for k, v in p.items()),
+    ]
+    top = make_block(Ty, attn_mx)
     ref = allo.customize(top).build(target="llvm")(*args)
-    s = schedule_mx_all(allo.customize(top))
+    s = schedule_block(allo.customize(top), Ty)
     mod = s.build(target="vitis_hls", mode=mode, project=project)
     # issue #603: extern "C" functions returning ap_int<N> (the packed MX word)
     patch_extern_c_for_class_return_types(f"{project}/kernel.cpp")

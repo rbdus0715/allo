@@ -19,6 +19,7 @@ from .._mlir.passmanager import PassManager
 
 from .config import DEFAULT_CONFIG, PART_NUMBER
 from .vitis import (
+    axi_bytes,
     codegen_host,
     postprocess_hls_code,
     generate_description_file,
@@ -600,7 +601,7 @@ class HLSModule:
                 with open(f"{self.project}/input{i}.data", "wb") as f:
                     if np.isscalar(arg):
                         arg = np.array(arg, dtype=np_supported_types[in_dtype])
-                    f.write(arg.tobytes())
+                    f.write(axi_bytes(arg, ele_bitwidth))
             # check if the build folder exists
             bitstream_folder = f"{self.project}/build_dir.{self.mode}.{os.environ['XDEVICE'].rsplit('/')[-1].split('.')[0]}"
             if not os.path.exists(

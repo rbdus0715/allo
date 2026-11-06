@@ -12,56 +12,68 @@ from ..ir.types import Int, UInt, int32, uint8, float32, ConstExpr
 def _mx_quantize_elem_int_f32[
     Ty
 ](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
+    # truncates: the top elem_bits - 1 mantissa bits, shifted to the block's
+    # exponent; signed locals, as the HLS backend sign-extends unsigned ones
     bits: int32 = v_f32.bitcast()
     sign: UInt(1) = bits[31:32]
     exp_field: Int(9) = bits[23:31]
-    full_mant: Int(25) = (1 << 23) | bits[0:23]
-    total_shift: Int(10) = (23 - Ty.max_unbiased_exp) + shared_field - exp_field
+    diff: Int(10) = shared_field - exp_field
+    top: Int(Ty.elem_bits) = (1 << Ty.max_unbiased_exp) | bits[
+        23 - Ty.max_unbiased_exp : 23
+    ]
 
     mag: Int(Ty.elem_bits) = 0
-    if total_shift < 24:
-        mag = full_mant >> total_shift
+    if diff <= Ty.max_unbiased_exp:
+        mag = top >> diff
 
-    rounded: Int(Ty.elem_bits) = mag
+    elem: Int(Ty.elem_bits) = mag
     if sign == 1:
-        rounded = -mag
-    if rounded > Ty.max_int:
-        rounded = Ty.max_int
-    if rounded < -Ty.max_int:
-        rounded = -Ty.max_int
-    return rounded
+        elem = -mag
+    return elem
 
 
 def _mx_quantize_elem_fp_f32[
     Ty
 ](v_f32: float32, shared_field: uint8) -> "UInt(Ty.elem_bits)":
     # OCP MX: v / 2^(shared exponent - emax), round-to-nearest-even, saturating
+    # signed locals, as the HLS backend sign-extends unsigned ones
     bits: int32 = v_f32.bitcast()
-    sign: int32 = int(bits[31:32])
-    exp_field: int32 = int(bits[23:31])
-    full_mant: int32 = (1 << 23) | int(bits[0:23])
-    code: int32 = exp_field - int(shared_field) + Ty.max_unbiased_exp + Ty.bias
-    shift: int32 = 23 - Ty.mantissa_bits
-    base: int32 = 0
-    if code >= 1:  # normal: q in [2^m, 2^(m+1)] sits on exponent code - 1
-        base = (code - 1) << Ty.mantissa_bits
-    else:  # subnormal: q in [0, 2^m]; q == 2^m carries into exponent code 1
-        shift = shift + 1 - code
+    sign: UInt(1) = bits[31:32]
+    exp_field: Int(9) = bits[23:31]
+    code: Int(10) = exp_field - shared_field + Ty.max_unbiased_exp + Ty.bias
+    # 1.m and a guard bit; the mantissa bits below them only matter as sticky
+    hi: Int(Ty.mantissa_bits + 3) = (1 << (Ty.mantissa_bits + 1)) | bits[
+        22 - Ty.mantissa_bits : 23
+    ]
+    low: Int(23 - Ty.mantissa_bits) = bits[0 : 22 - Ty.mantissa_bits]
 
-    mag: int32 = 0
-    if exp_field != 0 and shift <= 25:  # larger shifts round to zero
-        q: int32 = full_mant >> shift
-        rem: int32 = full_mant & ((1 << shift) - 1)
-        half: int32 = 1 << (shift - 1)
-        round_up: int32 = 0
-        if rem > half:
-            round_up = 1
-        if rem == half:
-            round_up = q & 1
-        mag = base + q + round_up
+    mag: Int(Ty.elem_bits + 1) = 0
+    if exp_field != 0 and code >= -1 - Ty.mantissa_bits:  # below: rounds to zero
+        base: Int(Ty.elem_bits + 1) = 0
+        sub: Int(5) = 0
+        if code >= 1:  # normal: q in [2^m, 2^(m+1)] sits on exponent code - 1
+            base = (code - 1) << Ty.mantissa_bits
+        else:  # subnormal: q in [0, 2^m]; q == 2^m carries into exponent code 1
+            sub = 1 - code
+        # hi >> sub in constant-shift stages (sub <= m + 2), collecting the
+        # bits shifted out: a variable shift becomes a two-way 32-bit shifter
+        g: Int(Ty.mantissa_bits + 3) = hi
+        lost: Int(2) = 0
+        with allo.meta_for((Ty.mantissa_bits + 2).bit_length()) as st:
+            if (sub >> st) & 1 == 1:
+                if g & ((1 << (1 << st)) - 1) != 0:
+                    lost = 1
+                g = g >> (1 << st)
+        q: Int(Ty.mantissa_bits + 3) = g >> 1
+        mag = base + q
+        if g & 1 == 1:  # round to nearest, ties to even
+            if low != 0 or lost == 1 or q & 1 == 1:
+                mag = mag + 1
     if mag > Ty.max_code:
         mag = Ty.max_code
-    result: UInt(Ty.elem_bits) = (sign << (Ty.elem_bits - 1)) | mag
+    result: Int(Ty.elem_bits) = mag
+    if sign == 1:
+        result = mag | (1 << (Ty.elem_bits - 1))
     return result
 
 
